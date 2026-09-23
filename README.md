@@ -7,7 +7,7 @@ OMP is a lightweight Pi-native agent orchestration extension inspired by the [up
 Install from GitHub:
 
 ```sh
-pi install git:github.com/hyird/pi-omp
+pi install git:github.com/hyird/oh-my-pi-slim
 ```
 
 Restart Pi or run `/reload`. Run `/omp` **without arguments** to open settings; there are no `/omp` subcommands. Select the default main role (`pi`, `orchestrator`, or `council`). Each of the five specialist roles has one settings row: choose its model, then its thinking level; both choices save together. The model picker follows Pi's enabled model scope (`/scoped-models`); disabled models cannot be selected or launched as configured specialist overrides. Council reviewers always inherit the main session's model and thinking level, so Council has no child settings row. Explorer, Librarian, Oracle, Designer, and Fixer cannot be main roles. Choose “Inherit” in either picker to use the current Pi session's model or thinking level. Thinking choices are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; Pi clamps unsupported levels to the selected model's capabilities. Arrow keys navigate, Enter selects/saves, typing searches available models, and Esc goes back or closes settings. RPC mode uses equivalent selection dialogs. Invalid legacy main-role settings fall back to `orchestrator` without discarding specialist overrides.
@@ -44,4 +44,4 @@ Recordings are persisted under `getAgentDir()/omp/conversations` (normally `~/.p
 
 The plugin UI and status/progress labels remain in **English**. Before each delegation or Council call, OMP makes **one extra call to the current main model** to infer the language from the **most recent user text on the current session branch** and translate the child role prompts and tasks for that request. Children are instructed to reply in that language; providers may still respond differently. Translation/validation errors fail closed (children are not started). The extra translation call's usage is included with child usage in the tool result, so budget for its cost.
 
-See [references and boundaries](docs/references.md) for read-only upstream comparisons. Remove a Git installation with `pi remove git:github.com/hyird/pi-omp`. Licensed under [MIT](LICENSE), retaining upstream attribution.
+See [references and boundaries](docs/references.md) for read-only upstream comparisons. Remove a Git installation with `pi remove git:github.com/hyird/oh-my-pi-slim`. Licensed under [MIT](LICENSE), retaining upstream attribution.
