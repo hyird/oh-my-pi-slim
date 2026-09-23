@@ -30,6 +30,8 @@ Settings live in `getAgentDir()/omp.json` (normally `~/.pi/agent/omp.json`, or u
 }
 ```
 
+If a previously saved specialist model is later disabled, OMP switches it to the current Pi model when that model is enabled, otherwise to the first available enabled model, and shows a notification. This happens when a session starts, `/omp` opens, or delegation runs. If no enabled model is available, `/omp` marks the role and delegation stops before translation or child work.
+
 ## MCP mapping
 
 With pi-mcp-adapter, Orchestrator can use verified non-context7 namespace proxies or the `mcp` gateway with an explicit server (for example `mcp({server:'gh_grep',tool:'search',args:{query:'repo'}})`). Unscoped gateway search, scripts, context7, and unattributed direct MCP tools are blocked; Council gets no MCP tools. Librarian children use an exclusive allowlist of public context7 and gh_grep namespace proxies; other specialists get none. Native `pi` retains its MCP tools. If the adapter exposes only direct tools, Orchestrator must use the scoped gateway instead. This is a tool-level policy, **not a network sandbox**: shell commands can still access the network. See [MCP boundaries](docs/references.md#mcp-defaults-mapping-pi-mcp-adapter-2370).

@@ -144,7 +144,12 @@ describe("/omp settings entry point", () => {
     expect(getChoices("model:explorer", h.ctx)).toEqual([INHERIT, "openai-codex/gpt-5.3-codex-spark"]);
     await updateConfig((config) => ({ ...config, models: { explorer: "openai-codex/gpt-5.5" } }));
     expect(getChoices("model:explorer", h.ctx)).not.toContain("openai-codex/gpt-5.5");
+    expect(getSettingsRows(h.ctx).find((row) => row.id === "role:explorer")?.description).toContain("Configured model is disabled");
     expect(() => resolveModel(h.ctx, "explorer")).toThrow("not enabled or available");
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.3-codex-spark");
+    expect(h.notifications.at(-1)).toContain("explorer: openai-codex/gpt-5.5 → openai-codex/gpt-5.3-codex-spark");
+    expect(h.translations).toEqual([]);
     h.ctx.mode = "rpc";
     let calls = 0;
     h.ctx.ui.select = async (_title: string, options: string[]) => {
@@ -165,6 +170,7 @@ describe("/omp settings entry point", () => {
       component = factory({ requestRender: () => {} }, { fg: (_: string, text: string) => text, bold: (text: string) => text }, {}, done);
     });
     const finished = h.commands.omp.handler("", h.ctx);
+    await waitFor(() => Boolean(component));
     expect(component.render(90).join("\n")).toContain("Main agent / specialist settings");
     expect(component.render(90).join("\n")).toContain("Default main agent");
     expect(component.render(90).join("\n")).toContain("explorer");
@@ -211,6 +217,7 @@ describe("/omp settings entry point", () => {
       }, {}, done);
     });
     const finished = h.commands.omp.handler("", h.ctx);
+    await waitFor(() => Boolean(component));
     const wide = component.render(100).join("\n");
     expect(wide).toContain("Default main agent");
     expect(wide).toContain("explorer");

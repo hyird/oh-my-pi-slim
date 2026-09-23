@@ -37,6 +37,36 @@ export default function omp(pi: ExtensionAPI) {
   const jobs = new Map<string, BackgroundJob>();
   const reconcileTools = installMcpPolicy(pi, () => role);
 
+  const reconcileModels = async (ctx: ExtensionContext) => {
+    const available = availableChildModels(ctx);
+    const byName = new Map(available.map((model) => [`${model.provider}/${model.id}`, model]));
+    const configured = readConfig().models;
+    const stale = ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council"
+      && configured[name] && !byName.has(configured[name]));
+    if (!stale.length) return;
+    const currentName = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
+    const fallback = (currentName && byName.has(currentName) ? currentName : undefined)
+      ?? ctx.scopedModels?.map(({ model }) => `${model.provider}/${model.id}`).find((name) => byName.has(name))
+      ?? (available[0] && `${available[0].provider}/${available[0].id}`);
+    if (!fallback) {
+      ctx.ui.notify(`OMP: ${stale.join(", ")} has an unavailable model and no enabled model can replace it. Check /scoped-models or /omp.`, "warning");
+      return;
+    }
+    const changed: string[] = [];
+    await updateConfig((config) => {
+      const models = { ...config.models };
+      for (const name of stale) {
+        const previous = models[name];
+        if (previous && !byName.has(previous)) {
+          models[name] = fallback;
+          changed.push(`${name}: ${previous} → ${fallback}`);
+        }
+      }
+      return { ...config, models };
+    });
+    if (changed.length) ctx.ui.notify(`OMP switched unavailable specialist models to enabled models: ${changed.join("; ")}`, "warning");
+  };
+
   const repaint = (job: BackgroundJob) => {
     for (const invalidate of job.invalidators.values()) {
       try { invalidate(); } catch { /* A closed tool card must not affect the job. */ }
@@ -147,6 +177,7 @@ export default function omp(pi: ExtensionAPI) {
         return;
       }
       try {
+        await reconcileModels(ctx);
         await showSettingsUi(ctx, { apply: applySetting });
       } catch (err) {
         ctx.ui.notify(`OMP configuration failed (${configPath()}): ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -154,7 +185,7 @@ export default function omp(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     cancelRunning();
     jobs.clear();
     session++;
@@ -166,6 +197,8 @@ export default function omp(pi: ExtensionAPI) {
     }
     reconcileTools(role);
     status(ctx);
+    try { await reconcileModels(ctx); }
+    catch (err) { ctx.ui.notify(`OMP: could not update specialist models: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
   });
 
   pi.on("session_shutdown", () => {
@@ -208,6 +241,9 @@ export default function omp(pi: ExtensionAPI) {
         throw new Error("Only explorer/librarian/oracle/designer/fixer are supported; task must be 1-12000 characters");
       }
       const assignments = items as Assignment[];
+      await reconcileModels(ctx);
+      // Reject stale overrides before paying for translation or starting other children.
+      for (const assignment of assignments) resolveModel(ctx, assignment.agent);
       onUpdate?.({ content: [{ type: "text", text: "OMP: preparing user-language prompts" }], details: { progress: queuedProgress(assignments) } });
       const prepared = await prepareAssignments(ctx, assignments, signal);
       return startJob(ctx, prepared, "delegate");

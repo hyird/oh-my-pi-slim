@@ -20,14 +20,15 @@ export interface SettingsActions {
   apply(id: string, value: string, ctx: ExtensionCommandContext): Promise<void>;
 }
 
-export function getSettingsRows(): SettingItem[] {
+export function getSettingsRows(ctx?: ExtensionCommandContext): SettingItem[] {
   const config = readConfig();
+  const enabled = ctx && new Set(availableChildModels(ctx).map((model) => `${model.provider}/${model.id}`));
   return [
     { id: "default", label: "Default main agent", currentValue: config.defaultAgent, description: "Default role for the main session; does not change Pi's current model." },
     ...ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => ({
       id: `role:${name}`, label: name,
       currentValue: roleSettingValue(config.models[name] ?? INHERIT, config.thinking[name] ?? INHERIT_THINKING),
-      description: `${ROLES[name].description}. Choose the model, then the thinking level.`,
+      description: `${ROLES[name].description}. Choose the model, then the thinking level.${enabled && config.models[name] && !enabled.has(config.models[name]) ? " Configured model is disabled or unavailable; choose an enabled model or Inherit." : ""}`,
     })),
   ];
 }
@@ -42,7 +43,7 @@ export function getChoices(id: string, ctx: ExtensionCommandContext): string[] {
 /** Terminal UI is one settings screen, with a searchable model picker per row. */
 async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): Promise<void> {
   await ctx.ui.custom<void>((tui, theme, _keys, done) => {
-    const rows = getSettingsRows();
+    const rows = getSettingsRows(ctx);
     const listTheme = {
       label: (s: string, selected: boolean) => theme.fg(selected ? "accent" : "text", selected ? theme.bold(s) : s),
       value: (s: string, selected: boolean) => theme.fg(selected ? "accent" : "text", selected ? theme.bold(s) : s),
@@ -144,7 +145,7 @@ async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): 
           feedback = `Could not save: ${err instanceof Error ? err.message : String(err)}`;
         } finally {
           try {
-            for (const row of getSettingsRows()) list.updateValue(row.id, row.currentValue);
+            for (const row of getSettingsRows(ctx)) list.updateValue(row.id, row.currentValue);
           } catch (err) {
             feedback = `Could not read config: ${err instanceof Error ? err.message : String(err)}`;
           }
@@ -182,8 +183,8 @@ async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): 
 /** RPC has dialogs but not custom terminal components: keep the same setting picker. */
 async function showDialogs(ctx: ExtensionCommandContext, actions: SettingsActions): Promise<void> {
   while (true) {
-    const rows = getSettingsRows();
-    const choices = rows.map((row) => `${row.label}  →  ${row.currentValue}`);
+    const rows = getSettingsRows(ctx);
+    const choices = rows.map((row) => `${row.label}  →  ${row.currentValue}${row.description?.includes("Configured model is disabled") ? " [disabled]" : ""}`);
     const selected = await ctx.ui.select("OMP · Main agent / specialist settings (cancel to close)", choices);
     if (!selected) return;
     const row = rows[choices.indexOf(selected)];
