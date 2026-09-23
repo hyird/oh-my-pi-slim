@@ -72,7 +72,7 @@ export default function omp(pi: ExtensionAPI) {
       if (job.session !== session) return;
       try {
         pi.sendMessage({ customType: "omp-background-result", display: false, content },
-          { triggerTurn: true, deliverAs: "followUp" });
+          { triggerTurn: true, deliverAs: "steer" });
       } catch { /* The completed task card remains visible if delivery fails. */ }
     };
     void runAssignments(ctx, prepared.items, controller.signal, (progress) => {
@@ -93,7 +93,7 @@ export default function omp(pi: ExtensionAPI) {
       deliver(`OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
     });
     return {
-      content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work; completion will arrive automatically.` }],
+      content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work. If nothing independent remains, end this turn with a brief status; completion will wake you. Never use shell sleep or polling to wait.` }],
       details: { jobId: id, progress: job.progress }, usage: prepared.usage,
     };
   };
@@ -182,7 +182,7 @@ export default function omp(pi: ExtensionAPI) {
       return;
     }
     event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
-    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background: continue only independent work, then wait for the automatic completion message before using its findings. Progress and assistant replies appear in the original OMP task card. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
+    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background. Continue only independent work; if none remains, end your turn with a brief status, without claiming the task is finished. Completion steers an active turn at the next safe tool boundary or wakes an idle turn. Never use shell sleep or polling to wait for specialists. Use their findings only after the completion message arrives. Progress and assistant replies appear in the original OMP task card. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
   });
 
   pi.registerTool({

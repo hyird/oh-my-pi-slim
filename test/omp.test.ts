@@ -321,6 +321,7 @@ describe("/omp settings entry point", () => {
     expect(event.systemPromptOptions.sections.omp_role).toContain("Active OMP main agent: orchestrator");
     expect(event.systemPromptOptions.sections.omp_role).toContain("not the default implementation worker");
     expect(event.systemPromptOptions.sections.omp_role).toContain("multi-file implementation");
+    expect(event.systemPromptOptions.sections.omp_roster).toContain("Never use shell sleep or polling");
     expect(Object.keys(h.tools).sort()).toEqual(["omp_council", "omp_delegate"]);
     await expect(h.tools.omp_delegate.execute("id", { agent: "bad", task: "test" }, undefined, undefined, h.ctx)).rejects.toThrow();
   });
@@ -575,13 +576,14 @@ test("background delegation returns immediately, updates its card and delivers c
     const result = await tool.execute("background-call", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
     expect(result.details.jobId).toBeString();
     expect(result.content[0].text).toContain("started");
+    expect(result.content[0].text).toContain("Never use shell sleep or polling");
     expect(result.content[0].text).not.toContain(result.details.jobId);
     expect(h.sentMessages).toHaveLength(0);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100).join("\n")).toContain("running");
     await waitFor(() => h.sentMessages.length === 1);
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
-    expect(h.sentMessages[0].options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    expect(h.sentMessages[0].options).toEqual({ triggerTurn: true, deliverAs: "steer" });
     expect(h.sentMessages[0].message.content).not.toContain(result.details.jobId);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100).join("\n")).toContain("done");

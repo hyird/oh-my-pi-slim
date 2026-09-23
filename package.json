@@ -1,6 +1,6 @@
 {
   "name": "@hyird/oh-my-pi-slim",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "OMP: Pi-native agent orchestration and /omp configuration",
   "license": "MIT",

@@ -14,6 +14,10 @@ These are **read-only inspiration**, not runtime dependencies or promises of API
 - `agents.ts`, `runner.ts`, `session-lock.ts`, `render.ts`: frontmatter agents, isolated RPC children, optional named continuation, locking, cancellation, result truncation, and streaming activity renderers. OMP instead runs its own JSON-mode children and stores their emitted events for per-task inline expansion; it does not use named continuation or claim Pi session resumption.
 - Its older Pi peer naming must not be assumed compatible with `@earendil-works/pi-coding-agent` without integration tests.
 
+## [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents)
+
+- Its async completion notifier uses `pi.sendMessage` with `triggerTurn` and Pi's default steering delivery. OMP explicitly uses `deliverAs: "steer"` so a busy main agent receives completed work at the next safe boundary instead of waiting until its turn settles. OMP retains its own inline task card and does not import the package.
+
 ## [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) (0.19.0 reference)
 
 - `src/index.ts`, `src/ui/agent-widget.ts`, `src/ui/fleet-list.ts`, `README.md`: native subagent tools, background sessions, live widget, and session-backed conversation browsing. OMP borrows only presentation ideas: it has **inline tool progress, no OMP widget**, and individual task rows that expand to show task text and assistant replies. It neither imports this package nor provides its FleetView or persistent/resumable sessions.
