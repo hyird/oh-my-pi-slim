@@ -327,6 +327,17 @@ describe("/omp settings entry point", () => {
   });
 });
 
+test("omp_task stays invisible in the transcript while preserving model-facing output", async () => {
+  const h = harness();
+  const tool = h.tools.omp_task;
+  const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  expect(tool.renderShell).toBe("self");
+  expect(tool.renderCall({ action: "status" }, theme).render(80)).toEqual([]);
+  const result = await tool.execute("status", { action: "status" }, undefined, undefined, h.ctx);
+  expect(result.content[0].text).toContain("No OMP background tasks");
+  expect(tool.renderResult(result, { expanded: true, isPartial: false }, theme).render(80)).toEqual([]);
+});
+
 test("isolated child uses the configured specialist model and tool allowlist (offline fake Pi)", async () => {
   const h = harness();
   h.ctx.thinkingLevel = "low";

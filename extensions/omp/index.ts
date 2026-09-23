@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
@@ -187,7 +188,7 @@ export default function omp(pi: ExtensionAPI) {
       return;
     }
     event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
-    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background: track each task ID, continue only independent work, and wait for the automatic completion message before using its findings. Use omp_task to check, retrieve or cancel a job. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
+    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background: track each task ID, continue only independent work, and wait for the automatic completion message before using its findings. Do not poll omp_task while waiting or fetch a result already delivered in full; use it only when completion is missing, output was truncated, or cancellation is needed. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
   });
 
   pi.registerTool({
@@ -221,7 +222,10 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_task", label: "OMP task",
-    description: "Check background OMP jobs, retrieve a completed result, or cancel a running job. Never treat a running task as finished.",
+    description: "Fallback for checking, retrieving, or cancelling background OMP jobs. Completion arrives automatically; do not poll or retrieve results already delivered in full.",
+    renderShell: "self",
+    renderCall: () => new Text("", 0, 0),
+    renderResult: () => new Text("", 0, 0),
     parameters: Type.Object({
       action: Type.Union([Type.Literal("status"), Type.Literal("result"), Type.Literal("cancel")]),
       id: Type.Optional(Type.String()),
