@@ -220,7 +220,7 @@ test("failed and cancelled runs finish, and invalid IDs or symlink paths are rej
   controller.abort();
   expect((await pending).ok).toBe(false);
   const cancelled = listConversations().find((meta) => meta.task === "cancel")!;
-  expect(cancelled.state).toBe("failed");
+  expect(cancelled.state).toBe("cancelled");
   expect(cancelled.finishedAt).toBeNumber();
 });
 

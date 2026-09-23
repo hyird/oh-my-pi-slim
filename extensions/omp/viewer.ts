@@ -181,8 +181,8 @@ function taskLines(meta: ConversationMeta, width: number, selected: boolean): Vi
     heading: selected,
   }));
   if (width >= 18) {
-    const state = meta.state === "running" ? "◷ running" : meta.state === "failed" ? "✗ failed" : "✓ done";
-    lines.push({ text: width < 32 ? `  ${state}` : `  ${safeText(meta.agent)} · ${state}`, tone: meta.state === "running" ? "warning" : meta.state === "failed" ? "error" : "success" });
+    const state = meta.state === "running" ? "◷ running" : meta.state === "failed" ? "✗ failed" : meta.state === "cancelled" ? "■ cancelled" : "✓ done";
+    lines.push({ text: width < 32 ? `  ${state}` : `  ${safeText(meta.agent)} · ${state}`, tone: meta.state === "running" || meta.state === "cancelled" ? "warning" : meta.state === "failed" ? "error" : "success" });
   }
   return lines;
 }
@@ -219,7 +219,7 @@ export async function showConversationViewer(ctx: ExtensionContext, delegationId
     });
     const dispose = () => { if (closed) return; closed = true; wrapped = undefined; unsubscribe(); };
     const close = () => { if (closed) return; dispose(); done(undefined); };
-    const status = (state: ConversationMeta["state"]) => `${state === "running" ? "◷" : state === "failed" ? "✗" : "✓"} ${state}`;
+    const status = (state: ConversationMeta["state"]) => `${state === "running" ? "◷" : state === "failed" ? "✗" : state === "cancelled" ? "■" : "✓"} ${state}`;
     const component: Component & { dispose(): void } = {
       render(width: number) {
         const w = Math.max(1, width);

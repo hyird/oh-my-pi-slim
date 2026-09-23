@@ -11,13 +11,13 @@ import { startConversation } from "./transcript.ts";
 import { availableChildModels } from "./models.ts";
 
 export interface Assignment { agent: Role; task: string; prompt?: string }
-export interface Result { agent: Role; model: string; ok: boolean; output: string; usage: Usage }
+export interface Result { agent: Role; model: string; ok: boolean; output: string; usage: Usage; cancelled?: boolean }
 export interface AgentProgress {
   agent: Role;
   task: string;
   conversationId?: string;
   model?: string;
-  state: "queued" | "running" | "done" | "failed";
+  state: "queued" | "running" | "done" | "failed" | "cancelled";
   activity: string;
   text: string;
   activities: string[];
@@ -276,17 +276,17 @@ export async function runAgent(
         if (buffer) consume(buffer);
         const ok = !aborted && code === 0 && !error && !!output;
         const failure = aborted ? "Specialist cancelled" : `Specialist run failed (exit code ${code ?? "unknown"}); inspect the local conversation viewer${agent === "librarian" ? "; if MCP namespaces are missing, load pi-mcp-adapter and initialize context7/gh_grep eager metadata (never enable the global gateway)" : ""}`;
-        progress.state = ok ? "done" : "failed";
+        progress.state = ok ? "done" : aborted ? "cancelled" : "failed";
         // Raw stderr and provider errors may contain credentials. JSON events remain in the private recording.
-        try { conversation.finish(ok ? "done" : "failed", ok ? undefined : failure); }
+        try { conversation.finish(ok ? "done" : aborted ? "cancelled" : "failed", ok ? undefined : failure); }
         catch { error = "Failed to save specialist conversation"; progress.state = "failed"; }
         settled = true;
         report(ok ? "Work completed" : aborted ? "Cancelled" : "Run failed");
-        resolve({ agent, model, ok: ok && !error, output: ok && !error ? output : (error === "Failed to save specialist conversation" ? error : failure), usage });
+        resolve({ agent, model, ok: ok && !error, cancelled: aborted, output: ok && !error ? output : (error === "Failed to save specialist conversation" ? error : failure), usage });
       });
     });
   } catch (err) {
-    if (!settled) conversation.finish("failed", err instanceof Error ? err.message : String(err));
+    if (!settled) conversation.finish(signal?.aborted ? "cancelled" : "failed", err instanceof Error ? err.message : String(err));
     throw err;
   } finally {
     if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true });
@@ -334,21 +334,31 @@ export async function runAssignments(
           }, delegationId);
         } catch (err) {
           results[index] = {
-            agent: items[index].agent, model: modelOverride ?? "inherit", ok: false,
-            output: err instanceof Error ? err.message : String(err), usage: emptyUsage(),
+            agent: items[index].agent, model: modelOverride ?? "inherit", ok: false, cancelled: signal?.aborted,
+            output: signal?.aborted ? "Specialist cancelled" : err instanceof Error ? err.message : String(err), usage: emptyUsage(),
           };
         } finally {
           release?.();
         }
         progress[index] = {
-          ...progress[index], model: results[index].model, state: results[index].ok ? "done" : "failed",
-          activity: results[index].ok ? "Work completed" : "Run failed",
+          ...progress[index], model: results[index].model, state: results[index].ok ? "done" : results[index].cancelled ? "cancelled" : "failed",
+          activity: results[index].ok ? "Work completed" : results[index].cancelled ? "Cancelled" : "Run failed",
           text: results[index].ok ? results[index].output.slice(-2000) : progress[index].text,
         };
         publish(true);
       }
     }));
-    if (signal?.aborted) throw new Error("Specialist tasks cancelled");
+    if (signal?.aborted) {
+      for (let index = 0; index < items.length; index++) {
+        if (results[index]) continue;
+        results[index] = {
+          agent: items[index].agent, model: modelOverride ?? "inherit", ok: false,
+          cancelled: true, output: "Specialist cancelled before starting", usage: emptyUsage(),
+        };
+        progress[index] = { ...progress[index], state: "cancelled", activity: "Cancelled" };
+      }
+      publish(true);
+    }
     return results;
   } finally {
     if (timer) clearTimeout(timer);
@@ -356,5 +366,5 @@ export async function runAssignments(
 }
 
 export function formatResults(results: Result[]): string {
-  return results.map((result) => `${result.ok ? "OK" : "FAILED"} ${result.agent} [${result.model}]\n${result.output}`).join("\n\n---\n\n");
+  return results.map((result) => `${result.ok ? "OK" : result.cancelled ? "CANCELLED" : "FAILED"} ${result.agent} [${result.model}]\n${result.output}`).join("\n\n---\n\n");
 }

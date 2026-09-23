@@ -10,7 +10,7 @@ export interface ConversationMeta {
   agent: Role;
   task: string;
   model: string;
-  state: "running" | "done" | "failed";
+  state: "running" | "done" | "failed" | "cancelled";
   startedAt: number;
   finishedAt?: number;
   error?: string;
@@ -128,7 +128,7 @@ export function startConversation(agent: Role, task: string, model: string, dele
       append(fd, { type: "event", event });
       notify();
     },
-    finish(state: "done" | "failed", error?: string) {
+    finish(state: "done" | "failed" | "cancelled", error?: string) {
       if (finished) return;
       finished = true;
       meta.state = state;
@@ -212,7 +212,7 @@ export function listConversations(): ConversationMeta[] {
         if (body === undefined) return undefined;
         const meta = JSON.parse(body) as ConversationMeta;
         return meta.id === id && isRole(meta.agent) &&
-          (meta.state === "running" || meta.state === "done" || meta.state === "failed") &&
+          (meta.state === "running" || meta.state === "done" || meta.state === "failed" || meta.state === "cancelled") &&
           typeof meta.startedAt === "number" ? meta : undefined;
       } catch { return undefined; }
     })

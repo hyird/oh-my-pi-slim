@@ -29,6 +29,7 @@ function stateInfo(state: AgentProgress["state"]): { icon: string; name: string;
     case "running": return { icon: "◷", name: "running", color: "warning" };
     case "done": return { icon: "✓", name: "done", color: "success" };
     case "failed": return { icon: "✗", name: "failed", color: "error" };
+    case "cancelled": return { icon: "■", name: "cancelled", color: "warning" };
     default: return { icon: "○", name: "queued", color: "muted" };
   }
 }
@@ -154,17 +155,18 @@ export function renderOmpResult(
   const count = Math.max(progress.length, results.length);
   const complete = progress.filter((item) => item.state === "done").length;
   const failed = progress.filter((item) => item.state === "failed").length;
+  const cancelled = progress.filter((item) => item.state === "cancelled").length;
   const queued = options.isPartial && progress.every((item) => item.state === "queued");
-  const headerColor = failed || (!options.isPartial && results.some((item) => !item.ok)) ? "error" : queued ? "muted" : options.isPartial ? "warning" : "success";
-  const finished = progress.length ? complete + failed : results.length;
-  const status = options.isPartial ? queued ? "queued" : "running" : headerColor === "error" ? "failed" : "done";
-  view.addChild(new TruncatedText(theme.fg(headerColor, options.isPartial ? queued ? "○ " : "◷ " : headerColor === "error" ? "✗ " : "✓ ") + theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · ${status} · ${finished}/${count}`)));
+  const headerColor = cancelled ? "warning" : failed || (!options.isPartial && results.some((item) => !item.ok)) ? "error" : queued ? "muted" : options.isPartial ? "warning" : "success";
+  const finished = progress.length ? complete + failed + cancelled : results.length;
+  const status = options.isPartial ? queued ? "queued" : "running" : cancelled ? "cancelled" : headerColor === "error" ? "failed" : "done";
+  view.addChild(new TruncatedText(theme.fg(headerColor, options.isPartial ? queued ? "○ " : "◷ " : cancelled ? "■ " : headerColor === "error" ? "✗ " : "✓ ") + theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · ${status} · ${finished}/${count}`)));
   if (!count) return view;
 
   for (let index = 0; index < count; index++) {
     const item = progress[index];
     const final = results[index];
-    const state = !options.isPartial && final ? final.ok ? "done" : "failed" : item?.state ?? "queued";
+    const state = !options.isPartial && final ? final.ok ? "done" : final.cancelled ? "cancelled" : "failed" : item?.state ?? "queued";
     const { icon, name, color } = stateInfo(state);
     const agent = item?.agent ?? final?.agent ?? "agent";
     const expanded = interaction?.state.expanded?.has(index) ?? false;

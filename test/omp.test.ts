@@ -395,6 +395,54 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
   }
 });
 
+test("cancelled queued work finishes every task row without launching children", async () => {
+  initTheme();
+  const h = harness();
+  const controller = new AbortController();
+  controller.abort();
+  const snapshots: AgentProgress[][] = [];
+  const items = [
+    { agent: "explorer" as const, task: "first" },
+    { agent: "fixer" as const, task: "second" },
+  ];
+  const results = await runAssignments(h.ctx, items, controller.signal, (snapshot) => snapshots.push(snapshot));
+  expect(results).toHaveLength(2);
+  expect(results.every((item) => item.cancelled)).toBe(true);
+  expect(snapshots.at(-1)?.map((item) => item.state)).toEqual(["cancelled", "cancelled"]);
+  expect(formatResults(results)).toContain("CANCELLED explorer");
+  const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const card = renderOmpResult({ content: [], details: { progress: snapshots.at(-1), results } } as any,
+    { expanded: false, isPartial: false }, theme).render(100).join("\n");
+  expect(card).toContain("cancelled · 2/2");
+  expect(card).toContain("■ cancelled · Explorer task 1");
+  expect(card).toContain("■ cancelled · Fixer task 2");
+});
+
+test("cancelling after one child completes preserves its result and settles the rest", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "60";
+  const controller = new AbortController();
+  const snapshots: AgentProgress[][] = [];
+  try {
+    const items = Array.from({ length: 4 }, (_, index) => ({ agent: "explorer" as const, task: `task ${index}` }));
+    const results = await runAssignments(h.ctx, items, controller.signal, (snapshot) => {
+      snapshots.push(snapshot);
+      if (!controller.signal.aborted && snapshot.some((item) => item.state === "done")) controller.abort();
+    });
+    expect(results).toHaveLength(4);
+    expect(results.some((item) => item.ok)).toBe(true);
+    expect(results.some((item) => item.cancelled)).toBe(true);
+    expect(snapshots.at(-1)?.every((item) => item.state === "done" || item.state === "cancelled")).toBe(true);
+    expect(formatResults(results)).toContain("OK explorer");
+    expect(formatResults(results)).toContain("CANCELLED explorer");
+  } finally {
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
 test("OMP cards show only safe progress until final outputs, regardless of expansion", () => {
   initTheme();
   const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };

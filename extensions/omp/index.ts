@@ -113,7 +113,9 @@ export default function omp(pi: ExtensionAPI) {
       job.state = controller.signal.aborted ? "cancelled" : results.some((result) => !result.ok) ? "failed" : "done";
       repaint(job);
       const summary = formatResults(results);
-      const councilHeader = kind === "council"
+      const councilHeader = job.state === "cancelled"
+        ? "Some specialist tasks were cancelled. Review any completed results.\n\n"
+        : kind === "council"
         ? `${results.filter((result) => result.ok).length}/${results.length} reviewers responded. These perspectives use the same inherited model, so do not claim cross-model agreement. Synthesize disagreements.\n\n`
         : "Verify and integrate these specialist results before finalizing.\n\n";
       deliver(`OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
