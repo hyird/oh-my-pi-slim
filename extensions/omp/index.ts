@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Text } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
@@ -69,17 +68,12 @@ export default function omp(pi: ExtensionAPI) {
       controller, invalidators: new Map(),
     };
     jobs.set(id, job);
-    // Keep a bounded in-memory task board; running work is never evicted.
-    for (const [oldId, old] of jobs) {
-      if (jobs.size <= 24) break;
-      if (old.state !== "running") jobs.delete(oldId);
-    }
     const deliver = (content: string) => {
       if (job.session !== session) return;
       try {
         pi.sendMessage({ customType: "omp-background-result", display: false, content },
           { triggerTurn: true, deliverAs: "followUp" });
-      } catch { /* The result remains available through omp_task if the host cannot deliver. */ }
+      } catch { /* The completed task card remains visible if delivery fails. */ }
     };
     void runAssignments(ctx, prepared.items, controller.signal, (progress) => {
       job.progress = progress;
@@ -92,14 +86,14 @@ export default function omp(pi: ExtensionAPI) {
       const councilHeader = kind === "council"
         ? `${results.filter((result) => result.ok).length}/${results.length} reviewers responded. These perspectives use the same inherited model, so do not claim cross-model agreement. Synthesize disagreements.\n\n`
         : "Verify and integrate these specialist results before finalizing.\n\n";
-      deliver(`OMP background ${kind} task ${id} ${job.state}. ${councilHeader}${summary.slice(0, 30_000)}${summary.length > 30_000 ? `\n[Result truncated; call omp_task with action=result and id=${id}]` : ""}`);
+      deliver(`OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
     }).catch(() => {
       job.state = controller.signal.aborted ? "cancelled" : "failed";
       repaint(job);
-      deliver(`OMP background ${kind} task ${id} ${job.state}. Inspect partial work before retrying.`);
+      deliver(`OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
     });
     return {
-      content: [{ type: "text", text: `OMP background ${kind} task ${id} started. Continue independent work; completion will arrive automatically. Use omp_task to check status or retrieve results.` }],
+      content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work; completion will arrive automatically.` }],
       details: { jobId: id, progress: job.progress }, usage: prepared.usage,
     };
   };
@@ -188,7 +182,7 @@ export default function omp(pi: ExtensionAPI) {
       return;
     }
     event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
-    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background: track each task ID, continue only independent work, and wait for the automatic completion message before using its findings. Do not poll omp_task while waiting or fetch a result already delivered in full; use it only when completion is missing, output was truncated, or cancellation is needed. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
+    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background: continue only independent work, then wait for the automatic completion message before using its findings. Progress and assistant replies appear in the original OMP task card. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
   });
 
   pi.registerTool({
@@ -217,34 +211,6 @@ export default function omp(pi: ExtensionAPI) {
       onUpdate?.({ content: [{ type: "text", text: "OMP: preparing user-language prompts" }], details: { progress: queuedProgress(assignments) } });
       const prepared = await prepareAssignments(ctx, assignments, signal);
       return startJob(ctx, prepared, "delegate");
-    },
-  });
-
-  pi.registerTool({
-    name: "omp_task", label: "OMP task",
-    description: "Fallback for checking, retrieving, or cancelling background OMP jobs. Completion arrives automatically; do not poll or retrieve results already delivered in full.",
-    renderShell: "self",
-    renderCall: () => new Text("", 0, 0),
-    renderResult: () => new Text("", 0, 0),
-    parameters: Type.Object({
-      action: Type.Union([Type.Literal("status"), Type.Literal("result"), Type.Literal("cancel")]),
-      id: Type.Optional(Type.String()),
-    }),
-    async execute(_id, { action, id }) {
-      if (role === "pi") throw new Error("OMP delegation is disabled while the default agent is pi");
-      const reply = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
-      if (action === "status" && !id) {
-        const text = [...jobs.values()].map((job) => `${job.id} · ${job.state} · ${job.progress.filter((item) => item.state === "done" || item.state === "failed").length}/${job.progress.length}`).join("\n");
-        return reply(text || "No OMP background tasks in this session.");
-      }
-      if (!id || !jobs.has(id)) throw new Error("Unknown OMP task ID in this session");
-      const job = jobs.get(id)!;
-      if (action === "cancel") {
-        if (job.state === "running") job.controller.abort();
-        return reply(`${id} · ${job.state === "running" ? "cancellation requested" : job.state}`);
-      }
-      if (action === "result") return reply(job.results ? formatResults(job.results) : `${id} · ${job.state}`);
-      return reply(`${id} · ${job.state}\n${job.progress.map((item) => `${item.agent} · ${item.state}`).join("\n")}`);
     },
   });
 

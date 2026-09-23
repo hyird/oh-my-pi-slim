@@ -289,7 +289,6 @@ describe("/omp settings entry point", () => {
     await h.handlers.session_start({ reason: "new" }, h.ctx);
     await expect(h.tools.omp_delegate.execute("id", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx)).rejects.toThrow("disabled while the default agent is pi");
     await expect(h.tools.omp_council.execute("id", { question: "review" }, undefined, undefined, h.ctx)).rejects.toThrow("disabled while the default agent is pi");
-    await expect(h.tools.omp_task.execute("id", { action: "status" }, undefined, undefined, h.ctx)).rejects.toThrow("disabled while the default agent is pi");
     expect(h.translations).toEqual([]);
   });
   test("recovers legacy specialist defaults as orchestrator while retaining model overrides", async () => {
@@ -322,20 +321,9 @@ describe("/omp settings entry point", () => {
     expect(event.systemPromptOptions.sections.omp_role).toContain("Active OMP main agent: orchestrator");
     expect(event.systemPromptOptions.sections.omp_role).toContain("not the default implementation worker");
     expect(event.systemPromptOptions.sections.omp_role).toContain("multi-file implementation");
-    expect(Object.keys(h.tools).sort()).toEqual(["omp_council", "omp_delegate", "omp_task"]);
+    expect(Object.keys(h.tools).sort()).toEqual(["omp_council", "omp_delegate"]);
     await expect(h.tools.omp_delegate.execute("id", { agent: "bad", task: "test" }, undefined, undefined, h.ctx)).rejects.toThrow();
   });
-});
-
-test("omp_task stays invisible in the transcript while preserving model-facing output", async () => {
-  const h = harness();
-  const tool = h.tools.omp_task;
-  const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
-  expect(tool.renderShell).toBe("self");
-  expect(tool.renderCall({ action: "status" }, theme).render(80)).toEqual([]);
-  const result = await tool.execute("status", { action: "status" }, undefined, undefined, h.ctx);
-  expect(result.content[0].text).toContain("No OMP background tasks");
-  expect(tool.renderResult(result, { expanded: true, isPartial: false }, theme).render(80)).toEqual([]);
 });
 
 test("isolated child uses the configured specialist model and tool allowlist (offline fake Pi)", async () => {
@@ -585,19 +573,16 @@ test("background delegation returns immediately, updates its card and delivers c
     const context = { state, toolCallId: "background-call", invalidate: () => invalidations++ };
     const card = tool.renderCall({ agent: "explorer", task: "inspect" }, theme, context);
     const result = await tool.execute("background-call", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
-    const id = result.details.jobId;
-    expect(id).toBeString();
+    expect(result.details.jobId).toBeString();
     expect(result.content[0].text).toContain("started");
+    expect(result.content[0].text).not.toContain(result.details.jobId);
     expect(h.sentMessages).toHaveLength(0);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100).join("\n")).toContain("running");
-    const pending = await h.tools.omp_task.execute("status", { action: "status", id }, undefined, undefined, h.ctx);
-    expect(pending.content[0].text).toContain("running");
     await waitFor(() => h.sentMessages.length === 1);
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
     expect(h.sentMessages[0].options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
-    const retrieved = await h.tools.omp_task.execute("result", { action: "result", id }, undefined, undefined, h.ctx);
-    expect(retrieved.content[0].text).toContain("Specialist read the task");
+    expect(h.sentMessages[0].message.content).not.toContain(result.details.jobId);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100).join("\n")).toContain("done");
     expect(invalidations).toBeGreaterThan(0);
@@ -607,21 +592,16 @@ test("background delegation returns immediately, updates its card and delivers c
   }
 });
 
-test("background task cancellation does not present a successful result", async () => {
+test("session shutdown cancels background work without sending a stale result", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "300";
   try {
-    const started = await h.tools.omp_delegate.execute("background-cancel", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
-    const id = started.details.jobId;
-    const cancelled = await h.tools.omp_task.execute("cancel", { action: "cancel", id }, undefined, undefined, h.ctx);
-    expect(cancelled.content[0].text).toContain("cancellation requested");
-    await waitFor(() => h.sentMessages.length === 1);
-    expect(h.sentMessages[0].message.content).toContain("cancelled");
-    expect(h.sentMessages[0].message.content).not.toContain("Specialist read the task");
-    const status = await h.tools.omp_task.execute("status", { action: "status", id }, undefined, undefined, h.ctx);
-    expect(status.content[0].text).toContain("· cancelled");
+    await h.tools.omp_delegate.execute("background-cancel", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
+    h.handlers.session_shutdown?.({}, h.ctx);
+    await Bun.sleep(100);
+    expect(h.sentMessages).toHaveLength(0);
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_WAIT_MS;
@@ -639,13 +619,14 @@ test("background batches share one three-child limit", async () => {
       { agent: "explorer", task: "two" },
       { agent: "explorer", task: "three" },
     ] }, undefined, undefined, h.ctx);
+    const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
     await waitFor(async () => {
-      const status = await h.tools.omp_task.execute("status", { action: "status", id: first.details.jobId }, undefined, undefined, h.ctx);
-      return (status.content[0].text.match(/explorer · running/g) ?? []).length === 3;
+      const card = h.tools.omp_delegate.renderResult(first, { expanded: false, isPartial: true }, theme).render(100).join("\n");
+      return (card.match(/running · Explorer task/g) ?? []).length === 3;
     });
     const second = await h.tools.omp_delegate.execute("second-batch", { agent: "explorer", task: "four" }, undefined, undefined, h.ctx);
-    const pending = await h.tools.omp_task.execute("status", { action: "status", id: second.details.jobId }, undefined, undefined, h.ctx);
-    expect(pending.content[0].text).toContain("explorer · queued");
+    const pending = h.tools.omp_delegate.renderResult(second, { expanded: false, isPartial: true }, theme).render(100).join("\n");
+    expect(pending).toContain("queued · Explorer task");
     await waitFor(() => h.sentMessages.length === 2, 150);
   } finally {
     h.handlers.session_shutdown?.({}, h.ctx);
@@ -717,9 +698,8 @@ test("specialist failure sets no widget and exposes failure state", async () => 
     process.env.OMP_TEST_FAIL = "1";
     const failed = await h.tools.omp_delegate.execute("failed", { agent: "explorer", task: "simulate failure" }, undefined, undefined, h.ctx);
     await waitFor(() => h.sentMessages.length === 1);
-    const result = await h.tools.omp_task.execute("result", { action: "result", id: failed.details.jobId }, undefined, undefined, h.ctx);
-    expect(result.content[0].text).toContain("inspect the local conversation viewer");
-    expect(result.content[0].text).not.toContain("simulated failure");
+    expect(h.sentMessages[0].message.content).toContain("inspect the local conversation viewer");
+    expect(h.sentMessages[0].message.content).not.toContain("simulated failure");
     const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
     for (const isExpanded of [false, true]) {
       const displayed = h.tools.omp_delegate.renderResult(failed, { expanded: isExpanded, isPartial: false }, theme).render(80).join("\n");

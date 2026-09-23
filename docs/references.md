@@ -6,7 +6,7 @@ These are **read-only inspiration**, not runtime dependencies or promises of API
 
 - `src/agents/orchestrator.ts`: routing is decided by the main model, not a keyword classifier. Direct work is reserved for an isolated low-risk step; bounded implementation goes to Fixer, UI/UX to Designer, exploration to Explorer, research to Librarian, and expensive decisions to Oracle/Council. Independent tasks can be delegated in parallel. OMP adopts this decision threshold, not upstream performance or cost claims.
 - `src/agents/index.ts`: Orchestrator is a primary role, Council can be primary or delegated, and Explorer/Librarian/Oracle/Designer/Fixer are specialists. OMP adds `pi` as a native main-role choice.
-- `src/index.ts` and `src/hooks/task-session-manager/`: OpenCode supplies its own task host and reusable child sessions. OMP provides background job IDs, a three-child scheduler, status/result/cancel operations, and automatic completion messages, but its child processes cannot be resumed as native sessions.
+- `src/index.ts` and `src/hooks/task-session-manager/`: OpenCode supplies its own task host and reusable child sessions. OMP provides background dispatch, a three-child scheduler, inline task status, and automatic completion messages, but its child processes cannot be resumed as native sessions.
 
 ## [mjakl/pi-subagent](https://github.com/mjakl/pi-subagent) (3.0.3 reference)
 
@@ -29,7 +29,7 @@ For main roles OMP filters active adapter tools at startup, role switches, and e
 
 ## What OMP actually does
 
-`/omp` opens settings only. The main model may call `omp_delegate` for one to four tasks or `omp_council` for three perspectives. Both use the same background scheduler, with at most three child subprocesses running across jobs. Each call returns a task ID; `omp_task` lists, checks, retrieves, or cancels jobs, and completion is automatically delivered to the main agent. Neither tool is automatically invoked by a keyword rule. Council perspectives inherit the main session's model and thinking level; they are separate runs, not different-model agreement. The main session remains responsible for verification and synthesis. Children have role tool allowlists, inherit project trust, and are not OS-sandboxed.
+`/omp` opens settings only. The main model may call `omp_delegate` for one to four tasks or `omp_council` for three perspectives. Both use the same background scheduler, with at most three child subprocesses running across calls. Progress and assistant replies remain in the original inline task card, and completion is automatically delivered to the main agent. There is no separate status/result tool. Neither dispatch tool is automatically invoked by a keyword rule. Council perspectives inherit the main session's model and thinking level; they are separate runs, not different-model agreement. The main session remains responsible for verification and synthesis. Children have role tool allowlists, inherit project trust, and are not OS-sandboxed.
 
 Inline cards show task names and status. Clicking one task row expands its task text and assistant replies from JSON event logs in `getAgentDir()/omp/conversations`; tool activity and thinking are not displayed. Model-facing replies are truncated independently of the recording. Older logs remain on disk and may hold sensitive data until manually removed. Do not treat them as Pi-native persisted sessions. OMP does not capture hidden provider thinking that was never emitted.
 
