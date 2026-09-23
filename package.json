@@ -1,12 +1,12 @@
 {
   "name": "@hyird/oh-my-pi-slim",
   "version": "0.1.1",
+  "private": true,
   "type": "module",
   "description": "OMP: Pi-native agent orchestration and /omp configuration",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/hyird/oh-my-pi-slim.git" },
   "homepage": "https://github.com/hyird/oh-my-pi-slim#readme",
-  "publishConfig": { "access": "public" },
   "files": ["extensions/", "docs/", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./extensions/omp/index.ts"]
