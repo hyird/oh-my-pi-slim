@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Container } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
@@ -103,8 +103,12 @@ export default function omp(pi: ExtensionAPI) {
     const active = [...jobs.values()].filter((job) => job.session === runtime.session && job.state === "running");
     ctx.ui.setWidget("omp-active", active.length ? (_tui, theme) => {
       const view = new Container();
-      for (const job of active) {
-        view.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned));
+      for (const [index, job] of active.entries()) {
+        if (index) view.addChild(new Spacer(1));
+        // Match Pi's normal tool result shell, including its padding and background.
+        const card = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
+        card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned));
+        view.addChild(card);
       }
       return view;
     } : undefined, { placement: "aboveEditor" });
@@ -349,11 +353,11 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_delegate", label: "OMP delegate",
-    description: "Start background specialist work and receive an automatic completion message. One to four independent tasks run concurrently. Specialists: explorer, librarian, oracle, designer, fixer. Do not send secret credentials in tasks.",
+    description: "Start background specialist work and receive an automatic completion message. Any number of independent tasks run concurrently. Specialists: explorer, librarian, oracle, designer, fixer. Do not send secret credentials in tasks.",
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Specialist for a single task" })),
       task: Type.Optional(Type.String({ description: "Bounded task for the specialist" })),
-      tasks: Type.Optional(Type.Array(Type.Object({ agent: Type.String(), task: Type.String() }), { maxItems: 4 })),
+      tasks: Type.Optional(Type.Array(Type.Object({ agent: Type.String(), task: Type.String() }))),
     }),
     renderCall(args, theme, context) {
       const tasks = args.tasks ?? [{ agent: args.agent ?? "explorer", task: args.task ?? "" }];
@@ -364,7 +368,7 @@ export default function omp(pi: ExtensionAPI) {
       if (role === "pi") throw new Error("OMP delegation is disabled while the default agent is pi");
       const single = params.agent !== undefined || params.task !== undefined;
       const list = params.tasks !== undefined;
-      if (single === list || (list && (!params.tasks?.length || params.tasks.length > 4))) throw new Error("Provide either one agent + task or 1-4 tasks");
+      if (single === list || (list && !params.tasks?.length)) throw new Error("Provide either one agent + task or a non-empty tasks array");
       const items = (list ? params.tasks! : [{ agent: params.agent!, task: params.task! }]);
       if (items.some((item) => !isRole(item.agent) || ["orchestrator", "council"].includes(item.agent) || !item.task?.trim() || item.task.length > 12_000)) {
         throw new Error("Only explorer/librarian/oracle/designer/fixer are supported; task must be 1-12000 characters");

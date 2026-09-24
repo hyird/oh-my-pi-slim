@@ -83,7 +83,7 @@ async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
 function widgetText(content: any, width = 100): string {
   if (!content) return "";
   if (Array.isArray(content)) return content.join("\n");
-  const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
   return content({ requestRender: () => {} }, theme).render(width).join("\n");
 }
 
@@ -418,7 +418,7 @@ test("cancelled queued work finishes every task row without launching children",
   expect(results.every((item) => item.cancelled)).toBe(true);
   expect(snapshots.at(-1)?.map((item) => item.state)).toEqual(["cancelled", "cancelled"]);
   expect(formatResults(results)).toContain("CANCELLED explorer");
-  const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const theme: any = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text };
   const card = renderOmpResult({ content: [], details: { progress: snapshots.at(-1), results } } as any,
     { expanded: false, isPartial: false }, theme).render(100).join("\n");
   expect(card).toContain("cancelled · 2/2");
@@ -646,7 +646,7 @@ test("background delegation returns immediately, updates its card and delivers c
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "100";
-  const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const theme: any = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text };
   let pinned: any;
   h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
   try {
@@ -664,8 +664,16 @@ test("background delegation returns immediately, updates its card and delivers c
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100)).toEqual([]);
     expect(widgetText(pinned)).toContain("running · Explorer task");
-    const fixedCard = pinned({ requestRender: () => {} }, theme);
-    const mouse = (type: "press" | "release" | "click"): any => ({ type, button: "left", x: 40, y: 1, screenX: 40, screenY: 1, width: 100, height: 2, shift: false, alt: false, ctrl: false });
+    const backgrounds: string[] = [];
+    const fixedCard = pinned({ requestRender: () => {} }, {
+      ...theme, bg: (color: string, text: string) => { backgrounds.push(color); return text; },
+    });
+    const fixedLines = fixedCard.render(100);
+    expect(backgrounds).toContain("toolSuccessBg");
+    expect(fixedLines[0].trim()).toBe("");
+    expect(fixedLines[1]).toContain("OMP · running");
+    expect(fixedLines.at(-1)?.trim()).toBe("");
+    const mouse = (type: "press" | "release" | "click"): any => ({ type, button: "left", x: 40, y: 2, screenX: 40, screenY: 2, width: 100, height: 4, shift: false, alt: false, ctrl: false });
     fixedCard.handleMouse?.(mouse("press"));
     fixedCard.handleMouse?.(mouse("release"));
     fixedCard.handleMouse?.(mouse("click"));
@@ -823,6 +831,31 @@ test("background batches start more than three children concurrently", async () 
   } finally {
     h.handlers.session_shutdown?.({}, h.ctx);
     await Bun.sleep(100);
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
+test("one delegation accepts more than four tasks without a count limit", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "300";
+  try {
+    const tool = h.tools.omp_delegate;
+    expect(tool.parameters.properties.tasks.maxItems).toBeUndefined();
+    const tasks = Array.from({ length: 5 }, (_, index) => ({ agent: "explorer", task: `inspect ${index + 1}` }));
+    const result = await tool.execute("five-task-batch", { tasks }, undefined, undefined, h.ctx);
+    expect(result.details.progress).toHaveLength(5);
+    const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+    await waitFor(() => {
+      const card = tool.renderResult(result, { expanded: false, isPartial: true }, theme).render(100).join("\n");
+      return h.sentMessages.length === 0 && (card.match(/running · Explorer task/g) ?? []).length === 5;
+    });
+    await waitFor(() => h.sentMessages.length === 1, 120);
+    expect(h.sentMessages[0].message.content.match(/OK explorer/g)).toHaveLength(5);
+  } finally {
+    h.handlers.session_shutdown?.({}, h.ctx);
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_WAIT_MS;
   }
