@@ -1,4 +1,4 @@
-import { stripTerminalSequences, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { truncateToWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 
 export interface PinnedScrollState { listTop: number; detailTop: number; focusedListRow?: number }
 
@@ -11,6 +11,7 @@ export function scrollablePinnedCard(
   state: PinnedScrollState,
   requestRender: () => void,
   hint: (text: string) => string,
+  setInlineRange?: (label: string | undefined) => boolean,
 ): Component {
   const maxRows = Math.max(1, Math.floor(terminalRows * 0.65));
   let listHeight = 0;
@@ -65,14 +66,13 @@ export function scrollablePinnedCard(
       detailContentRows = visibleDetail.contentRows;
       detailScreenRows = visibleDetail.lines.length;
       detailStart = detail ? Math.max(0, Math.min(listContentRows, (insertAfterRow ?? listHeight) - state.listTop)) : listScreenRows;
-      if (detail && detailHeight > detailContentRows && detailContentRows > 0 && insertAfterRow !== undefined) {
-        const row = insertAfterRow - state.listTop - 1;
-        if (row >= 0 && row < listContentRows) {
-          const label = ` ↕ ${state.detailTop + 1}–${Math.min(detailHeight, state.detailTop + detailContentRows)}/${detailHeight}`;
-          const available = width - visibleWidth(label);
-          const taskWidth = visibleWidth(stripTerminalSequences(visibleList.lines[row]).trimEnd());
-          if (available >= taskWidth) visibleList.lines[row] = truncateToWidth(visibleList.lines[row], available, "") + hint(label);
-        }
+      const range = detail && detailHeight > detailContentRows && detailContentRows > 0
+        ? ` ↕ ${state.detailTop + 1}–${Math.min(detailHeight, state.detailTop + detailContentRows)}/${detailHeight}`
+        : undefined;
+      if (setInlineRange?.(range)) {
+        // The range belongs to the task row itself, so its hover and card
+        // background are rendered by the same components as the task name.
+        visibleList.lines = region(list.render(width), listBudget, state.listTop, width).lines;
       }
       return [
         ...visibleList.lines.slice(0, detailStart),

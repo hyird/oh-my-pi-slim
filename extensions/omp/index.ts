@@ -138,12 +138,14 @@ export default function omp(pi: ExtensionAPI) {
       }
       let detail: Box | undefined;
       let insertAfterRow: number | undefined;
+      let expandedState: OmpRenderState | undefined;
       for (const call of pending) {
         const index = call.state.expanded?.values().next().value;
         if (index === undefined || !call.tasks[index]) continue;
         detail = new Box(1, 0, (text) => theme.bg("toolPendingBg", text));
         detail.addChild(renderPinnedOmpDetail(call.tasks[index].task, undefined, undefined, theme));
         insertAfterRow = cardStarts.get(call.state)! + 3 + index;
+        expandedState = call.state;
         break;
       }
       if (!detail) for (const job of pinned) {
@@ -152,10 +154,16 @@ export default function omp(pi: ExtensionAPI) {
         detail = new Box(1, 0, (text) => theme.bg("toolSuccessBg", text));
         detail.addChild(renderPinnedOmpDetail(job.progress[index].task, job.progress[index], job.results?.[index], theme));
         insertAfterRow = cardStarts.get(job.pinnedState)! + 3 + index;
+        expandedState = job.pinnedState;
         break;
       }
       return scrollablePinnedCard(list, detail, insertAfterRow, tui.terminal?.rows ?? 24, runtime.scroll,
-        () => tui.requestRender(), (text) => theme.fg("muted", text));
+        () => tui.requestRender(), (text) => theme.fg("muted", text), (label) => {
+          if (!expandedState || expandedState.inlineRange === label) return false;
+          expandedState.inlineRange = label;
+          list.invalidate();
+          return true;
+        });
     } : undefined, { placement: "aboveEditor" });
   };
   const pinnedJob = (callId: string) => [...jobs.values()].find((job) => job.callId === callId && !job.released);

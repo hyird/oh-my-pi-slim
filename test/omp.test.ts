@@ -7,7 +7,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { configPath, parseConfig, parseModel, readConfig, updateConfig } from "../extensions/omp/config.ts";
 import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Assignment, type Result } from "../extensions/omp/subagents.ts";
 import { getChoices, getSettingsRows, INHERIT, INHERIT_THINKING } from "../extensions/omp/settings-ui.ts";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { renderOmpCall, renderOmpResult, renderOmpToolCall, renderPinnedOmpCard } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
 
@@ -760,8 +760,12 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   expect(expandedLines).toHaveLength(13);
   expect(expandedLines.join("\n")).toContain("detail line 1");
   expect(expandedLines.join("\n")).toContain("Explorer task 1");
-  expect(expandedLines.find((line: string) => line.includes("Explorer task 1"))).toContain("1–");
+  expect(stripTerminalSequences(expandedLines.find((line: string) => line.includes("Explorer task 1")) ?? ""))
+    .toContain("Explorer task 1 ▾ ↕ 1–");
   expect(expandedLines.join("\n")).not.toContain("· scroll");
+  const narrowRow = card.render(36).find((line: string) => line.includes("Explorer task 1")) ?? "";
+  expect(stripTerminalSequences(narrowRow)).toContain("Explorer task 1 ▾");
+  expect(stripTerminalSequences(narrowRow)).not.toContain("↕");
   expect(expandedLines.join("\n")).toContain("Fixer task 2");
   expect(expandedLines.findIndex((line: string) => line.includes("Explorer task 1")))
     .toBeLessThan(expandedLines.findIndex((line: string) => line.includes("detail line 1")));

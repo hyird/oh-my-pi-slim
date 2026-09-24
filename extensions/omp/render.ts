@@ -1,5 +1,5 @@
 import { getMarkdownTheme, type AgentToolResult, type Theme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, MouseRegion, TruncatedText, type Component } from "@earendil-works/pi-tui";
+import { Container, Markdown, MouseRegion, TruncatedText, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { AgentProgress, Assignment, OmpDetails, Result } from "./subagents.ts";
 import { getConversation } from "./transcript.ts";
 import { assistantReplies, safeText } from "./conversation-content.ts";
@@ -43,7 +43,7 @@ function taskName(agent: string, index: number, count: number): string {
   return count > 1 ? `${title} ${index + 1}` : title;
 }
 
-export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number }
+export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number; inlineRange?: string }
 interface Interaction { state: OmpRenderState; invalidate: () => void; toggle?: (index: number) => void }
 
 function taskRow(line: string, index: number, theme: Theme, interaction?: Interaction): Component {
@@ -51,7 +51,10 @@ function taskRow(line: string, index: number, theme: Theme, interaction?: Intera
   if (!interaction) return text;
   const highlighted: Component = {
     render(width) {
-      const rows = text.render(width);
+      const range = interaction.state.expanded?.has(index) ? interaction.state.inlineRange : undefined;
+      const rows = range && visibleWidth(line) + visibleWidth(range) <= width
+        ? new TruncatedText(line + theme.fg("muted", range)).render(width)
+        : text.render(width);
       return interaction.state.hovered === index && theme.bg ? rows.map((row) => theme.bg("selectedBg", row)) : rows;
     },
     invalidate() { text.invalidate(); },
