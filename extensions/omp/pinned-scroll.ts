@@ -1,61 +1,97 @@
 import { truncateToWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 
-export interface PinnedScrollState { top: number }
+export interface PinnedScrollState { listTop: number; detailTop: number; focusedListRow?: number }
 
-/** Keep the fixed widget within the terminal while preserving mouse targets. */
+/** Bound the fixed widget while keeping task rows above the scrolling detail. */
 export function scrollablePinnedCard(
-  content: Component,
+  list: Component,
+  detail: Component | undefined,
   terminalRows: number,
   state: PinnedScrollState,
   requestRender: () => void,
   hint: (text: string) => string,
 ): Component {
   const maxRows = Math.max(1, Math.floor(terminalRows * 0.65));
-  let contentHeight = 0;
-  let visibleRows = maxRows;
+  let listHeight = 0;
+  let detailHeight = 0;
+  let listContentRows = 0;
+  let detailContentRows = 0;
+  let listScreenRows = 0;
   let viewportWidth = 0;
-  const clamp = () => { state.top = Math.max(0, Math.min(state.top, contentHeight - visibleRows)); };
+  const clamp = (top: number, height: number, contentRows: number) =>
+    Math.max(0, Math.min(top, height - contentRows));
+  const region = (lines: string[], budget: number, top: number, width: number) => {
+    if (budget <= 0) return { lines: [], top: 0, contentRows: 0 };
+    if (lines.length <= budget) return { lines, top: 0, contentRows: lines.length };
+    const contentRows = budget - 1;
+    const position = clamp(top, lines.length, contentRows);
+    const first = position + 1;
+    const last = Math.min(lines.length, position + contentRows);
+    return {
+      lines: [
+        ...lines.slice(position, position + contentRows),
+        hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width)),
+      ],
+      top: position,
+      contentRows,
+    };
+  };
   return {
     render(width) {
       viewportWidth = width;
-      const lines = content.render(width);
-      contentHeight = lines.length;
-      if (contentHeight <= maxRows) {
-        state.top = 0;
-        visibleRows = maxRows;
-        return lines;
+      const listLines = list.render(width);
+      const detailLines = detail?.render(width) ?? [];
+      listHeight = listLines.length;
+      detailHeight = detailLines.length;
+      // Reserve up to four rows for an open detail when the task list is long.
+      const listBudget = detail ? Math.min(listHeight, Math.max(1, maxRows - Math.min(4, detailHeight))) : maxRows;
+      const listVisibleContent = listHeight > listBudget ? Math.max(0, listBudget - 1) : listHeight;
+      if (state.focusedListRow !== undefined && listVisibleContent > 0) {
+        if (state.focusedListRow < state.listTop) state.listTop = state.focusedListRow;
+        else if (state.focusedListRow >= state.listTop + listVisibleContent) {
+          state.listTop = state.focusedListRow - listVisibleContent + 1;
+        }
       }
-      visibleRows = Math.max(0, maxRows - 1);
-      clamp();
-      const first = state.top + 1;
-      const last = Math.min(contentHeight, state.top + visibleRows);
-      return [
-        ...lines.slice(state.top, state.top + visibleRows),
-        hint(truncateToWidth(`  ↕ ${first}–${last}/${contentHeight} · scroll`, width)),
-      ];
+      const visibleList = region(listLines, listBudget, state.listTop, width);
+      state.listTop = visibleList.top;
+      state.focusedListRow = undefined;
+      listContentRows = visibleList.contentRows;
+      listScreenRows = visibleList.lines.length;
+      const visibleDetail = region(detailLines, maxRows - listScreenRows, state.detailTop, width);
+      state.detailTop = visibleDetail.top;
+      detailContentRows = visibleDetail.contentRows;
+      return [...visibleList.lines, ...visibleDetail.lines];
     },
-    invalidate() { content.invalidate(); },
+    invalidate() { list.invalidate(); detail?.invalidate(); },
     handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-      if (event.type === "wheel" && contentHeight > maxRows) {
-        const previous = state.top;
-        state.top += event.wheelDelta ?? 0;
-        clamp();
-        if (state.top !== previous) requestRender();
-        return { handled: true, render: state.top !== previous };
+      const inList = event.y < listScreenRows;
+      const regionTop = inList ? state.listTop : state.detailTop;
+      const regionHeight = inList ? listHeight : detailHeight;
+      const regionContentRows = inList ? listContentRows : detailContentRows;
+      const target = inList ? list : detail;
+      const localY = inList ? event.y : event.y - listScreenRows;
+      if (event.type === "wheel") {
+        // When all task rows fit, wheel motion anywhere scrolls the detail.
+        const scrollDetail = !!detail && (!inList || listHeight <= listScreenRows);
+        const key = scrollDetail ? "detailTop" : "listTop";
+        const height = scrollDetail ? detailHeight : listHeight;
+        const contentRows = scrollDetail ? detailContentRows : listContentRows;
+        if (height > contentRows && contentRows > 0) {
+          const previous = state[key];
+          state[key] = clamp(previous + (event.wheelDelta ?? 0), height, contentRows);
+          if (state[key] !== previous) requestRender();
+          return { handled: true, render: state[key] !== previous };
+        }
+        return undefined;
       }
-      if (event.y < 0 || event.y >= visibleRows) return undefined;
-      const targetRow = event.y + state.top;
-      const result = content.handleMouse?.({
+      if (!target || localY < 0 || localY >= regionContentRows) return undefined;
+      const result = target.handleMouse?.({
         ...event,
-        y: targetRow,
+        y: localY + regionTop,
         width: viewportWidth || event.width,
-        height: contentHeight,
+        height: regionHeight,
       });
-      // A row opened near the bottom should reveal the first lines below it.
-      if (event.type === "click" && result?.handled && contentHeight > maxRows) {
-        const nextTop = Math.max(state.top, targetRow + 4 - visibleRows);
-        if (nextTop !== state.top) { state.top = nextTop; requestRender(); }
-      }
+      if (inList && event.type === "click" && result?.handled) state.focusedListRow = localY + regionTop;
       return result;
     },
   };

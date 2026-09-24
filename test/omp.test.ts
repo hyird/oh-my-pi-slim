@@ -530,7 +530,7 @@ test("OMP tool rows replace queued content in place as progress changes", () => 
   }
 });
 
-test("the fixed OMP card keeps task row click expansion", () => {
+test("the fixed OMP list marks the selected task without inlining its detail", () => {
   initTheme();
   const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
   const state: any = {};
@@ -542,7 +542,9 @@ test("the fixed OMP card keeps task row click expansion", () => {
   card.handleMouse?.(mouse("release"));
   card.handleMouse?.(mouse("click"));
   card = renderPinnedOmpCard(progress, undefined, 1, theme, state, () => {});
-  expect(card.render(80).join("\n")).toContain("inspect private task");
+  expect(state.expanded.has(0)).toBe(true);
+  expect(card.render(80).join("\n")).toContain("Explorer task ▾");
+  expect(card.render(80).join("\n")).not.toContain("inspect private task");
 });
 
 test("OMP rendering tracks theme changes and stays within narrow widths", () => {
@@ -756,16 +758,52 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   card = pinned(tui, theme);
   expect(card.render(100)).toHaveLength(13);
   expect(card.render(100).join("\n")).toContain("detail line 1");
+  expect(card.render(100).join("\n")).toContain("Explorer task 1");
+  expect(card.render(100).join("\n")).toContain("Fixer task 2");
   card.handleMouse?.(mouse("wheel", 5, 100));
   card = pinned(tui, theme);
   const scrolled = card.render(100);
   expect(scrolled).toHaveLength(13);
+  expect(scrolled.join("\n")).toContain("Explorer task 1");
   expect(scrolled.join("\n")).toContain("Fixer task 2");
   const secondRow = scrolled.findIndex((line: string) => line.includes("Fixer task 2"));
   expect(secondRow).toBeGreaterThanOrEqual(0);
   card.handleMouse?.(mouse("click", secondRow));
   card = pinned(tui, theme);
-  expect(card.render(100).join("\n")).toContain("second task detail");
+  const second = card.render(100).join("\n");
+  expect(second).toContain("second task detail");
+  expect(second).toContain("Explorer task 1 ▸");
+  expect(second).toContain("Fixer task 2 ▾");
+  expect(second).not.toContain("detail line 60");
+  h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+});
+
+test("only one task can stay expanded across separate fixed OMP cards", () => {
+  initTheme();
+  const h = harness();
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  h.handlers.tool_execution_start({ toolCallId: "first", toolName: "omp_delegate", args: { agent: "explorer", task: "first private detail" } }, h.ctx);
+  h.handlers.tool_execution_start({ toolCallId: "second", toolName: "omp_delegate", args: { agent: "fixer", task: "second private detail" } }, h.ctx);
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const tui: any = { terminal: { rows: 30 }, requestRender: () => {} };
+  const click = (y: number): any => ({ type: "click", button: "left", x: 10, y, screenX: 10, screenY: y,
+    width: 100, height: 15, shift: false, alt: false, ctrl: false });
+  let card = pinned(tui, theme);
+  expect(card.render(100).join("\n")).not.toContain("private detail");
+  card.handleMouse?.(click(2));
+  card = pinned(tui, theme);
+  const first = card.render(100).join("\n");
+  expect(first).toContain("first private detail");
+  expect(first).not.toContain("second private detail");
+  const secondRow = card.render(100).findIndex((line: string) => line.includes("Fixer task"));
+  card.handleMouse?.(click(secondRow));
+  card = pinned(tui, theme);
+  const second = card.render(100).join("\n");
+  expect(second).toContain("second private detail");
+  expect(second).not.toContain("first private detail");
+  expect(second).toContain("Explorer task ▸");
+  expect(second).toContain("Fixer task ▾");
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
 

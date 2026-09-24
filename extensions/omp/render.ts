@@ -44,7 +44,7 @@ function taskName(agent: string, index: number, count: number): string {
 }
 
 export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number }
-interface Interaction { state: OmpRenderState; invalidate: () => void }
+interface Interaction { state: OmpRenderState; invalidate: () => void; toggle?: (index: number) => void }
 
 function taskRow(line: string, index: number, theme: Theme, interaction?: Interaction): Component {
   const text = new TruncatedText(line);
@@ -66,9 +66,13 @@ function taskRow(line: string, index: number, theme: Theme, interaction?: Intera
     }
     if (event.type === "release") return { handled: true, render: false };
     if (event.type === "click" && event.button === "left") {
+      if (interaction.toggle) {
+        interaction.toggle(index);
+        return { handled: true };
+      }
       const expanded = interaction.state.expanded ??= new Set<number>();
       if (expanded.has(index)) expanded.delete(index);
-      else expanded.add(index);
+      else { expanded.clear(); expanded.add(index); }
       interaction.invalidate();
       return { handled: true };
     }
@@ -111,13 +115,13 @@ function assistantReply(item: AgentProgress | undefined, final: Result | undefin
   return item?.text || undefined;
 }
 
-export function renderOmpCall(_label: string, tasks: readonly Assignment[], theme: Theme, interaction?: Interaction): Component {
+export function renderOmpCall(_label: string, tasks: readonly Assignment[], theme: Theme, interaction?: Interaction, showDetails = true): Component {
   const view = new Container();
   view.addChild(new TruncatedText(theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · 0/${tasks.length}`)));
   tasks.forEach((task, index) => {
     const expanded = interaction?.state.expanded?.has(index) ?? false;
     view.addChild(taskRow(theme.fg("muted", "○ queued · ") + theme.fg("accent", taskName(task.agent, index, tasks.length)) + (interaction ? theme.fg("muted", expanded ? " ▾" : " ▸") : ""), index, theme, interaction));
-    if (expanded) view.addChild(taskDetails(task.task, undefined, theme));
+    if (expanded && showDetails) view.addChild(taskDetails(task.task, undefined, theme));
   });
   return view;
 }
@@ -148,24 +152,28 @@ export function renderOmpToolResult(
 }
 
 export function renderPinnedOmpCall(
-  tasks: readonly Assignment[], theme: Theme, state: OmpRenderState, invalidate: () => void,
+  tasks: readonly Assignment[], theme: Theme, state: OmpRenderState, invalidate: () => void, toggle?: (index: number) => void,
 ): Component {
-  const interaction = { state, invalidate };
-  return clearHoverOutsideRows(renderOmpCall("OMP", tasks, theme, interaction), interaction);
+  const interaction = { state, invalidate, toggle };
+  return clearHoverOutsideRows(renderOmpCall("OMP", tasks, theme, interaction, false), interaction);
 }
 
-/** The same interactive status card, hosted at the fixed editor position. */
+/** Status rows for the fixed editor area; the selected detail renders separately. */
 export function renderPinnedOmpCard(
   progress: AgentProgress[], results: Result[] | undefined, animationFrame: number,
-  theme: Theme, state: OmpRenderState, invalidate: () => void, isPartial = true,
+  theme: Theme, state: OmpRenderState, invalidate: () => void, isPartial = true, toggle?: (index: number) => void,
 ): Component {
-  const interaction = { state, invalidate };
+  const interaction = { state, invalidate, toggle };
   const result: AgentToolResult<OmpDetails> = { content: [], details: { progress, results, animationFrame } };
-  return clearHoverOutsideRows(renderOmpResult(result, { expanded: false, isPartial }, theme, interaction), interaction);
+  return clearHoverOutsideRows(renderOmpResult(result, { expanded: false, isPartial }, theme, interaction, false), interaction);
+}
+
+export function renderPinnedOmpDetail(task: string, item: AgentProgress | undefined, final: Result | undefined, theme: Theme): Component {
+  return taskDetails(task, assistantReply(item, final), theme);
 }
 
 export function renderOmpResult(
-  result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Theme, interaction?: Interaction,
+  result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Theme, interaction?: Interaction, showDetails = true,
 ): Component {
   const view = new Container();
   const details = result.details;
@@ -196,7 +204,7 @@ export function renderOmpResult(
       theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") + theme.fg("accent", taskName(agent, index, count)) + (interaction ? theme.fg("muted", expanded ? " ▾" : " ▸") : ""),
       index, theme, interaction,
     ));
-    if (expanded) view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme));
+    if (expanded && showDetails) view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme));
     // Only completed, successful final output. Progress text may be an interim
     // explanation; failed output may contain stderr or provider secrets.
     if (!interaction && !options.isPartial && state === "done" && final?.ok) {
