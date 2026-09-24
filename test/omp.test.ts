@@ -54,6 +54,7 @@ function harness() {
     ui: {
       notify: (text: string) => notifications.push(text),
       setStatus: () => {},
+      setWidget: () => {},
       select: async () => undefined,
       input: async () => undefined,
     },
@@ -566,7 +567,7 @@ test("OMP rendering tracks theme changes and stays within narrow widths", () => 
   }
 });
 
-test("delegation shows live progress and final output collapsed without setting a widget", async () => {
+test("delegation pins live progress and clears the widget on completion", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -583,6 +584,8 @@ test("delegation shows live progress and final output collapsed without setting 
     expect(call).toContain("0/1");
     expect(call).not.toContain("src/index.ts");
     const result = await tool.execute("call-123", { agent: "explorer", task: "查看 src/index.ts" }, undefined, (partial: any) => partials.push(partial), h.ctx);
+    expect(widgets.some((widget) => widget.key === "omp-active" && widget.lines?.join("\n").includes("Explorer task"))).toBe(true);
+    expect(widgets.flatMap((widget) => widget.lines ?? []).join("\n")).not.toContain("src/index.ts");
     expect(partials[0].content[0].text).toContain("preparing user-language prompts");
     expect(partials[0].details.progress.map((item: AgentProgress) => item.state)).toEqual(["queued"]);
     const preparing = tool.renderResult(partials[0], { expanded: false, isPartial: true }, theme).render(100).join("\n");
@@ -608,7 +611,7 @@ test("delegation shows live progress and final output collapsed without setting 
       expect(displayed.match(/Specialist read the task/g)).toHaveLength(1);
       expect(displayed).not.toContain("Ctrl+Alt+O");
     }
-    expect(widgets).toEqual([]);
+    expect(widgets.at(-1)).toEqual({ key: "omp-active", lines: undefined });
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_CAPTURE;
@@ -702,6 +705,7 @@ test("session shutdown cancels background work without sending a stale result", 
 test("reload adopts running and queued children and delivers through the new extension", async () => {
   initTheme();
   const firstExtension = harness();
+  const restoredWidgets: Array<string[] | undefined> = [];
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "300";
@@ -720,8 +724,11 @@ test("reload adopts running and queued children and delivers through the new ext
     firstExtension.ctx.isProjectTrusted = () => { throw new Error("Old context was used after reload"); };
     await Bun.sleep(100);
     secondExtension = harness();
+    secondExtension.ctx.ui.setWidget = (_key: string, lines: string[] | undefined) => restoredWidgets.push(lines);
     await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
+    await waitFor(() => restoredWidgets.some((lines) => lines?.some((line) => line.includes("Explorer task 4")) ?? false));
     await waitFor(() => secondExtension!.sentMessages.length === 1, 120);
+    expect(restoredWidgets.at(-1)).toBeUndefined();
     expect(firstExtension.sentMessages).toHaveLength(0);
     expect(secondExtension.sentMessages[0].message.content).toContain("OMP background delegate done");
     expect(secondExtension.sentMessages[0].message.content.match(/OK explorer/g)).toHaveLength(4);
@@ -786,7 +793,7 @@ test("background batches share one three-child limit", async () => {
   }
 });
 
-test("council shows live progress and final outputs collapsed without setting a widget", async () => {
+test("council pins all reviewer statuses and clears them on completion", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -831,14 +838,15 @@ test("council shows live progress and final outputs collapsed without setting a 
       expect(displayed).not.toMatch(/read src\/index.ts|Inspecting the code|Activity:|Preview:|Model:|Task:/);
       expect(displayed).not.toContain("Ctrl+Alt+O");
     }
-    expect(widgets).toEqual([]);
+    expect(widgets.some((entry: any) => entry[1]?.join("\n").includes("Council review 3"))).toBe(true);
+    expect((widgets.at(-1) as any)?.[1]).toBeUndefined();
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_CAPTURE;
   }
 });
 
-test("specialist failure sets no widget and exposes failure state", async () => {
+test("specialist failure clears the pinned status and exposes failure state in the card", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -856,7 +864,8 @@ test("specialist failure sets no widget and exposes failure state", async () => 
       expect(displayed).toContain("✗ failed · Explorer task");
       expect(displayed).not.toMatch(/stderr|simulated failure|inspect the local conversation viewer|read src\/index.ts/i);
     }
-    expect(widgets).toEqual([]);
+    expect(widgets.some((entry) => entry.lines?.join("\n").includes("Explorer task"))).toBe(true);
+    expect(widgets.at(-1)?.lines).toBeUndefined();
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_FAIL;

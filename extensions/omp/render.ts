@@ -43,6 +43,23 @@ function taskName(agent: string, index: number, count: number): string {
   return count > 1 ? `${title} ${index + 1}` : title;
 }
 
+/** Short, safe status for the fixed editor widget; task text stays in the card. */
+export function pinnedOmpLines(jobs: readonly { progress: readonly AgentProgress[]; animationFrame: number }[]): string[] {
+  const lines: string[] = [];
+  for (const job of jobs) {
+    const count = job.progress.length;
+    const finished = job.progress.filter((item) => ["done", "failed", "cancelled"].includes(item.state)).length;
+    const queued = job.progress.every((item) => item.state === "queued");
+    lines.push(`${queued ? "○" : OMP_SPINNER_FRAMES[job.animationFrame % OMP_SPINNER_FRAMES.length]} OMP · ${queued ? "queued" : "running"} · ${finished}/${count}`);
+    job.progress.forEach((item, index) => {
+      const { icon, name } = stateInfo(item.state, job.animationFrame);
+      lines.push(`  ${icon} ${name} · ${taskName(item.agent, index, count)}`);
+    });
+  }
+  // Pi caps each widget at ten lines. Reserve the last line for overflow.
+  return lines.length <= 9 ? lines : [...lines.slice(0, 8), `  … ${lines.length - 8} more status lines`];
+}
+
 export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number }
 interface Interaction { state: OmpRenderState; invalidate: () => void }
 

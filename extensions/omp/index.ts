@@ -5,7 +5,7 @@ import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } fro
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
 import { formatResults, queuedProgress, resolveModel, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result } from "./subagents.ts";
-import { OMP_SPINNER_FRAMES, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
+import { OMP_SPINNER_FRAMES, pinnedOmpLines, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
@@ -93,6 +93,13 @@ export default function omp(pi: ExtensionAPI) {
     for (const invalidate of job.invalidators.values()) {
       try { invalidate(); } catch { /* A closed tool card must not affect the job. */ }
     }
+    refreshPinned();
+  };
+  const refreshPinned = () => {
+    const ctx = runtime.ctx;
+    if (!ctx?.hasUI || runtime.reloading || typeof ctx.ui.setWidget !== "function") return;
+    const active = [...jobs.values()].filter((job) => job.session === runtime.session && job.state === "running");
+    ctx.ui.setWidget("omp-active", active.length ? pinnedOmpLines(active) : undefined, { placement: "aboveEditor" });
   };
   const stopAnimation = (job: BackgroundJob) => {
     if (job.animationTimer) clearInterval(job.animationTimer);
@@ -176,6 +183,7 @@ export default function omp(pi: ExtensionAPI) {
     };
     bindContext(ctx);
     jobs.set(id, job);
+    refreshPinned();
     job.animationTimer = setInterval(() => {
       job.animationFrame = (job.animationFrame + 1) % OMP_SPINNER_FRAMES.length;
       repaint(job);
@@ -275,6 +283,7 @@ export default function omp(pi: ExtensionAPI) {
       runtime.reloading = false;
     }
     bindContext(ctx);
+    refreshPinned();
     try {
       role = readConfig().defaultAgent;
     } catch (err) {
@@ -289,6 +298,7 @@ export default function omp(pi: ExtensionAPI) {
       // Pi is still rebuilding its UI during session_start; deliver after reload returns.
       const resume = setTimeout(() => {
         runtime.reloading = false;
+        refreshPinned();
         flushPending();
         for (const job of jobs.values()) repaint(job);
       }, 0);
@@ -297,6 +307,7 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    runtime.ctx?.ui.setWidget?.("omp-active", undefined);
     runtime.pi = undefined;
     runtime.ctx = undefined;
     for (const job of jobs.values()) job.invalidators.clear();
