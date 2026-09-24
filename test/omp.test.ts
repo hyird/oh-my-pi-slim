@@ -699,6 +699,65 @@ test("session shutdown cancels background work without sending a stale result", 
   }
 });
 
+test("reload adopts running and queued children and delivers through the new extension", async () => {
+  initTheme();
+  const firstExtension = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "300";
+  const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  let secondExtension: ReturnType<typeof harness> | undefined;
+  try {
+    const result = await firstExtension.tools.omp_delegate.execute("reload-batch", { tasks: [
+      { agent: "explorer", task: "one" }, { agent: "explorer", task: "two" },
+      { agent: "explorer", task: "three" }, { agent: "explorer", task: "four" },
+    ] }, undefined, undefined, firstExtension.ctx);
+    await waitFor(() => {
+      const card = firstExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: true }, theme).render(100).join("\n");
+      return card.includes("running · 0/4") && card.includes("queued · Explorer task 4");
+    });
+    firstExtension.handlers.session_shutdown({ reason: "reload" }, firstExtension.ctx);
+    firstExtension.ctx.isProjectTrusted = () => { throw new Error("Old context was used after reload"); };
+    await Bun.sleep(100);
+    secondExtension = harness();
+    await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
+    await waitFor(() => secondExtension!.sentMessages.length === 1, 120);
+    expect(firstExtension.sentMessages).toHaveLength(0);
+    expect(secondExtension.sentMessages[0].message.content).toContain("OMP background delegate done");
+    expect(secondExtension.sentMessages[0].message.content.match(/OK explorer/g)).toHaveLength(4);
+    const restored = secondExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: false }, theme).render(100).join("\n");
+    expect(restored).toContain("done · 4/4");
+  } finally {
+    (secondExtension ?? firstExtension).handlers.session_shutdown({ reason: "quit" }, (secondExtension ?? firstExtension).ctx);
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
+test("completion during reload is delivered after the new extension starts", async () => {
+  const firstExtension = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "80";
+  let secondExtension: ReturnType<typeof harness> | undefined;
+  try {
+    const result = await firstExtension.tools.omp_delegate.execute("reload-gap", { agent: "explorer", task: "inspect" }, undefined, undefined, firstExtension.ctx);
+    firstExtension.handlers.session_shutdown({ reason: "reload" }, firstExtension.ctx);
+    await Bun.sleep(180);
+    expect(firstExtension.sentMessages).toHaveLength(0);
+    secondExtension = harness();
+    await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
+    await waitFor(() => secondExtension!.sentMessages.length === 1);
+    expect(secondExtension.sentMessages[0].message.content).toContain("OMP background delegate done");
+    const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    expect(secondExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: false }, theme).render(80).join("\n")).toContain("done · 1/1");
+  } finally {
+    (secondExtension ?? firstExtension).handlers.session_shutdown({ reason: "quit" }, (secondExtension ?? firstExtension).ctx);
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
 test("background batches share one three-child limit", async () => {
   const h = harness();
   const originalArgv = process.argv[1];

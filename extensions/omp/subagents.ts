@@ -147,6 +147,9 @@ export async function runAgent(
   if (!isRole(agent) || !task.trim()) throw new Error("A valid agent and nonempty task are required");
   const model = modelOverride ?? resolveModel(ctx, agent);
   const thinking = agent === "council" ? ctx.thinkingLevel : readConfig().thinking[agent] ?? ctx.thinkingLevel;
+  // A /reload invalidates extension contexts while already-running children keep working.
+  const cwd = ctx.cwd;
+  const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
   const progress: AgentProgress = { agent, task, model, state: "running", activity: "Starting specialist", text: "", activities: [] };
   const publish = () => {
@@ -179,7 +182,7 @@ export async function runAgent(
       tools = [...tools, "mcp__context7", "mcp__gh_grep"];
     }
     const args = [
-      "--mode", "json", "--print", "--no-session", ctx.isProjectTrusted() ? "--approve" : "--no-approve",
+      "--mode", "json", "--print", "--no-session", projectTrusted ? "--approve" : "--no-approve",
       "--model", model, ...(thinking ? ["--thinking", thinking] : []), "--tools", tools.join(","),
       ...(mcpPath ? ["--mcp-config", mcpPath] : []),
       // End flag parsing; a leading @ is treated as a file even after --, so add a newline.
@@ -196,7 +199,7 @@ export async function runAgent(
       const usage = emptyUsage();
       let streamingText = "";
       const proc = spawn(child.command, child.args, {
-        cwd: ctx.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"],
+        cwd, shell: false, stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, PI_OMP_CHILD: "1", ...(mcpPath ? { PI_MCP_CONFIG_MODE: "exclusive" } : {}), MCP_DIRECT_TOOLS: undefined },
       });
       const onAbort = () => {
@@ -298,6 +301,7 @@ export async function runAssignments(
   onProgress?: (snapshot: AgentProgress[]) => void,
   modelOverride?: string,
   delegationId?: string,
+  getContext?: (signal?: AbortSignal) => ExtensionContext | Promise<ExtensionContext>,
 ): Promise<Result[]> {
   const results = new Array<Result>(items.length);
   const progress = queuedProgress(items);
@@ -325,9 +329,11 @@ export async function runAssignments(
         let release: (() => void) | undefined;
         try {
           release = await acquireChildSlot(signal);
+          const nextContext = getContext ? getContext(signal) : ctx;
+          const childContext = nextContext instanceof Promise ? await nextContext : nextContext;
           progress[index] = { ...progress[index], state: "running", activity: "Starting" };
           publish(true);
-          results[index] = await runAgent(ctx, items[index], signal, modelOverride, (snapshot) => {
+          results[index] = await runAgent(childContext, items[index], signal, modelOverride, (snapshot) => {
             const important = snapshot.activities.length !== progress[index].activities.length || snapshot.state !== progress[index].state;
             progress[index] = snapshot;
             publish(important);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
@@ -31,12 +31,32 @@ type BackgroundJob = {
   animationTimer?: ReturnType<typeof setInterval>;
 };
 
+type OmpRuntime = {
+  session: number;
+  jobs: Map<string, BackgroundJob>;
+  pi?: ExtensionAPI;
+  ctx?: ExtensionContext;
+  reloading: boolean;
+  pending: Array<{ session: number; content: string; attempts: number }>;
+  contextWaiters: Set<(ctx: ExtensionContext) => void>;
+};
+
+// Pi reloads extension modules in the same process. Keep live child jobs outside
+// the old module instance so the new extension can adopt their cards and results.
+const RUNTIME_KEY = Symbol.for("@hyird/oh-my-pi-slim/live-runtime");
+const runtimeHost = globalThis as unknown as Record<symbol, Map<string, OmpRuntime> | undefined>;
+const runtimes = runtimeHost[RUNTIME_KEY] ??= new Map<string, OmpRuntime>();
+
 export default function omp(pi: ExtensionAPI) {
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
   let role: MainAgent = "orchestrator";
-  let session = 0;
-  const jobs = new Map<string, BackgroundJob>();
+  const runtimeKey = getAgentDir();
+  const runtime: OmpRuntime = runtimes.get(runtimeKey) ?? {
+    session: 0, jobs: new Map(), reloading: false, pending: [], contextWaiters: new Set(),
+  };
+  runtimes.set(runtimeKey, runtime);
+  const jobs = runtime.jobs;
   const reconcileTools = installMcpPolicy(pi, () => role);
 
   const reconcileModels = async (ctx: ExtensionContext) => {
@@ -84,6 +104,54 @@ export default function omp(pi: ExtensionAPI) {
       stopAnimation(job);
     }
   };
+  const bindContext = (ctx: ExtensionContext) => {
+    runtime.pi = pi;
+    runtime.ctx = ctx;
+    for (const resolve of runtime.contextWaiters) resolve(ctx);
+    runtime.contextWaiters.clear();
+  };
+  const waitForContext = (signal?: AbortSignal): ExtensionContext | Promise<ExtensionContext> => {
+    if (signal?.aborted) return Promise.reject(new Error("Specialist tasks cancelled"));
+    if (runtime.ctx) return runtime.ctx;
+    return new Promise((resolve, reject) => {
+      const onReady = (ctx: ExtensionContext) => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(ctx);
+      };
+      const onAbort = () => {
+        runtime.contextWaiters.delete(onReady);
+        reject(new Error("Specialist tasks cancelled"));
+      };
+      runtime.contextWaiters.add(onReady);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+  const flushPending = () => {
+    if (runtime.reloading || !runtime.pi) return;
+    const pending = runtime.pending.splice(0);
+    for (const item of pending) {
+      if (item.session !== runtime.session) continue;
+      try {
+        runtime.pi.sendMessage({ customType: "omp-background-result", display: false, content: item.content },
+          { triggerTurn: true, deliverAs: "steer" });
+      } catch {
+        if (item.attempts < 5) {
+          runtime.pending.push({ ...item, attempts: item.attempts + 1 });
+        } else {
+          runtime.ctx?.ui.notify("OMP completed a background task, but could not deliver its result. Check the task card.", "warning");
+        }
+      }
+    }
+    if (runtime.pending.length) {
+      const retry = setTimeout(flushPending, 100);
+      retry.unref?.();
+    }
+  };
+  const deliver = (job: BackgroundJob, content: string) => {
+    if (job.session !== runtime.session) return;
+    runtime.pending.push({ session: job.session, content, attempts: 0 });
+    flushPending();
+  };
   const visibleResult = (result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Parameters<typeof renderOmpToolResult>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string }) => {
     const job = result.details?.jobId ? jobs.get(result.details.jobId) : undefined;
     if (job && context?.toolCallId) job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
@@ -103,26 +171,20 @@ export default function omp(pi: ExtensionAPI) {
     const id = randomUUID();
     const controller = new AbortController();
     const job: BackgroundJob = {
-      id, kind, session, state: "running", progress: queuedProgress(prepared.items),
+      id, kind, session: runtime.session, state: "running", progress: queuedProgress(prepared.items),
       controller, invalidators: new Map(), animationFrame: 0,
     };
+    bindContext(ctx);
     jobs.set(id, job);
     job.animationTimer = setInterval(() => {
       job.animationFrame = (job.animationFrame + 1) % OMP_SPINNER_FRAMES.length;
       repaint(job);
     }, 80);
     job.animationTimer.unref?.();
-    const deliver = (content: string) => {
-      if (job.session !== session) return;
-      try {
-        pi.sendMessage({ customType: "omp-background-result", display: false, content },
-          { triggerTurn: true, deliverAs: "steer" });
-      } catch { /* The completed task card remains visible if delivery fails. */ }
-    };
     void runAssignments(ctx, prepared.items, controller.signal, (progress) => {
       job.progress = progress;
       repaint(job);
-    }, modelOverride, id).then((results) => {
+    }, modelOverride, id, waitForContext).then((results) => {
       stopAnimation(job);
       job.results = results;
       job.state = controller.signal.aborted ? "cancelled" : results.some((result) => !result.ok) ? "failed" : "done";
@@ -133,12 +195,12 @@ export default function omp(pi: ExtensionAPI) {
         : kind === "council"
         ? `${results.filter((result) => result.ok).length}/${results.length} reviewers responded. These perspectives use the same inherited model, so do not claim cross-model agreement. Synthesize disagreements.\n\n`
         : "Verify and integrate these specialist results before finalizing.\n\n";
-      deliver(`OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
+      deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
     }).catch(() => {
       stopAnimation(job);
       job.state = controller.signal.aborted ? "cancelled" : "failed";
       repaint(job);
-      deliver(`OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
+      deliver(job, `OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
     });
     return {
       content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work. If nothing independent remains, end this turn with a brief status; completion will wake you. Never use shell sleep or polling to wait.` }],
@@ -203,10 +265,16 @@ export default function omp(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
-    cancelRunning();
-    jobs.clear();
-    session++;
+  pi.on("session_start", async (event, ctx) => {
+    const resumedReload = event.reason === "reload" && runtime.reloading;
+    if (!resumedReload) {
+      cancelRunning();
+      jobs.clear();
+      runtime.pending.length = 0;
+      runtime.session++;
+      runtime.reloading = false;
+    }
+    bindContext(ctx);
     try {
       role = readConfig().defaultAgent;
     } catch (err) {
@@ -217,12 +285,31 @@ export default function omp(pi: ExtensionAPI) {
     status(ctx);
     try { await reconcileModels(ctx); }
     catch (err) { ctx.ui.notify(`OMP: could not update specialist models: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
+    if (resumedReload) {
+      // Pi is still rebuilding its UI during session_start; deliver after reload returns.
+      const resume = setTimeout(() => {
+        runtime.reloading = false;
+        flushPending();
+        for (const job of jobs.values()) repaint(job);
+      }, 0);
+      resume.unref?.();
+    }
   });
 
-  pi.on("session_shutdown", () => {
-    session++;
+  pi.on("session_shutdown", (event) => {
+    runtime.pi = undefined;
+    runtime.ctx = undefined;
+    for (const job of jobs.values()) job.invalidators.clear();
+    if (event.reason === "reload") {
+      runtime.reloading = true;
+      return;
+    }
+    runtime.session++;
     cancelRunning();
     jobs.clear();
+    runtime.pending.length = 0;
+    runtime.reloading = false;
+    runtimes.delete(runtimeKey);
   });
 
   pi.on("before_agent_start", (event) => {
