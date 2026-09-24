@@ -783,6 +783,42 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
 
+test("five fixed tasks keep their order around the expanded second task", () => {
+  initTheme();
+  const h = harness();
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  const longTask = Array.from({ length: 60 }, (_, i) => `detail line ${i + 1}`).join("\n");
+  h.handlers.tool_execution_start({ toolCallId: "five-tasks", toolName: "omp_delegate", args: { tasks:
+    Array.from({ length: 5 }, (_, i) => ({ agent: "explorer", task: i === 1 ? longTask : `task ${i + 1} detail` })),
+  } }, h.ctx);
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const tui: any = { terminal: { rows: 20 }, requestRender: () => {} };
+  const mouse = (type: string, y: number, wheelDelta = 0): any => ({
+    type, button: "left", x: 10, y, screenX: 10, screenY: y,
+    width: 100, height: 13, shift: false, alt: false, ctrl: false, wheelDelta,
+  });
+  const rowPositions = (lines: string[]) => Array.from({ length: 5 }, (_, i) =>
+    lines.findIndex(line => line.includes(`Explorer task ${i + 1}`)));
+  let card = pinned(tui, theme);
+  expect(rowPositions(card.render(100))).toEqual([2, 3, 4, 5, 6]);
+  card.handleMouse?.(mouse("click", 3));
+  card = pinned(tui, theme);
+  const expanded = card.render(100);
+  expect(expanded).toHaveLength(13);
+  const positions = rowPositions(expanded);
+  expect(positions[0]).toBeLessThan(positions[1]);
+  expect(positions[1]).toBeLessThan(expanded.findIndex((line: string) => line.includes("detail line 1")));
+  expect(expanded.findIndex((line: string) => line.includes("detail line 1"))).toBeLessThan(positions[2]);
+  expect(positions.slice(2)).toEqual([10, 11, 12].map(y => y - 1));
+  card.handleMouse?.(mouse("wheel", 6, 100));
+  card = pinned(tui, theme);
+  const scrolled = card.render(100);
+  expect(rowPositions(scrolled)).toEqual(positions);
+  expect(scrolled.join("\n")).not.toContain("detail line 1\n");
+  h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+});
+
 test("only one task can stay expanded across separate fixed OMP cards", () => {
   initTheme();
   const h = harness();
