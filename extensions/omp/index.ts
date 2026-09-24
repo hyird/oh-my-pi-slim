@@ -10,6 +10,7 @@ import { OMP_SPINNER_FRAMES, renderPinnedOmpCall, renderPinnedOmpCard, renderOmp
 import { prepareAssignments } from "./language.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
+import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 
 const COUNCIL_PERSPECTIVES = [
   "Find failure modes, safety issues, and counterexamples.",
@@ -45,6 +46,7 @@ type OmpRuntime = {
   ctx?: ExtensionContext;
   pending: Array<{ session: number; content: string; attempts: number }>;
   retryTimer?: ReturnType<typeof setTimeout>;
+  scroll: PinnedScrollState;
 };
 
 export default function omp(pi: ExtensionAPI) {
@@ -54,7 +56,7 @@ export default function omp(pi: ExtensionAPI) {
   // Each extension instance owns its jobs. Reloading disposes this instance and
   // cancels its children; no cross-version runtime state is shared.
   const runtime: OmpRuntime = {
-    session: 0, jobs: new Map(), calls: new Map(), pending: [],
+    session: 0, jobs: new Map(), calls: new Map(), pending: [], scroll: { top: 0 },
   };
   const jobs = runtime.jobs;
   const calls = runtime.calls;
@@ -102,7 +104,8 @@ export default function omp(pi: ExtensionAPI) {
     if (ctx?.mode !== "tui" || typeof ctx.ui.setWidget !== "function") return;
     const pinned = [...jobs.values()].filter((job) => job.session === runtime.session && !job.released);
     const pending = [...calls.values()];
-    ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (_tui, theme) => {
+    if (!pinned.length && !pending.length) runtime.scroll.top = 0;
+    ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (tui, theme) => {
       const view = new Container();
       for (const [index, call] of pending.entries()) {
         if (index) view.addChild(new Spacer(1));
@@ -116,7 +119,8 @@ export default function omp(pi: ExtensionAPI) {
         card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned, job.state === "running"));
         view.addChild(card);
       }
-      return view;
+      return scrollablePinnedCard(view, tui.terminal?.rows ?? 24, runtime.scroll,
+        () => tui.requestRender(), (text) => theme.fg("muted", text));
     } : undefined, { placement: "aboveEditor" });
   };
   const pinnedJob = (callId: string) => [...jobs.values()].find((job) => job.callId === callId && !job.released);

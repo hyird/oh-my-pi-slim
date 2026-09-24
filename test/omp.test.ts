@@ -723,6 +723,40 @@ test("background delegation returns immediately, updates its card and delivers c
   }
 });
 
+test("long fixed task details scroll within 65% height and keep task rows clickable", () => {
+  initTheme();
+  const h = harness();
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  const task = Array.from({ length: 60 }, (_, i) => `detail line ${i + 1}`).join("\n");
+  h.handlers.tool_execution_start({ toolCallId: "scroll-call", toolName: "omp_delegate", args: { tasks: [
+    { agent: "explorer", task }, { agent: "fixer", task: "second task detail" },
+  ] } }, h.ctx);
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const tui: any = { terminal: { rows: 20 }, requestRender: () => {} };
+  const mouse = (type: string, y: number, wheelDelta = 0): any => ({
+    type, button: "left", x: 10, y, screenX: 10, screenY: y,
+    width: 100, height: 13, shift: false, alt: false, ctrl: false, wheelDelta,
+  });
+  let card = pinned(tui, theme);
+  expect(card.render(100).join("\n")).toContain("Explorer task 1");
+  card.handleMouse?.(mouse("click", 2));
+  card = pinned(tui, theme);
+  expect(card.render(100)).toHaveLength(13);
+  expect(card.render(100).join("\n")).toContain("detail line 1");
+  card.handleMouse?.(mouse("wheel", 5, 100));
+  card = pinned(tui, theme);
+  const scrolled = card.render(100);
+  expect(scrolled).toHaveLength(13);
+  expect(scrolled.join("\n")).toContain("Fixer task 2");
+  const secondRow = scrolled.findIndex((line: string) => line.includes("Fixer task 2"));
+  expect(secondRow).toBeGreaterThanOrEqual(0);
+  card.handleMouse?.(mouse("click", secondRow));
+  card = pinned(tui, theme);
+  expect(card.render(100).join("\n")).toContain("second task detail");
+  h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+});
+
 test("running OMP rows animate like Pi Working and stop after completion", async () => {
   initTheme();
   const h = harness();
