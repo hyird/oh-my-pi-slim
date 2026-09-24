@@ -1,6 +1,6 @@
 # References and implementation boundaries
 
-These are **read-only inspiration**, not runtime dependencies or promises of API compatibility with future releases. OMP has its own isolated Pi JSON-mode child subprocess backend and its own local conversation recorder/viewer. No third-party `pi-subagents` installation or integration is required.
+These are **read-only inspiration**, not runtime dependencies or promises of API compatibility with future releases. OMP has its own isolated Pi JSON-mode child subprocess backend and its own local conversation recorder. No third-party `pi-subagents` installation or integration is required.
 
 ## [Upstream source](https://github.com/alvinunreal/oh-my-opencode-slim)
 

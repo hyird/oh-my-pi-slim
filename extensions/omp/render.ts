@@ -2,7 +2,7 @@ import { getMarkdownTheme, type AgentToolResult, type Theme } from "@earendil-wo
 import { Container, Markdown, MouseRegion, TruncatedText, type Component } from "@earendil-works/pi-tui";
 import type { AgentProgress, Assignment, OmpDetails, Result } from "./subagents.ts";
 import { getConversation } from "./transcript.ts";
-import { safeText, transcriptBlocks } from "./viewer.ts";
+import { assistantReplies, safeText } from "./conversation-content.ts";
 
 const OUTPUT_LIMIT = 12_000;
 const OUTPUT_LINES = 180;
@@ -37,7 +37,7 @@ function stateInfo(state: AgentProgress["state"], frame = 0): { icon: string; na
 }
 
 // Cards use role-based task names, never task text (which may contain
-// commands or credentials). Full assignments stay in the local conversation viewer.
+// commands or credentials). Full assignments stay in local recordings.
 function taskName(agent: string, index: number, count: number): string {
   const title = agent === "council" ? "Council review" : `${agent.charAt(0).toUpperCase()}${agent.slice(1)} task`;
   return count > 1 ? `${title} ${index + 1}` : title;
@@ -103,9 +103,7 @@ function assistantReply(item: AgentProgress | undefined, final: Result | undefin
   if (item?.conversationId) {
     try {
       const conversation = getConversation(item.conversationId);
-      const replies = conversation && transcriptBlocks(conversation.events)
-        .filter((block) => block.label === "Assistant" || block.label === "Assistant · live")
-        .map((block) => block.text).filter(Boolean);
+      const replies = conversation && assistantReplies(conversation.events);
       if (replies?.length) return replies.join("\n\n");
     } catch { /* A missing recording should not break the tool card. */ }
   }

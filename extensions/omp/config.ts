@@ -30,28 +30,25 @@ export function parseConfig(raw: unknown): OmpConfig {
   const value = raw as Record<string, unknown>;
   const requestedDefault = value.defaultAgent ?? "orchestrator";
   if (typeof requestedDefault !== "string") throw new Error("Invalid defaultAgent");
-  // Migrate defaults written by older versions, which wrongly accepted specialists.
-  // Never make a subagent the session's main agent.
-  if (!isMainAgent(requestedDefault) && !isRole(requestedDefault)) throw new Error("defaultAgent must be a main agent");
-  const defaultAgent: MainAgent = isMainAgent(requestedDefault) ? requestedDefault : "orchestrator";
+  if (!isMainAgent(requestedDefault)) throw new Error("defaultAgent must be a main agent");
+  const defaultAgent: MainAgent = requestedDefault;
   const models = value.models ?? {};
   if (!models || typeof models !== "object" || Array.isArray(models)) throw new Error("models must be an object");
   const validated: OmpConfig["models"] = {};
   for (const [role, model] of Object.entries(models)) {
-    if (!isRole(role) || typeof model !== "string" || !parseModel(model)) {
+    if (!isRole(role) || role === "council" || typeof model !== "string" || !parseModel(model)) {
       throw new Error(`Invalid models.${role}: expected provider/model-id`);
     }
-    // Older versions allowed a Council override; Council now always follows the main session.
-    if (role !== "council") validated[role] = model;
+    validated[role] = model;
   }
   const thinking = value.thinking ?? {};
   if (!thinking || typeof thinking !== "object" || Array.isArray(thinking)) throw new Error("thinking must be an object");
   const validatedThinking: OmpConfig["thinking"] = {};
   for (const [role, level] of Object.entries(thinking)) {
-    if (!isRole(role) || typeof level !== "string" || !isThinkingLevel(level)) {
+    if (!isRole(role) || role === "council" || typeof level !== "string" || !isThinkingLevel(level)) {
       throw new Error(`Invalid thinking.${role}: expected ${THINKING_LEVELS.join("/")}`);
     }
-    if (role !== "council") validatedThinking[role] = level;
+    validatedThinking[role] = level;
   }
   return { defaultAgent, models: validated, thinking: validatedThinking };
 }

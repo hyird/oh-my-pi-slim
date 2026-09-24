@@ -6,7 +6,6 @@ import { isRole, type Role } from "./roles.ts";
 
 export interface ConversationMeta {
   id: string;
-  delegationId?: string;
   agent: Role;
   task: string;
   model: string;
@@ -16,32 +15,6 @@ export interface ConversationMeta {
   error?: string;
 }
 export interface Conversation { meta: ConversationMeta; events: any[] }
-
-const listeners = new Set<() => void>();
-let timer: ReturnType<typeof setTimeout> | undefined;
-let lastNotify = 0;
-function notify(force = false) {
-  if (!listeners.size) return;
-  const delay = 100 - (Date.now() - lastNotify);
-  if (!force && delay > 0) {
-    timer ??= setTimeout(() => { timer = undefined; notify(true); }, delay);
-    return;
-  }
-  if (timer) clearTimeout(timer);
-  timer = undefined;
-  lastNotify = Date.now();
-  for (const listener of [...listeners]) {
-    try { listener(); } catch { /* Viewers cannot disrupt recording. */ }
-  }
-}
-
-export function subscribeConversations(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-    if (!listeners.size && timer) { clearTimeout(timer); timer = undefined; }
-  };
-}
 
 function directory(): string {
   return path.join(getAgentDir(), "omp", "conversations");
@@ -60,7 +33,7 @@ function ensureDirectory(): string {
 const validId = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
 
 // Bound both the number of recordings and their estimated parsed size. Oversized logs
-// remain readable, but are not retained by the viewer cache.
+// remain readable, but are not retained by the task-card cache.
 const cacheLimit = 8;
 const cacheBudget = 64 * 1024 * 1024;
 const conversationCache = new Map<string, { revision: fs.BigIntStats; value: Conversation; cost: number }>();
@@ -74,34 +47,6 @@ function evict(file: string) {
   if (old) { cacheSize -= old.cost; conversationCache.delete(file); }
 }
 
-function readRegularFile(file: string): string | undefined {
-  const before = fs.lstatSync(file);
-  if (!before.isFile()) return undefined;
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-  try {
-    const opened = fs.fstatSync(fd);
-    // Also guard platforms where O_NOFOLLOW is unavailable or ignored.
-    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return undefined;
-    return fs.readFileSync(fd, "utf8");
-  } finally { fs.closeSync(fd); }
-}
-
-function writeMeta(dir: string, meta: ConversationMeta) {
-  const target = path.join(dir, `${meta.id}.meta.json`);
-  const temp = path.join(dir, `${meta.id}.${randomUUID()}.tmp`);
-  const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
-  try {
-    try {
-      fs.fchmodSync(fd, 0o600);
-      append(fd, meta);
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-    fs.renameSync(temp, target);
-  } finally {
-    try { fs.unlinkSync(temp); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
-  }
-}
-
 function append(fd: number, value: unknown) {
   const bytes = Buffer.from(JSON.stringify(value) + "\n");
   for (let offset = 0; offset < bytes.length;) {
@@ -112,21 +57,19 @@ function append(fd: number, value: unknown) {
 }
 
 /** Record only parsed, child-visible JSON events; never copy the child environment or stderr. */
-export function startConversation(agent: Role, task: string, model: string, delegationId?: string) {
-  const meta: ConversationMeta = { id: randomUUID(), ...(delegationId !== undefined ? { delegationId } : {}), agent, task, model, state: "running", startedAt: Date.now() };
+export function startConversation(agent: Role, task: string, model: string) {
+  const meta: ConversationMeta = { id: randomUUID(), agent, task, model, state: "running", startedAt: Date.now() };
   const dir = ensureDirectory();
   const file = path.join(dir, `${meta.id}.jsonl`);
   const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
-  try { append(fd, { type: "meta", meta }); writeMeta(dir, meta); }
+  try { append(fd, { type: "meta", meta }); }
   catch (err) { fs.closeSync(fd); fs.unlinkSync(file); throw err; }
-  notify(true);
   let finished = false;
   return {
     id: meta.id,
     record(event: any) {
       if (finished) return;
       append(fd, { type: "event", event });
-      notify();
     },
     finish(state: "done" | "failed" | "cancelled", error?: string) {
       if (finished) return;
@@ -136,8 +79,7 @@ export function startConversation(agent: Role, task: string, model: string, dele
       if (error) meta.error = error;
       try {
         append(fd, { type: "completion", state, finishedAt: meta.finishedAt, ...(error ? { error } : {}) });
-        writeMeta(dir, meta);
-      } finally { fs.closeSync(fd); notify(true); }
+      } finally { fs.closeSync(fd); }
     },
   };
 }
@@ -196,26 +138,4 @@ export function getConversation(id: string): Conversation | undefined {
     }
     return result;
   } catch { evict(file); return undefined; }
-}
-
-export function listConversations(): ConversationMeta[] {
-  let names: string[];
-  try { names = fs.readdirSync(directory()); } catch { return []; }
-  const present = new Set(names);
-  return names.filter((name) => name.endsWith(".jsonl") && validId(name.slice(0, -6)))
-    .map((name) => {
-      const id = name.slice(0, -6);
-      const sidecar = `${id}.meta.json`;
-      if (!present.has(sidecar)) return getConversation(id)?.meta; // Pre-sidecar recordings.
-      try {
-        const body = readRegularFile(path.join(directory(), sidecar));
-        if (body === undefined) return undefined;
-        const meta = JSON.parse(body) as ConversationMeta;
-        return meta.id === id && isRole(meta.agent) &&
-          (meta.state === "running" || meta.state === "done" || meta.state === "failed" || meta.state === "cancelled") &&
-          typeof meta.startedAt === "number" ? meta : undefined;
-      } catch { return undefined; }
-    })
-    .filter((meta): meta is ConversationMeta => !!meta)
-    .sort((a, b) => b.startedAt - a.startedAt || b.id.localeCompare(a.id));
 }

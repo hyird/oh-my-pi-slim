@@ -95,16 +95,15 @@ describe("config safety", () => {
     expect(() => parseConfig({ models: { unknown: "openai-codex/gpt-5.5" } })).toThrow();
     expect(() => parseConfig({ defaultAgent: "bad" })).toThrow();
     expect(parseConfig({ defaultAgent: "pi" }).defaultAgent).toBe("pi");
-    expect(parseConfig({ defaultAgent: "explorer", models: { explorer: "openai-codex/gpt-5.5" } })).toEqual({
-      defaultAgent: "orchestrator", models: { explorer: "openai-codex/gpt-5.5" }, thinking: {},
-    });
+    expect(() => parseConfig({ defaultAgent: "explorer" })).toThrow("defaultAgent must be a main agent");
     expect(() => parseConfig({ models: { fixer: "invalid" } })).toThrow("Invalid models.fixer: expected provider/model-id");
     expect(() => parseConfig([])).toThrow("Config must be a JSON object");
     expect(() => parseConfig({ defaultAgent: 1 })).toThrow("Invalid defaultAgent");
     expect(() => parseConfig({ defaultAgent: "bad" })).toThrow("defaultAgent must be a main agent");
     expect(() => parseConfig({ models: [] })).toThrow("models must be an object");
-    expect(parseConfig({ thinking: { explorer: "high", council: "off" } }).thinking).toEqual({ explorer: "high" });
-    expect(parseConfig({ models: { council: "openai-codex/gpt-5.5" } }).models).toEqual({});
+    expect(parseConfig({ thinking: { explorer: "high" } }).thinking).toEqual({ explorer: "high" });
+    expect(() => parseConfig({ thinking: { council: "off" } })).toThrow("Invalid thinking.council");
+    expect(() => parseConfig({ models: { council: "openai-codex/gpt-5.5" } })).toThrow("Invalid models.council");
     expect(() => parseConfig({ thinking: { explorer: "ultra" } })).toThrow("Invalid thinking.explorer");
     expect(() => parseConfig({ thinking: { unknown: "high" } })).toThrow("Invalid thinking.unknown");
     expect(() => parseConfig({ thinking: [] })).toThrow("thinking must be an object");
@@ -306,12 +305,11 @@ describe("/omp settings entry point", () => {
     await expect(h.tools.omp_council.execute("id", { question: "review" }, undefined, undefined, h.ctx)).rejects.toThrow("disabled while the default agent is pi");
     expect(h.translations).toEqual([]);
   });
-  test("recovers legacy specialist defaults as orchestrator while retaining model overrides", async () => {
+  test("rejects specialist defaults instead of migrating obsolete config", async () => {
     fs.writeFileSync(configPath(), JSON.stringify({ defaultAgent: "fixer", models: { fixer: "openai-codex/gpt-5.5" } }));
     const h = harness();
     await h.handlers.session_start({ reason: "new" }, h.ctx);
-    expect(readConfig().defaultAgent).toBe("orchestrator");
-    expect(readConfig().models.fixer).toBe("openai-codex/gpt-5.5");
+    expect(() => readConfig()).toThrow("defaultAgent must be a main agent");
     const event: any = { systemPromptOptions: { sections: {} } };
     h.handlers.before_agent_start(event);
     expect(event.systemPromptOptions.sections.omp_role).toContain("Active OMP main agent: orchestrator");
@@ -370,7 +368,7 @@ test("isolated child uses the configured specialist model and tool allowlist (of
     expect(trustedArgs).toContain("--approve");
     expect(trustedArgs).not.toContain("--no-approve");
     expect(trustedArgs[trustedArgs.indexOf("--thinking") + 1]).toBe("low");
-    fs.writeFileSync(configPath(), JSON.stringify({ defaultAgent: "orchestrator", models: { council: "openai-codex/gpt-5.3-codex-spark" }, thinking: { council: "max" } }));
+    fs.writeFileSync(configPath(), JSON.stringify({ defaultAgent: "orchestrator", models: {}, thinking: {} }));
     await runAgent(h.ctx, { agent: "council", task: "review another decision" });
     const councilArgs = JSON.parse(fs.readFileSync(capture, "utf8")).args;
     expect(councilArgs[councilArgs.indexOf("--model") + 1]).toBe("openai-codex/gpt-5.5");
@@ -780,62 +778,23 @@ test("session shutdown cancels background work without sending a stale result", 
   }
 });
 
-test("reload adopts running children and delivers through the new extension", async () => {
-  initTheme();
+test("reload cancels running children without restoring cards or delivering stale results", async () => {
   const firstExtension = harness();
-  const restoredWidgets: any[] = [];
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "300";
-  const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   let secondExtension: ReturnType<typeof harness> | undefined;
   try {
-    const result = await firstExtension.tools.omp_delegate.execute("reload-batch", { tasks: [
-      { agent: "explorer", task: "one" }, { agent: "explorer", task: "two" },
-      { agent: "explorer", task: "three" }, { agent: "explorer", task: "four" },
-    ] }, undefined, undefined, firstExtension.ctx);
-    await waitFor(() => {
-      const card = firstExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: true }, theme).render(100).join("\n");
-      return card.includes("running · 0/4") && card.includes("running · Explorer task 4");
-    });
+    await firstExtension.tools.omp_delegate.execute("reload-cancel", { agent: "explorer", task: "inspect" }, undefined, undefined, firstExtension.ctx);
     firstExtension.handlers.session_shutdown({ reason: "reload" }, firstExtension.ctx);
-    firstExtension.ctx.isProjectTrusted = () => { throw new Error("Old context was used after reload"); };
-    await Bun.sleep(100);
     secondExtension = harness();
+    const restoredWidgets: any[] = [];
     secondExtension.ctx.ui.setWidget = (_key: string, content: any) => restoredWidgets.push(content);
     await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
-    await waitFor(() => restoredWidgets.some((content) => widgetText(content).includes("Explorer task 4")));
-    await waitFor(() => secondExtension!.sentMessages.length === 1, 120);
-    expect(widgetText(restoredWidgets.at(-1))).toContain("done · Explorer task 4");
+    await Bun.sleep(400);
     expect(firstExtension.sentMessages).toHaveLength(0);
-    expect(secondExtension.sentMessages[0].message.content).toContain("OMP background delegate done");
-    expect(secondExtension.sentMessages[0].message.content.match(/OK explorer/g)).toHaveLength(4);
-    const restored = secondExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: false }, theme).render(100).join("\n");
-    expect(restored).toContain("done · 4/4");
-  } finally {
-    (secondExtension ?? firstExtension).handlers.session_shutdown({ reason: "quit" }, (secondExtension ?? firstExtension).ctx);
-    process.argv[1] = originalArgv;
-    delete process.env.OMP_TEST_WAIT_MS;
-  }
-});
-
-test("completion during reload is delivered after the new extension starts", async () => {
-  const firstExtension = harness();
-  const originalArgv = process.argv[1];
-  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
-  process.env.OMP_TEST_WAIT_MS = "80";
-  let secondExtension: ReturnType<typeof harness> | undefined;
-  try {
-    const result = await firstExtension.tools.omp_delegate.execute("reload-gap", { agent: "explorer", task: "inspect" }, undefined, undefined, firstExtension.ctx);
-    firstExtension.handlers.session_shutdown({ reason: "reload" }, firstExtension.ctx);
-    await Bun.sleep(180);
-    expect(firstExtension.sentMessages).toHaveLength(0);
-    secondExtension = harness();
-    await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
-    await waitFor(() => secondExtension!.sentMessages.length === 1);
-    expect(secondExtension.sentMessages[0].message.content).toContain("OMP background delegate done");
-    const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-    expect(secondExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: false }, theme).render(80).join("\n")).toContain("done · 1/1");
+    expect(secondExtension.sentMessages).toHaveLength(0);
+    expect(restoredWidgets.every((content) => !widgetText(content).includes("Explorer task"))).toBe(true);
   } finally {
     (secondExtension ?? firstExtension).handlers.session_shutdown({ reason: "quit" }, (secondExtension ?? firstExtension).ctx);
     process.argv[1] = originalArgv;
@@ -958,13 +917,13 @@ test("specialist failure clears the pinned status and exposes failure state in t
     process.env.OMP_TEST_FAIL = "1";
     const failed = await h.tools.omp_delegate.execute("failed", { agent: "explorer", task: "simulate failure" }, undefined, undefined, h.ctx);
     await waitFor(() => h.sentMessages.length === 1);
-    expect(h.sentMessages[0].message.content).toContain("inspect the local conversation viewer");
+    expect(h.sentMessages[0].message.content).toContain("Specialist run failed");
     expect(h.sentMessages[0].message.content).not.toContain("simulated failure");
     const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
     for (const isExpanded of [false, true]) {
       const displayed = h.tools.omp_delegate.renderResult(failed, { expanded: isExpanded, isPartial: false }, theme).render(80).join("\n");
       expect(displayed).toContain("✗ failed · Explorer task");
-      expect(displayed).not.toMatch(/stderr|simulated failure|inspect the local conversation viewer|read src\/index.ts/i);
+      expect(displayed).not.toMatch(/stderr|simulated failure|Specialist run failed|read src\/index.ts/i);
     }
     expect(widgets.some((entry) => widgetText(entry.content).includes("Explorer task"))).toBe(true);
     expect(widgetText(widgets.at(-1)?.content)).toContain("failed · Explorer task");

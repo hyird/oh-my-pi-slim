@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Container, Spacer } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
@@ -43,28 +43,19 @@ type OmpRuntime = {
   calls: Map<string, PendingCall>;
   pi?: ExtensionAPI;
   ctx?: ExtensionContext;
-  reloading: boolean;
   pending: Array<{ session: number; content: string; attempts: number }>;
-  contextWaiters: Set<(ctx: ExtensionContext) => void>;
+  retryTimer?: ReturnType<typeof setTimeout>;
 };
-
-// Pi reloads extension modules in the same process. Keep live child jobs outside
-// the old module instance so the new extension can adopt their cards and results.
-const RUNTIME_KEY = Symbol.for("@hyird/oh-my-pi-slim/live-runtime");
-const runtimeHost = globalThis as unknown as Record<symbol, Map<string, OmpRuntime> | undefined>;
-const runtimes = runtimeHost[RUNTIME_KEY] ??= new Map<string, OmpRuntime>();
 
 export default function omp(pi: ExtensionAPI) {
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
   let role: MainAgent = "orchestrator";
-  const runtimeKey = getAgentDir();
-  const runtime: OmpRuntime = runtimes.get(runtimeKey) ?? {
-    session: 0, jobs: new Map(), calls: new Map(), reloading: false, pending: [], contextWaiters: new Set(),
+  // Each extension instance owns its jobs. Reloading disposes this instance and
+  // cancels its children; no cross-version runtime state is shared.
+  const runtime: OmpRuntime = {
+    session: 0, jobs: new Map(), calls: new Map(), pending: [],
   };
-  // A /reload may adopt a runtime created by an older extension version.
-  runtime.calls ??= new Map();
-  runtimes.set(runtimeKey, runtime);
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const callStates = new Map<string, { state: OmpRenderState; invalidate: () => void }>();
@@ -108,7 +99,7 @@ export default function omp(pi: ExtensionAPI) {
   };
   const refreshPinned = () => {
     const ctx = runtime.ctx;
-    if (ctx?.mode !== "tui" || runtime.reloading || typeof ctx.ui.setWidget !== "function") return;
+    if (ctx?.mode !== "tui" || typeof ctx.ui.setWidget !== "function") return;
     const pinned = [...jobs.values()].filter((job) => job.session === runtime.session && !job.released);
     const pending = [...calls.values()];
     ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (_tui, theme) => {
@@ -170,27 +161,9 @@ export default function omp(pi: ExtensionAPI) {
   const bindContext = (ctx: ExtensionContext) => {
     runtime.pi = pi;
     runtime.ctx = ctx;
-    for (const resolve of runtime.contextWaiters) resolve(ctx);
-    runtime.contextWaiters.clear();
-  };
-  const waitForContext = (signal?: AbortSignal): ExtensionContext | Promise<ExtensionContext> => {
-    if (signal?.aborted) return Promise.reject(new Error("Specialist tasks cancelled"));
-    if (runtime.ctx) return runtime.ctx;
-    return new Promise((resolve, reject) => {
-      const onReady = (ctx: ExtensionContext) => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve(ctx);
-      };
-      const onAbort = () => {
-        runtime.contextWaiters.delete(onReady);
-        reject(new Error("Specialist tasks cancelled"));
-      };
-      runtime.contextWaiters.add(onReady);
-      signal?.addEventListener("abort", onAbort, { once: true });
-    });
   };
   const flushPending = () => {
-    if (runtime.reloading || !runtime.pi) return;
+    if (!runtime.pi) return;
     const pending = runtime.pending.splice(0);
     for (const item of pending) {
       if (item.session !== runtime.session) continue;
@@ -206,8 +179,11 @@ export default function omp(pi: ExtensionAPI) {
       }
     }
     if (runtime.pending.length) {
-      const retry = setTimeout(flushPending, 100);
-      retry.unref?.();
+      runtime.retryTimer ??= setTimeout(() => {
+        runtime.retryTimer = undefined;
+        flushPending();
+      }, 100);
+      runtime.retryTimer.unref?.();
     }
   };
   const deliver = (job: BackgroundJob, content: string) => {
@@ -259,7 +235,7 @@ export default function omp(pi: ExtensionAPI) {
     void runAssignments(ctx, prepared.items, controller.signal, (progress) => {
       job.progress = progress;
       repaint(job);
-    }, modelOverride, id, waitForContext).then((results) => {
+    }, modelOverride).then((results) => {
       stopAnimation(job);
       job.results = results;
       job.state = controller.signal.aborted ? "cancelled" : results.some((result) => !result.ok) ? "failed" : "done";
@@ -373,16 +349,14 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (event, ctx) => {
-    const resumedReload = event.reason === "reload" && runtime.reloading;
-    if (!resumedReload) {
-      cancelRunning();
-      jobs.clear();
-      calls.clear();
-      callStates.clear();
-      runtime.pending.length = 0;
-      runtime.session++;
-      runtime.reloading = false;
-    }
+    cancelRunning();
+    jobs.clear();
+    calls.clear();
+    callStates.clear();
+    runtime.pending.length = 0;
+    if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
+    runtime.retryTimer = undefined;
+    runtime.session++;
     bindContext(ctx);
     refreshPinned();
     try {
@@ -395,38 +369,21 @@ export default function omp(pi: ExtensionAPI) {
     status(ctx);
     try { await reconcileModels(ctx); }
     catch (err) { ctx.ui.notify(`OMP: could not update specialist models: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
-    if (resumedReload) {
-      // Pi is still rebuilding its UI during session_start; deliver after reload returns.
-      const resume = setTimeout(() => {
-        runtime.reloading = false;
-        refreshPinned();
-        flushPending();
-        for (const job of jobs.values()) repaint(job);
-      }, 0);
-      resume.unref?.();
-    }
   });
 
-  pi.on("session_shutdown", (event) => {
+  pi.on("session_shutdown", () => {
     runtime.ctx?.ui.setWidget?.("omp-active", undefined);
     runtime.pi = undefined;
     runtime.ctx = undefined;
     for (const job of jobs.values()) job.invalidators.clear();
-    if (event.reason === "reload") {
-      // A tool still preparing prompts has no child run to adopt after reload.
-      calls.clear();
-      callStates.clear();
-      runtime.reloading = true;
-      return;
-    }
     runtime.session++;
     cancelRunning();
     jobs.clear();
     calls.clear();
     callStates.clear();
     runtime.pending.length = 0;
-    runtime.reloading = false;
-    runtimes.delete(runtimeKey);
+    if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
+    runtime.retryTimer = undefined;
   });
 
   pi.on("before_agent_start", (event) => {

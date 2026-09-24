@@ -93,13 +93,11 @@ export async function runAgent(
   ctx: ExtensionContext, assignment: Assignment, signal?: AbortSignal,
   modelOverride?: string,
   onActivity?: (snapshot: AgentProgress) => void,
-  delegationId?: string,
 ): Promise<Result> {
   const { agent, task } = assignment;
   if (!isRole(agent) || !task.trim()) throw new Error("A valid agent and nonempty task are required");
   const model = modelOverride ?? resolveModel(ctx, agent);
   const thinking = agent === "council" ? ctx.thinkingLevel : readConfig().thinking[agent] ?? ctx.thinkingLevel;
-  // A /reload invalidates extension contexts while already-running children keep working.
   const cwd = ctx.cwd;
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
@@ -115,7 +113,7 @@ export async function runAgent(
     publish();
   };
   publish();
-  const conversation = startConversation(agent, task, model, delegationId);
+  const conversation = startConversation(agent, task, model);
   progress.conversationId = conversation.id;
   publish();
   let settled = false;
@@ -230,7 +228,7 @@ export async function runAgent(
         buffer += decoder.end();
         if (buffer) consume(buffer);
         const ok = !aborted && code === 0 && !error && !!output;
-        const failure = aborted ? "Specialist cancelled" : `Specialist run failed (exit code ${code ?? "unknown"}); inspect the local conversation viewer${agent === "librarian" ? "; if MCP namespaces are missing, load pi-mcp-adapter and initialize context7/gh_grep eager metadata (never enable the global gateway)" : ""}`;
+        const failure = aborted ? "Specialist cancelled" : `Specialist run failed (exit code ${code ?? "unknown"})${agent === "librarian" ? "; if MCP namespaces are missing, load pi-mcp-adapter and initialize context7/gh_grep eager metadata (never enable the global gateway)" : ""}`;
         progress.state = ok ? "done" : aborted ? "cancelled" : "failed";
         // Raw stderr and provider errors may contain credentials. JSON events remain in the private recording.
         try { conversation.finish(ok ? "done" : aborted ? "cancelled" : "failed", ok ? undefined : failure); }
@@ -252,8 +250,6 @@ export async function runAssignments(
   ctx: ExtensionContext, items: Assignment[], signal?: AbortSignal,
   onProgress?: (snapshot: AgentProgress[]) => void,
   modelOverride?: string,
-  delegationId?: string,
-  getContext?: (signal?: AbortSignal) => ExtensionContext | Promise<ExtensionContext>,
 ): Promise<Result[]> {
   const results = new Array<Result>(items.length);
   const progress = queuedProgress(items);
@@ -277,16 +273,14 @@ export async function runAssignments(
     await Promise.all(items.map(async (item, index) => {
       try {
         if (signal?.aborted) throw new Error("Specialist tasks cancelled");
-        const nextContext = getContext ? getContext(signal) : ctx;
-        const childContext = nextContext instanceof Promise ? await nextContext : nextContext;
         if (signal?.aborted) throw new Error("Specialist tasks cancelled");
         progress[index] = { ...progress[index], state: "running", activity: "Starting" };
         publish(true);
-        results[index] = await runAgent(childContext, item, signal, modelOverride, (snapshot) => {
+        results[index] = await runAgent(ctx, item, signal, modelOverride, (snapshot) => {
           const important = snapshot.activities.length !== progress[index].activities.length || snapshot.state !== progress[index].state;
           progress[index] = snapshot;
           publish(important);
-        }, delegationId);
+        });
       } catch (err) {
         results[index] = {
           agent: item.agent, model: modelOverride ?? "inherit", ok: false, cancelled: signal?.aborted,
