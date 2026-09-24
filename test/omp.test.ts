@@ -8,7 +8,7 @@ import { configPath, parseConfig, parseModel, readConfig, updateConfig } from ".
 import { formatResults, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Result } from "../extensions/omp/subagents.ts";
 import { getChoices, getSettingsRows, INHERIT, INHERIT_THINKING } from "../extensions/omp/settings-ui.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { renderOmpCall, renderOmpResult } from "../extensions/omp/render.ts";
+import { renderOmpCall, renderOmpResult, renderPinnedOmpCard } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
@@ -78,6 +78,13 @@ async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
     await Bun.sleep(10);
   }
   expect(await check()).toBe(true);
+}
+
+function widgetText(content: any, width = 100): string {
+  if (!content) return "";
+  if (Array.isArray(content)) return content.join("\n");
+  const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  return content({ requestRender: () => {} }, theme).render(width).join("\n");
 }
 
 describe("config safety", () => {
@@ -525,6 +532,21 @@ test("OMP tool rows replace queued content in place as progress changes", () => 
   }
 });
 
+test("the fixed OMP card keeps task row click expansion", () => {
+  initTheme();
+  const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const state: any = {};
+  const progress: AgentProgress[] = [{ agent: "explorer", task: "inspect private task", state: "running", activity: "", text: "", activities: [] }];
+  const mouse = (type: "press" | "release" | "click"): any => ({ type, button: "left", x: 40, y: 1, screenX: 40, screenY: 1, width: 80, height: 2, shift: false, alt: false, ctrl: false });
+  let card = renderPinnedOmpCard(progress, undefined, 0, theme, state, () => {});
+  expect(card.render(80).join("\n")).not.toContain("inspect private task");
+  card.handleMouse?.(mouse("press"));
+  card.handleMouse?.(mouse("release"));
+  card.handleMouse?.(mouse("click"));
+  card = renderPinnedOmpCard(progress, undefined, 1, theme, state, () => {});
+  expect(card.render(80).join("\n")).toContain("inspect private task");
+});
+
 test("OMP rendering tracks theme changes and stays within narrow widths", () => {
   initTheme();
   let palette = 1;
@@ -567,12 +589,12 @@ test("OMP rendering tracks theme changes and stays within narrow widths", () => 
   }
 });
 
-test("delegation pins live progress and clears the widget on completion", async () => {
+test("delegation moves the card to the fixed position and returns it on completion", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const widgets: Array<{ key: string; lines: string[] | undefined }> = [];
-  h.ctx.ui.setWidget = (key: string, lines: string[] | undefined) => widgets.push({ key, lines });
+  const widgets: Array<{ key: string; content: any }> = [];
+  h.ctx.ui.setWidget = (key: string, content: any) => widgets.push({ key, content });
   const partials: any[] = [];
   const capture = path.join(tmp, "delegate-capture.json");
   process.env.OMP_TEST_CAPTURE = capture;
@@ -584,8 +606,8 @@ test("delegation pins live progress and clears the widget on completion", async 
     expect(call).toContain("0/1");
     expect(call).not.toContain("src/index.ts");
     const result = await tool.execute("call-123", { agent: "explorer", task: "查看 src/index.ts" }, undefined, (partial: any) => partials.push(partial), h.ctx);
-    expect(widgets.some((widget) => widget.key === "omp-active" && widget.lines?.join("\n").includes("Explorer task"))).toBe(true);
-    expect(widgets.flatMap((widget) => widget.lines ?? []).join("\n")).not.toContain("src/index.ts");
+    expect(widgets.some((widget) => widget.key === "omp-active" && widgetText(widget.content).includes("Explorer task"))).toBe(true);
+    expect(widgets.map((widget) => widgetText(widget.content)).join("\n")).not.toContain("src/index.ts");
     expect(partials[0].content[0].text).toContain("preparing user-language prompts");
     expect(partials[0].details.progress.map((item: AgentProgress) => item.state)).toEqual(["queued"]);
     const preparing = tool.renderResult(partials[0], { expanded: false, isPartial: true }, theme).render(100).join("\n");
@@ -611,7 +633,7 @@ test("delegation pins live progress and clears the widget on completion", async 
       expect(displayed.match(/Specialist read the task/g)).toHaveLength(1);
       expect(displayed).not.toContain("Ctrl+Alt+O");
     }
-    expect(widgets.at(-1)).toEqual({ key: "omp-active", lines: undefined });
+    expect(widgets.at(-1)).toEqual({ key: "omp-active", content: undefined });
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_CAPTURE;
@@ -625,6 +647,8 @@ test("background delegation returns immediately, updates its card and delivers c
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "100";
   const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
   try {
     const tool = h.tools.omp_delegate;
     const state: Record<string, unknown> = {};
@@ -638,13 +662,22 @@ test("background delegation returns immediately, updates its card and delivers c
     expect(result.content[0].text).not.toContain(result.details.jobId);
     expect(h.sentMessages).toHaveLength(0);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
-    expect(card.render(100).join("\n")).toContain("running");
+    expect(card.render(100)).toEqual([]);
+    expect(widgetText(pinned)).toContain("running · Explorer task");
+    const fixedCard = pinned({ requestRender: () => {} }, theme);
+    const mouse = (type: "press" | "release" | "click"): any => ({ type, button: "left", x: 40, y: 1, screenX: 40, screenY: 1, width: 100, height: 2, shift: false, alt: false, ctrl: false });
+    fixedCard.handleMouse?.(mouse("press"));
+    fixedCard.handleMouse?.(mouse("release"));
+    fixedCard.handleMouse?.(mouse("click"));
+    expect(widgetText(pinned)).toContain("inspect");
     await waitFor(() => h.sentMessages.length === 1);
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
     expect(h.sentMessages[0].options).toEqual({ triggerTurn: true, deliverAs: "steer" });
     expect(h.sentMessages[0].message.content).not.toContain(result.details.jobId);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100).join("\n")).toContain("done");
+    expect(card.render(100).join("\n")).toContain("inspect");
+    expect(pinned).toBeUndefined();
     expect(invalidations).toBeGreaterThan(0);
   } finally {
     process.argv[1] = originalArgv;
@@ -659,23 +692,26 @@ test("running OMP rows animate like Pi Working and stop after completion", async
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "300";
   const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
   try {
     const tool = h.tools.omp_delegate;
     const context = { state: {} as Record<string, unknown>, toolCallId: "animated-call", invalidate: () => {} };
     const card = tool.renderCall({ agent: "explorer", task: "inspect" }, theme, context);
     const result = await tool.execute("animated-call", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
-    const first = card.render(80).join("\n");
+    const first = widgetText(pinned, 80);
     expect(first).toContain("running · Explorer task");
     await Bun.sleep(100);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
-    const second = card.render(80).join("\n");
+    const second = widgetText(pinned, 80);
     expect(second).toContain("running · Explorer task");
     expect(second).not.toBe(first);
     await waitFor(() => h.sentMessages.length === 1);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     const finished = card.render(80).join("\n");
     expect(finished).toContain("done · Explorer task");
+    expect(pinned).toBeUndefined();
     await Bun.sleep(100);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(80).join("\n")).toBe(finished);
@@ -702,10 +738,10 @@ test("session shutdown cancels background work without sending a stale result", 
   }
 });
 
-test("reload adopts running and queued children and delivers through the new extension", async () => {
+test("reload adopts running children and delivers through the new extension", async () => {
   initTheme();
   const firstExtension = harness();
-  const restoredWidgets: Array<string[] | undefined> = [];
+  const restoredWidgets: any[] = [];
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "300";
@@ -718,15 +754,15 @@ test("reload adopts running and queued children and delivers through the new ext
     ] }, undefined, undefined, firstExtension.ctx);
     await waitFor(() => {
       const card = firstExtension.tools.omp_delegate.renderResult(result, { expanded: false, isPartial: true }, theme).render(100).join("\n");
-      return card.includes("running · 0/4") && card.includes("queued · Explorer task 4");
+      return card.includes("running · 0/4") && card.includes("running · Explorer task 4");
     });
     firstExtension.handlers.session_shutdown({ reason: "reload" }, firstExtension.ctx);
     firstExtension.ctx.isProjectTrusted = () => { throw new Error("Old context was used after reload"); };
     await Bun.sleep(100);
     secondExtension = harness();
-    secondExtension.ctx.ui.setWidget = (_key: string, lines: string[] | undefined) => restoredWidgets.push(lines);
+    secondExtension.ctx.ui.setWidget = (_key: string, content: any) => restoredWidgets.push(content);
     await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
-    await waitFor(() => restoredWidgets.some((lines) => lines?.some((line) => line.includes("Explorer task 4")) ?? false));
+    await waitFor(() => restoredWidgets.some((content) => widgetText(content).includes("Explorer task 4")));
     await waitFor(() => secondExtension!.sentMessages.length === 1, 120);
     expect(restoredWidgets.at(-1)).toBeUndefined();
     expect(firstExtension.sentMessages).toHaveLength(0);
@@ -765,7 +801,7 @@ test("completion during reload is delivered after the new extension starts", asy
   }
 });
 
-test("background batches share one three-child limit", async () => {
+test("background batches start more than three children concurrently", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -782,8 +818,7 @@ test("background batches share one three-child limit", async () => {
       return (card.match(/running · Explorer task/g) ?? []).length === 3;
     });
     const second = await h.tools.omp_delegate.execute("second-batch", { agent: "explorer", task: "four" }, undefined, undefined, h.ctx);
-    const pending = h.tools.omp_delegate.renderResult(second, { expanded: false, isPartial: true }, theme).render(100).join("\n");
-    expect(pending).toContain("queued · Explorer task");
+    await waitFor(() => h.tools.omp_delegate.renderResult(second, { expanded: false, isPartial: true }, theme).render(100).join("\n").includes("running · Explorer task"));
     await waitFor(() => h.sentMessages.length === 2, 150);
   } finally {
     h.handlers.session_shutdown?.({}, h.ctx);
@@ -793,7 +828,7 @@ test("background batches share one three-child limit", async () => {
   }
 });
 
-test("council pins all reviewer statuses and clears them on completion", async () => {
+test("council moves all reviewer statuses to the fixed card and clears it on completion", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -838,7 +873,7 @@ test("council pins all reviewer statuses and clears them on completion", async (
       expect(displayed).not.toMatch(/read src\/index.ts|Inspecting the code|Activity:|Preview:|Model:|Task:/);
       expect(displayed).not.toContain("Ctrl+Alt+O");
     }
-    expect(widgets.some((entry: any) => entry[1]?.join("\n").includes("Council review 3"))).toBe(true);
+    expect(widgets.some((entry: any) => widgetText(entry[1]).includes("Council review 3"))).toBe(true);
     expect((widgets.at(-1) as any)?.[1]).toBeUndefined();
   } finally {
     process.argv[1] = originalArgv;
@@ -850,8 +885,8 @@ test("specialist failure clears the pinned status and exposes failure state in t
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const widgets: Array<{ key: string; lines: string[] | undefined }> = [];
-  h.ctx.ui.setWidget = (key: string, lines: string[] | undefined) => widgets.push({ key, lines });
+  const widgets: Array<{ key: string; content: any }> = [];
+  h.ctx.ui.setWidget = (key: string, content: any) => widgets.push({ key, content });
   try {
     process.env.OMP_TEST_FAIL = "1";
     const failed = await h.tools.omp_delegate.execute("failed", { agent: "explorer", task: "simulate failure" }, undefined, undefined, h.ctx);
@@ -864,8 +899,8 @@ test("specialist failure clears the pinned status and exposes failure state in t
       expect(displayed).toContain("✗ failed · Explorer task");
       expect(displayed).not.toMatch(/stderr|simulated failure|inspect the local conversation viewer|read src\/index.ts/i);
     }
-    expect(widgets.some((entry) => entry.lines?.join("\n").includes("Explorer task"))).toBe(true);
-    expect(widgets.at(-1)?.lines).toBeUndefined();
+    expect(widgets.some((entry) => widgetText(entry.content).includes("Explorer task"))).toBe(true);
+    expect(widgets.at(-1)?.content).toBeUndefined();
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_FAIL;

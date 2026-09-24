@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Container } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
 import { formatResults, queuedProgress, resolveModel, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result } from "./subagents.ts";
-import { OMP_SPINNER_FRAMES, pinnedOmpLines, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
+import { OMP_SPINNER_FRAMES, renderPinnedOmpCard, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
@@ -27,6 +28,7 @@ type BackgroundJob = {
   results?: Result[];
   controller: AbortController;
   invalidators: Map<string, () => void>;
+  pinnedState: OmpRenderState;
   animationFrame: number;
   animationTimer?: ReturnType<typeof setInterval>;
 };
@@ -97,9 +99,15 @@ export default function omp(pi: ExtensionAPI) {
   };
   const refreshPinned = () => {
     const ctx = runtime.ctx;
-    if (!ctx?.hasUI || runtime.reloading || typeof ctx.ui.setWidget !== "function") return;
+    if (ctx?.mode !== "tui" || runtime.reloading || typeof ctx.ui.setWidget !== "function") return;
     const active = [...jobs.values()].filter((job) => job.session === runtime.session && job.state === "running");
-    ctx.ui.setWidget("omp-active", active.length ? pinnedOmpLines(active) : undefined, { placement: "aboveEditor" });
+    ctx.ui.setWidget("omp-active", active.length ? (_tui, theme) => {
+      const view = new Container();
+      for (const job of active) {
+        view.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned));
+      }
+      return view;
+    } : undefined, { placement: "aboveEditor" });
   };
   const stopAnimation = (job: BackgroundJob) => {
     if (job.animationTimer) clearInterval(job.animationTimer);
@@ -162,10 +170,15 @@ export default function omp(pi: ExtensionAPI) {
   const visibleResult = (result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Parameters<typeof renderOmpToolResult>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string }) => {
     const job = result.details?.jobId ? jobs.get(result.details.jobId) : undefined;
     if (job && context?.toolCallId) job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
+    if (job && context?.state.card && job.pinnedState !== context.state) {
+      job.pinnedState = context.state;
+      refreshPinned();
+    }
     return renderOmpToolResult(
       job ? { ...result, details: { ...result.details, progress: job.progress, results: job.results, animationFrame: job.animationFrame } } : result,
       job ? { ...options, isPartial: job.state === "running" } : options,
       theme, context?.state ?? {}, context?.invalidate,
+      job?.state === "running" && runtime.ctx?.mode === "tui" && !!context?.state.card,
     );
   };
 
@@ -179,7 +192,7 @@ export default function omp(pi: ExtensionAPI) {
     const controller = new AbortController();
     const job: BackgroundJob = {
       id, kind, session: runtime.session, state: "running", progress: queuedProgress(prepared.items),
-      controller, invalidators: new Map(), animationFrame: 0,
+      controller, invalidators: new Map(), pinnedState: {}, animationFrame: 0,
     };
     bindContext(ctx);
     jobs.set(id, job);
@@ -336,7 +349,7 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_delegate", label: "OMP delegate",
-    description: "Start background specialist work and receive an automatic completion message. One to four independent tasks, at most three children running across all batches. Specialists: explorer, librarian, oracle, designer, fixer. Do not send secret credentials in tasks.",
+    description: "Start background specialist work and receive an automatic completion message. One to four independent tasks run concurrently. Specialists: explorer, librarian, oracle, designer, fixer. Do not send secret credentials in tasks.",
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Specialist for a single task" })),
       task: Type.Optional(Type.String({ description: "Bounded task for the specialist" })),

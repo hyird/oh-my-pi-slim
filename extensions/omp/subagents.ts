@@ -24,54 +24,6 @@ export interface AgentProgress {
 }
 export interface OmpDetails { progress: AgentProgress[]; results?: Result[]; jobId?: string; animationFrame?: number }
 const MAX_OUTPUT = 20_000;
-const MAX_CONCURRENT_CHILDREN = 3;
-let activeChildren = 0;
-const waitingChildren: Array<{
-  signal?: AbortSignal;
-  resolve: (release: () => void) => void;
-  reject: (error: Error) => void;
-  onAbort: () => void;
-}> = [];
-
-function releaseChildSlot(): () => void {
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    activeChildren--;
-    while (activeChildren < MAX_CONCURRENT_CHILDREN && waitingChildren.length) {
-      const next = waitingChildren.shift()!;
-      next.signal?.removeEventListener("abort", next.onAbort);
-      if (next.signal?.aborted) {
-        next.reject(new Error("Specialist tasks cancelled"));
-        continue;
-      }
-      activeChildren++;
-      next.resolve(releaseChildSlot());
-    }
-  };
-}
-
-function acquireChildSlot(signal?: AbortSignal): Promise<() => void> {
-  if (signal?.aborted) return Promise.reject(new Error("Specialist tasks cancelled"));
-  if (activeChildren < MAX_CONCURRENT_CHILDREN && waitingChildren.length === 0) {
-    activeChildren++;
-    return Promise.resolve(releaseChildSlot());
-  }
-  return new Promise((resolve, reject) => {
-    const entry = {
-      signal, resolve, reject,
-      onAbort: () => {
-        const index = waitingChildren.indexOf(entry);
-        if (index >= 0) waitingChildren.splice(index, 1);
-        signal?.removeEventListener("abort", entry.onAbort);
-        reject(new Error("Specialist tasks cancelled"));
-      },
-    };
-    waitingChildren.push(entry);
-    signal?.addEventListener("abort", entry.onAbort, { once: true });
-  });
-}
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
   return items.map(({ agent, task }) => ({
@@ -305,7 +257,6 @@ export async function runAssignments(
 ): Promise<Result[]> {
   const results = new Array<Result>(items.length);
   const progress = queuedProgress(items);
-  let next = 0;
   let lastPublished = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const publish = (force = false) => {
@@ -323,36 +274,31 @@ export async function runAssignments(
   };
   publish(true);
   try {
-    await Promise.all(Array.from({ length: Math.min(3, items.length) }, async () => {
-      while (next < items.length && !signal?.aborted) {
-        const index = next++;
-        let release: (() => void) | undefined;
-        try {
-          release = await acquireChildSlot(signal);
-          const nextContext = getContext ? getContext(signal) : ctx;
-          const childContext = nextContext instanceof Promise ? await nextContext : nextContext;
-          progress[index] = { ...progress[index], state: "running", activity: "Starting" };
-          publish(true);
-          results[index] = await runAgent(childContext, items[index], signal, modelOverride, (snapshot) => {
-            const important = snapshot.activities.length !== progress[index].activities.length || snapshot.state !== progress[index].state;
-            progress[index] = snapshot;
-            publish(important);
-          }, delegationId);
-        } catch (err) {
-          results[index] = {
-            agent: items[index].agent, model: modelOverride ?? "inherit", ok: false, cancelled: signal?.aborted,
-            output: signal?.aborted ? "Specialist cancelled" : err instanceof Error ? err.message : String(err), usage: emptyUsage(),
-          };
-        } finally {
-          release?.();
-        }
-        progress[index] = {
-          ...progress[index], model: results[index].model, state: results[index].ok ? "done" : results[index].cancelled ? "cancelled" : "failed",
-          activity: results[index].ok ? "Work completed" : results[index].cancelled ? "Cancelled" : "Run failed",
-          text: results[index].ok ? results[index].output.slice(-2000) : progress[index].text,
-        };
+    await Promise.all(items.map(async (item, index) => {
+      try {
+        if (signal?.aborted) throw new Error("Specialist tasks cancelled");
+        const nextContext = getContext ? getContext(signal) : ctx;
+        const childContext = nextContext instanceof Promise ? await nextContext : nextContext;
+        if (signal?.aborted) throw new Error("Specialist tasks cancelled");
+        progress[index] = { ...progress[index], state: "running", activity: "Starting" };
         publish(true);
+        results[index] = await runAgent(childContext, item, signal, modelOverride, (snapshot) => {
+          const important = snapshot.activities.length !== progress[index].activities.length || snapshot.state !== progress[index].state;
+          progress[index] = snapshot;
+          publish(important);
+        }, delegationId);
+      } catch (err) {
+        results[index] = {
+          agent: item.agent, model: modelOverride ?? "inherit", ok: false, cancelled: signal?.aborted,
+          output: signal?.aborted ? "Specialist cancelled" : err instanceof Error ? err.message : String(err), usage: emptyUsage(),
+        };
       }
+      progress[index] = {
+        ...progress[index], model: results[index].model, state: results[index].ok ? "done" : results[index].cancelled ? "cancelled" : "failed",
+        activity: results[index].ok ? "Work completed" : results[index].cancelled ? "Cancelled" : "Run failed",
+        text: results[index].ok ? results[index].output.slice(-2000) : progress[index].text,
+      };
+      publish(true);
     }));
     if (signal?.aborted) {
       for (let index = 0; index < items.length; index++) {
