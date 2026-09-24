@@ -1,4 +1,4 @@
-import { truncateToWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 
 export interface PinnedScrollState { listTop: number; detailTop: number; focusedListRow?: number }
 
@@ -23,17 +23,17 @@ export function scrollablePinnedCard(
   let viewportWidth = 0;
   const clamp = (top: number, height: number, contentRows: number) =>
     Math.max(0, Math.min(top, height - contentRows));
-  const region = (lines: string[], budget: number, top: number, width: number) => {
+  const region = (lines: string[], budget: number, top: number, width: number, footer = true) => {
     if (budget <= 0) return { lines: [], top: 0, contentRows: 0 };
     if (lines.length <= budget) return { lines, top: 0, contentRows: lines.length };
-    const contentRows = budget - 1;
+    const contentRows = budget - (footer ? 1 : 0);
     const position = clamp(top, lines.length, contentRows);
     const first = position + 1;
     const last = Math.min(lines.length, position + contentRows);
     return {
       lines: [
         ...lines.slice(position, position + contentRows),
-        hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width)),
+        ...(footer ? [hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width))] : []),
       ],
       top: position,
       contentRows,
@@ -60,11 +60,20 @@ export function scrollablePinnedCard(
       state.focusedListRow = undefined;
       listContentRows = visibleList.contentRows;
       listScreenRows = visibleList.lines.length;
-      const visibleDetail = region(detailLines, maxRows - listScreenRows, state.detailTop, width);
+      const visibleDetail = region(detailLines, maxRows - listScreenRows, state.detailTop, width, false);
       state.detailTop = visibleDetail.top;
       detailContentRows = visibleDetail.contentRows;
       detailScreenRows = visibleDetail.lines.length;
       detailStart = detail ? Math.max(0, Math.min(listContentRows, (insertAfterRow ?? listHeight) - state.listTop)) : listScreenRows;
+      if (detail && detailHeight > detailContentRows && detailContentRows > 0 && insertAfterRow !== undefined) {
+        const row = insertAfterRow - state.listTop - 1;
+        if (row >= 0 && row < listContentRows) {
+          const label = ` ↕ ${state.detailTop + 1}–${Math.min(detailHeight, state.detailTop + detailContentRows)}/${detailHeight}`;
+          const available = width - visibleWidth(label);
+          const taskWidth = visibleWidth(stripTerminalSequences(visibleList.lines[row]).trimEnd());
+          if (available >= taskWidth) visibleList.lines[row] = truncateToWidth(visibleList.lines[row], available, "") + hint(label);
+        }
+      }
       return [
         ...visibleList.lines.slice(0, detailStart),
         ...visibleDetail.lines,

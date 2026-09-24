@@ -15,19 +15,23 @@ test("expanded detail scrolls below its row while later tasks remain visible", (
   const detail = { render: () => Array.from({ length: 30 }, (_, i) => `detail ${i + 1}`), invalidate() {} };
   const card = scrollablePinnedCard(list, detail, 2, 20, state, () => { renders++; }, (text) => text);
   expect(card.render(40)).toHaveLength(13);
-  expect(card.render(40).slice(0, 3)).toEqual(["OMP", "task 1", "detail 1"]);
+  expect(card.render(40)[0]).toBe("OMP");
+  expect(card.render(40)[1]).toContain("task 1");
+  expect(card.render(40)[2]).toBe("detail 1");
   expect(card.render(40).at(-1)).toBe("task 2");
-  expect(card.render(40)[11]).toContain("1–9/30");
+  expect(card.render(40)[1]).toContain("1–10/30");
+  expect(card.render(40)[11]).toContain("detail 10");
   expect(card.handleMouse?.(mouse("wheel", 5, 5))?.handled).toBe(true);
   expect(state.detailTop).toBe(5);
   expect(renders).toBe(1);
-  expect(card.render(40).slice(0, 3)).toEqual(["OMP", "task 1", "detail 6"]);
+  expect(card.render(40)[1]).toContain("6–15/30");
+  expect(card.render(40)[2]).toBe("detail 6");
   expect(card.render(40).at(-1)).toBe("task 2");
   card.handleMouse?.(mouse("click", 12));
   expect(clicked).toEqual([2]);
   card.handleMouse?.(mouse("wheel", 1, 100));
-  expect(state.detailTop).toBe(21);
-  expect(card.render(40)[11]).toContain("22–30/30");
+  expect(state.detailTop).toBe(20);
+  expect(card.render(40)[1]).toContain("21–30/30");
 });
 
 test("a long task list scrolls separately while detail stays visible", () => {
@@ -41,7 +45,8 @@ test("a long task list scrolls separately while detail stays visible", () => {
   expect(state.listTop).toBe(5);
   expect(state.detailTop).toBe(0);
   const scrolled = card.render(40);
-  expect(scrolled[0]).toBe("task 6");
+  expect(scrolled[0]).toContain("task 6");
+  expect(scrolled[0]).toContain("1–4/12");
   expect(scrolled.join("\n")).toContain("detail 1");
 });
 
@@ -54,7 +59,7 @@ test("opening detail keeps the clicked row visible when the list viewport shrink
   collapsed.handleMouse?.(mouse("click", 10));
   const detail = { render: () => Array.from({ length: 12 }, (_, i) => `detail ${i + 1}`), invalidate() {} };
   const expanded = scrollablePinnedCard(list, detail, 11, 20, state, () => {}, (text) => text);
-  expect(expanded.render(40).slice(0, 9)).toContain("task 11");
+  expect(expanded.render(40).slice(0, 9).some(line => line.includes("task 11"))).toBe(true);
   expect(state.listTop).toBe(3);
   expect(state.focusedListRow).toBeUndefined();
 });
@@ -65,4 +70,15 @@ test("short task lists retain their height and reset stale offsets", () => {
     10, state, () => {}, (text) => text);
   expect(card.render(40)).toEqual(["OMP", "task"]);
   expect(state).toEqual({ listTop: 0, detailTop: 0 });
+});
+
+test("narrow task rows keep their names when the inline range does not fit", () => {
+  const state = { listTop: 0, detailTop: 0 };
+  const list = { render: () => ["OMP", "Explorer task 1", "Explorer task 2"], invalidate() {} };
+  const detail = { render: () => Array.from({ length: 30 }, (_, i) => `detail ${i + 1}`), invalidate() {} };
+  const card = scrollablePinnedCard(list, detail, 2, 20, state, () => {}, (text) => text);
+  const lines = card.render(18);
+  expect(lines[1]).toBe("Explorer task 1");
+  expect(lines.at(-1)).toBe("Explorer task 2");
+  expect(lines.join("\n")).not.toContain("scroll");
 });

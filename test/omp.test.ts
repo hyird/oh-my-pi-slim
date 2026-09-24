@@ -760,6 +760,8 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   expect(expandedLines).toHaveLength(13);
   expect(expandedLines.join("\n")).toContain("detail line 1");
   expect(expandedLines.join("\n")).toContain("Explorer task 1");
+  expect(expandedLines.find((line: string) => line.includes("Explorer task 1"))).toContain("1–");
+  expect(expandedLines.join("\n")).not.toContain("· scroll");
   expect(expandedLines.join("\n")).toContain("Fixer task 2");
   expect(expandedLines.findIndex((line: string) => line.includes("Explorer task 1")))
     .toBeLessThan(expandedLines.findIndex((line: string) => line.includes("detail line 1")));
