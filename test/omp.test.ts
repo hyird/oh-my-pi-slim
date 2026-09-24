@@ -5,10 +5,10 @@ import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { configPath, parseConfig, parseModel, readConfig, updateConfig } from "../extensions/omp/config.ts";
-import { formatResults, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Result } from "../extensions/omp/subagents.ts";
+import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Result } from "../extensions/omp/subagents.ts";
 import { getChoices, getSettingsRows, INHERIT, INHERIT_THINKING } from "../extensions/omp/settings-ui.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { renderOmpCall, renderOmpResult, renderPinnedOmpCard } from "../extensions/omp/render.ts";
+import { renderOmpCall, renderOmpResult, renderOmpToolCall, renderPinnedOmpCard } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
@@ -589,7 +589,7 @@ test("OMP rendering tracks theme changes and stays within narrow widths", () => 
   }
 });
 
-test("delegation moves the card to the fixed position and returns it on completion", async () => {
+test("delegation keeps its completed card fixed until the next user input", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -633,11 +633,31 @@ test("delegation moves the card to the fixed position and returns it on completi
       expect(displayed.match(/Specialist read the task/g)).toHaveLength(1);
       expect(displayed).not.toContain("Ctrl+Alt+O");
     }
+    expect(widgetText(widgets.at(-1)?.content)).toContain("done · Explorer task");
+    h.handlers.input({ source: "extension", text: "automatic result" }, h.ctx);
+    expect(widgetText(widgets.at(-1)?.content)).toContain("done · Explorer task");
+    h.handlers.input({ source: "interactive", text: "next request" }, h.ctx);
     expect(widgets.at(-1)).toEqual({ key: "omp-active", content: undefined });
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_CAPTURE;
   }
+});
+
+test("dispatch appears in the fixed card before the chat call renders and failed preparation clears it", () => {
+  const h = harness();
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  const tool = h.tools.omp_delegate;
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const context = { state: {} as any, toolCallId: "pending-call", invalidate: () => {} };
+  const args = { agent: "explorer", task: "inspect" };
+  h.handlers.tool_execution_start({ toolCallId: "pending-call", toolName: "omp_delegate", args }, h.ctx);
+  expect(widgetText(pinned)).toContain("queued · Explorer task");
+  expect(tool.renderCall(args, theme, context).render(80)).toEqual([]);
+  h.handlers.tool_execution_end({ toolCallId: "pending-call", toolName: "omp_delegate", isError: true, result: { content: [] } }, h.ctx);
+  expect(pinned).toBeUndefined();
+  expect(tool.renderCall(args, theme, context).render(80).join("\n")).toContain("Explorer task");
 });
 
 test("background delegation returns immediately, updates its card and delivers completion", async () => {
@@ -655,6 +675,12 @@ test("background delegation returns immediately, updates its card and delivers c
     let invalidations = 0;
     const context = { state, toolCallId: "background-call", invalidate: () => invalidations++ };
     const card = tool.renderCall({ agent: "explorer", task: "inspect" }, theme, context);
+    expect(tool.renderShell).toBe("self");
+    h.handlers.tool_execution_start({ toolCallId: "background-call", toolName: "omp_delegate", args: { agent: "explorer", task: "inspect" } }, h.ctx);
+    expect(card.render(100)).toEqual([]);
+    expect(tool.renderCall({ agent: "explorer", task: "inspect" }, theme, context).render(100)).toEqual([]);
+    expect(tool.renderResult({ content: [], details: { progress: queuedProgress([{ agent: "explorer", task: "inspect" }]) } }, { expanded: false, isPartial: true }, theme, context).render(100)).toEqual([]);
+    expect(widgetText(pinned)).toContain("queued · Explorer task");
     const result = await tool.execute("background-call", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
     expect(result.details.jobId).toBeString();
     expect(result.content[0].text).toContain("started");
@@ -682,6 +708,12 @@ test("background delegation returns immediately, updates its card and delivers c
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
     expect(h.sentMessages[0].options).toEqual({ triggerTurn: true, deliverAs: "steer" });
     expect(h.sentMessages[0].message.content).not.toContain(result.details.jobId);
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    expect(card.render(100)).toEqual([]);
+    expect(widgetText(pinned)).toContain("done · Explorer task");
+    h.handlers.input({ source: "extension", text: "automatic completion" }, h.ctx);
+    expect(widgetText(pinned)).toContain("done · Explorer task");
+    h.handlers.input({ source: "interactive", text: "next message" }, h.ctx);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
     expect(card.render(100).join("\n")).toContain("done");
     expect(card.render(100).join("\n")).toContain("inspect");
@@ -717,12 +749,14 @@ test("running OMP rows animate like Pi Working and stop after completion", async
     expect(second).not.toBe(first);
     await waitFor(() => h.sentMessages.length === 1);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
-    const finished = card.render(80).join("\n");
+    const finished = widgetText(pinned, 80);
     expect(finished).toContain("done · Explorer task");
-    expect(pinned).toBeUndefined();
     await Bun.sleep(100);
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
-    expect(card.render(80).join("\n")).toBe(finished);
+    expect(widgetText(pinned, 80)).toBe(finished);
+    h.handlers.input({ source: "interactive", text: "next" }, h.ctx);
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    expect(card.render(80).join("\n")).toContain("done · Explorer task");
   } finally {
     h.handlers.session_shutdown?.({}, h.ctx);
     process.argv[1] = originalArgv;
@@ -772,7 +806,7 @@ test("reload adopts running children and delivers through the new extension", as
     await secondExtension.handlers.session_start({ reason: "reload" }, secondExtension.ctx);
     await waitFor(() => restoredWidgets.some((content) => widgetText(content).includes("Explorer task 4")));
     await waitFor(() => secondExtension!.sentMessages.length === 1, 120);
-    expect(restoredWidgets.at(-1)).toBeUndefined();
+    expect(widgetText(restoredWidgets.at(-1))).toContain("done · Explorer task 4");
     expect(firstExtension.sentMessages).toHaveLength(0);
     expect(secondExtension.sentMessages[0].message.content).toContain("OMP background delegate done");
     expect(secondExtension.sentMessages[0].message.content.match(/OK explorer/g)).toHaveLength(4);
@@ -907,7 +941,7 @@ test("council moves all reviewer statuses to the fixed card and clears it on com
       expect(displayed).not.toContain("Ctrl+Alt+O");
     }
     expect(widgets.some((entry: any) => widgetText(entry[1]).includes("Council review 3"))).toBe(true);
-    expect((widgets.at(-1) as any)?.[1]).toBeUndefined();
+    expect(widgetText((widgets.at(-1) as any)?.[1])).toContain("done · Council review 3");
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_CAPTURE;
@@ -933,7 +967,7 @@ test("specialist failure clears the pinned status and exposes failure state in t
       expect(displayed).not.toMatch(/stderr|simulated failure|inspect the local conversation viewer|read src\/index.ts/i);
     }
     expect(widgets.some((entry) => widgetText(entry.content).includes("Explorer task"))).toBe(true);
-    expect(widgets.at(-1)?.content).toBeUndefined();
+    expect(widgetText(widgets.at(-1)?.content)).toContain("failed · Explorer task");
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_FAIL;
@@ -983,24 +1017,25 @@ test("clicking one task expands its task and assistant reply inline", () => {
   const tool = h.tools.omp_delegate;
   const mouse = (type: string, y: number, x = 99) => ({ type, button: "left", x, y, screenX: x, screenY: y, width: 100, height: 4, shift: false, alt: false, ctrl: false });
 
-  let call = tool.renderCall({ tasks }, theme, context);
+  const renderCall = () => renderOmpToolCall("OMP delegate", tasks as any, theme, state as any, context.invalidate);
+  let call: any = renderCall();
   expect(call.render(100).join("\n")).not.toContain("second private task");
   expect(call.handleMouse(mouse("move", 2))?.handled).toBe(true);
-  call = tool.renderCall({ tasks }, theme, context);
+  call = renderCall();
   expect(call.render(100)[2]).toContain("\x1b[44m");
   expect(call.render(100)[1]).not.toContain("\x1b[44m");
   expect(call.handleMouse(mouse("move", 1))?.handled).toBe(true);
-  call = tool.renderCall({ tasks }, theme, context);
+  call = renderCall();
   expect(call.render(100)[1]).toContain("\x1b[44m");
   expect(call.render(100)[2]).not.toContain("\x1b[44m");
   expect(call.handleMouse(mouse("move", 0))?.handled).toBe(true);
-  call = tool.renderCall({ tasks }, theme, context);
+  call = renderCall();
   expect(call.render(100).join("\n")).not.toContain("\x1b[44m");
   expect(call.handleMouse(mouse("press", 2))?.handled).toBe(true);
   expect(call.handleMouse(mouse("release", 2))?.handled).toBe(true);
   expect(call.handleMouse(mouse("click", 2))?.handled).toBe(true);
   expect(invalidations).toBeGreaterThan(1);
-  call = tool.renderCall({ tasks }, theme, context);
+  call = renderCall();
   const queued = call.render(100).join("\n");
   expect(queued).toContain("second private task");
   expect(queued).not.toContain("first private task");
@@ -1028,7 +1063,7 @@ test("clicking one task expands its task and assistant reply inline", () => {
 
   expect(call.handleMouse(mouse("press", 2))?.handled).toBe(true);
   expect(call.handleMouse(mouse("click", 2))?.handled).toBe(true);
-  call = tool.renderCall({ tasks }, theme, context);
+  call = renderCall();
   tool.renderResult({ content: [], details: { progress, results } }, { expanded: false, isPartial: false }, theme, context);
   expect(call.render(100).join("\n")).not.toContain("second private task");
   const failedProgress = progress.map((item, index) => index === 1 ? { ...item, state: "failed" } : item);
@@ -1037,7 +1072,7 @@ test("clicking one task expands its task and assistant reply inline", () => {
   call.render(100);
   expect(call.handleMouse(mouse("press", 2))?.handled).toBe(true);
   expect(call.handleMouse(mouse("click", 2))?.handled).toBe(true);
-  call = tool.renderCall({ tasks }, theme, context);
+  call = renderCall();
   tool.renderResult({ content: [], details: { progress: failedProgress, results: failedResults } }, { expanded: false, isPartial: false }, theme, context);
   const failed = call.render(100).join("\n");
   expect(failed).toContain("✗ failed · Oracle task 2");

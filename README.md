@@ -40,7 +40,7 @@ With pi-mcp-adapter, Orchestrator can use verified non-context7 namespace proxie
 
 Running OMP task rows use the same spinner frames and cadence as Pi's Working indicator. The animation stops when the batch completes or is cancelled.
 
-While a batch is active, its interactive status card moves above Pi's editor so progress remains visible when the conversation scrolls. Click its task rows there to read the task and assistant replies. The card returns to the conversation when the batch finishes; the fixed position then clears.
+From the start of delegation, the interactive task card appears only above Pi's editor, with Pi's normal tool-card background and padding. Click its task rows to read tasks and assistant replies. After completion, it stays fixed until the next user message; then it returns to the conversation. Automatic specialist completion messages do not move it.
 
 Pi's `/reload` keeps running OMP children in the same process. The new extension instance reconnects their task cards and delivers any results that finished during reload. Switching sessions or quitting Pi cancels active work; process restarts cannot resume child processes.
 
@@ -48,7 +48,7 @@ The main model decides whether to use `omp_delegate` (one specialist task or a n
 
 Completion is delivered at Pi's next safe tool boundary while the main agent is active, or starts a new turn when idle. The main agent should finish its current turn when no independent work remains; it should not call `sleep` or poll for results. The fixed card continues to show progress while work runs. Cancelling a batch marks every unfinished task as cancelled in the card and retains completed results when a completion message is delivered.
 
-The inline tool card shows each task's status from queued through completion. Hovering highlights the task row; click anywhere across that row to expand or collapse its full task text and the assistant replies recorded so far. Tool calls, tool results, and thinking are not shown in the card. There is no Ctrl+Alt+O popup. OMP does not integrate with `pi-subagents`; that third-party package is neither installed nor required. Child runs are isolated local processes, not Pi native session persistence, named session continuation, or resumable child sessions.
+The task card shows each task's status from queued through completion. Hovering highlights the task row; click anywhere across that row to expand or collapse its full task text and the assistant replies recorded so far. Tool calls, tool results, and thinking are not shown in the card. There is no Ctrl+Alt+O popup. OMP does not integrate with `pi-subagents`; that third-party package is neither installed nor required. Child runs are isolated local processes, not Pi native session persistence, named session continuation, or resumable child sessions.
 
 Recordings are persisted under `getAgentDir()/omp/conversations` (normally `~/.pi/agent/omp/conversations`) as local JSON event logs and metadata. Older recordings remain on disk. They can contain sensitive prompts, code, full tool arguments/results, and emitted thinking. Protect this directory, avoid sharing it, and delete old logs yourself when no longer needed: OMP does not automatically expire or purge them. Model-facing tool output is separately bounded/truncated; local logs retain the full recorded child-visible event data. Provider output may vary, and un-emitted content cannot be displayed.
 

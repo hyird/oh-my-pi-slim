@@ -149,14 +149,21 @@ export function renderOmpToolResult(
   return new Container();
 }
 
+export function renderPinnedOmpCall(
+  tasks: readonly Assignment[], theme: Theme, state: OmpRenderState, invalidate: () => void,
+): Component {
+  const interaction = { state, invalidate };
+  return clearHoverOutsideRows(renderOmpCall("OMP", tasks, theme, interaction), interaction);
+}
+
 /** The same interactive status card, hosted at the fixed editor position. */
 export function renderPinnedOmpCard(
   progress: AgentProgress[], results: Result[] | undefined, animationFrame: number,
-  theme: Theme, state: OmpRenderState, invalidate: () => void,
+  theme: Theme, state: OmpRenderState, invalidate: () => void, isPartial = true,
 ): Component {
   const interaction = { state, invalidate };
   const result: AgentToolResult<OmpDetails> = { content: [], details: { progress, results, animationFrame } };
-  return clearHoverOutsideRows(renderOmpResult(result, { expanded: false, isPartial: true }, theme, interaction), interaction);
+  return clearHoverOutsideRows(renderOmpResult(result, { expanded: false, isPartial }, theme, interaction), interaction);
 }
 
 export function renderOmpResult(

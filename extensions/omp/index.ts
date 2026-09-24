@@ -6,7 +6,7 @@ import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } fro
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
 import { formatResults, queuedProgress, resolveModel, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result } from "./subagents.ts";
-import { OMP_SPINNER_FRAMES, renderPinnedOmpCard, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
+import { OMP_SPINNER_FRAMES, renderPinnedOmpCall, renderPinnedOmpCard, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
@@ -21,6 +21,7 @@ const councilAssignments = (question: string): Assignment[] =>
 
 type BackgroundJob = {
   id: string;
+  callId: string;
   kind: "delegate" | "council";
   session: number;
   state: "running" | "done" | "failed" | "cancelled";
@@ -29,13 +30,17 @@ type BackgroundJob = {
   controller: AbortController;
   invalidators: Map<string, () => void>;
   pinnedState: OmpRenderState;
+  released: boolean;
   animationFrame: number;
   animationTimer?: ReturnType<typeof setInterval>;
 };
 
+type PendingCall = { tasks: Assignment[]; state: OmpRenderState; invalidate: () => void };
+
 type OmpRuntime = {
   session: number;
   jobs: Map<string, BackgroundJob>;
+  calls: Map<string, PendingCall>;
   pi?: ExtensionAPI;
   ctx?: ExtensionContext;
   reloading: boolean;
@@ -55,10 +60,14 @@ export default function omp(pi: ExtensionAPI) {
   let role: MainAgent = "orchestrator";
   const runtimeKey = getAgentDir();
   const runtime: OmpRuntime = runtimes.get(runtimeKey) ?? {
-    session: 0, jobs: new Map(), reloading: false, pending: [], contextWaiters: new Set(),
+    session: 0, jobs: new Map(), calls: new Map(), reloading: false, pending: [], contextWaiters: new Set(),
   };
+  // A /reload may adopt a runtime created by an older extension version.
+  runtime.calls ??= new Map();
   runtimes.set(runtimeKey, runtime);
   const jobs = runtime.jobs;
+  const calls = runtime.calls;
+  const callStates = new Map<string, { state: OmpRenderState; invalidate: () => void }>();
   const reconcileTools = installMcpPolicy(pi, () => role);
 
   const reconcileModels = async (ctx: ExtensionContext) => {
@@ -100,18 +109,53 @@ export default function omp(pi: ExtensionAPI) {
   const refreshPinned = () => {
     const ctx = runtime.ctx;
     if (ctx?.mode !== "tui" || runtime.reloading || typeof ctx.ui.setWidget !== "function") return;
-    const active = [...jobs.values()].filter((job) => job.session === runtime.session && job.state === "running");
-    ctx.ui.setWidget("omp-active", active.length ? (_tui, theme) => {
+    const pinned = [...jobs.values()].filter((job) => job.session === runtime.session && !job.released);
+    const pending = [...calls.values()];
+    ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (_tui, theme) => {
       const view = new Container();
-      for (const [index, job] of active.entries()) {
+      for (const [index, call] of pending.entries()) {
         if (index) view.addChild(new Spacer(1));
-        // Match Pi's normal tool result shell, including its padding and background.
+        const card = new Box(1, 1, (text) => theme.bg("toolPendingBg", text));
+        card.addChild(renderPinnedOmpCall(call.tasks, theme, call.state, refreshPinned));
+        view.addChild(card);
+      }
+      for (const [index, job] of pinned.entries()) {
+        if (index || pending.length) view.addChild(new Spacer(1));
         const card = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
-        card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned));
+        card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned, job.state === "running"));
         view.addChild(card);
       }
       return view;
     } : undefined, { placement: "aboveEditor" });
+  };
+  const pinnedJob = (callId: string) => [...jobs.values()].find((job) => job.callId === callId && !job.released);
+  const beginCall = (callId: string, tasks: Assignment[]) => {
+    if (runtime.ctx?.mode !== "tui" || !callId || calls.has(callId) || pinnedJob(callId)) return;
+    const existing = callStates.get(callId);
+    const call: PendingCall = { tasks, state: existing?.state ?? {}, invalidate: existing?.invalidate ?? (() => {}) };
+    calls.set(callId, call);
+    call.state.card?.clear();
+    call.invalidate();
+    refreshPinned();
+  };
+  const renderChatCall = (label: string, tasks: Assignment[], theme: Parameters<typeof renderOmpToolCall>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string; isPartial?: boolean; isError?: boolean }) => {
+    if (context?.toolCallId) {
+      callStates.set(context.toolCallId, { state: context.state, invalidate: context.invalidate });
+      const pending = calls.get(context.toolCallId);
+      if (pending && pending.state !== context.state) {
+        pending.state = context.state;
+        pending.invalidate = context.invalidate;
+        refreshPinned();
+      }
+      if (pending || pinnedJob(context.toolCallId)) {
+        context.state.card?.clear();
+        return new Container();
+      }
+    }
+    const shell = new Box(1, 1, (text) => theme.bg?.(context?.isPartial === false
+      ? context.isError ? "toolErrorBg" : "toolSuccessBg" : "toolPendingBg", text) ?? text);
+    shell.addChild(renderOmpToolCall(label, tasks, theme, context?.state ?? {}, context?.invalidate));
+    return shell;
   };
   const stopAnimation = (job: BackgroundJob) => {
     if (job.animationTimer) clearInterval(job.animationTimer);
@@ -173,16 +217,20 @@ export default function omp(pi: ExtensionAPI) {
   };
   const visibleResult = (result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Parameters<typeof renderOmpToolResult>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string }) => {
     const job = result.details?.jobId ? jobs.get(result.details.jobId) : undefined;
-    if (job && context?.toolCallId) job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
+    if (job && context?.toolCallId) {
+      job.callId = context.toolCallId;
+      job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
+    }
     if (job && context?.state.card && job.pinnedState !== context.state) {
       job.pinnedState = context.state;
       refreshPinned();
     }
+    const moved = runtime.ctx?.mode === "tui" && !!context?.state.card && (!!(job && !job.released) || !!(context?.toolCallId && calls.has(context.toolCallId)));
     return renderOmpToolResult(
       job ? { ...result, details: { ...result.details, progress: job.progress, results: job.results, animationFrame: job.animationFrame } } : result,
       job ? { ...options, isPartial: job.state === "running" } : options,
       theme, context?.state ?? {}, context?.invalidate,
-      job?.state === "running" && runtime.ctx?.mode === "tui" && !!context?.state.card,
+      moved,
     );
   };
 
@@ -190,15 +238,17 @@ export default function omp(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     prepared: Awaited<ReturnType<typeof prepareAssignments>>,
     kind: BackgroundJob["kind"],
+    callId: string,
     modelOverride?: string,
   ): AgentToolResult<OmpDetails> => {
     const id = randomUUID();
     const controller = new AbortController();
     const job: BackgroundJob = {
-      id, kind, session: runtime.session, state: "running", progress: queuedProgress(prepared.items),
-      controller, invalidators: new Map(), pinnedState: {}, animationFrame: 0,
+      id, callId, kind, session: runtime.session, state: "running", progress: queuedProgress(prepared.items),
+      controller, invalidators: new Map(), pinnedState: calls.get(callId)?.state ?? {}, released: false, animationFrame: 0,
     };
     bindContext(ctx);
+    calls.delete(callId);
     jobs.set(id, job);
     refreshPinned();
     job.animationTimer = setInterval(() => {
@@ -290,11 +340,45 @@ export default function omp(pi: ExtensionAPI) {
     },
   });
 
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (event.toolName !== "omp_delegate" && event.toolName !== "omp_council") return;
+    bindContext(ctx);
+    if (event.toolName === "omp_delegate") {
+      const args = event.args ?? {};
+      const tasks = Array.isArray(args.tasks)
+        ? args.tasks.map((item: any) => ({ agent: typeof item?.agent === "string" ? item.agent : "explorer", task: typeof item?.task === "string" ? item.task : "" }))
+        : [{ agent: typeof args.agent === "string" ? args.agent : "explorer", task: typeof args.task === "string" ? args.task : "" }];
+      beginCall(event.toolCallId, tasks as Assignment[]);
+    } else if (event.toolName === "omp_council") {
+      beginCall(event.toolCallId, councilAssignments(String(event.args?.question ?? "")));
+    }
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    const call = calls.get(event.toolCallId);
+    if (!call) return;
+    calls.delete(event.toolCallId);
+    call.invalidate();
+    refreshPinned();
+  });
+
+  pi.on("input", (event) => {
+    if (event.source === "extension") return;
+    for (const job of jobs.values()) {
+      if (job.session !== runtime.session || job.state === "running" || job.released) continue;
+      job.released = true;
+      repaint(job);
+      callStates.delete(job.callId);
+    }
+  });
+
   pi.on("session_start", async (event, ctx) => {
     const resumedReload = event.reason === "reload" && runtime.reloading;
     if (!resumedReload) {
       cancelRunning();
       jobs.clear();
+      calls.clear();
+      callStates.clear();
       runtime.pending.length = 0;
       runtime.session++;
       runtime.reloading = false;
@@ -329,12 +413,17 @@ export default function omp(pi: ExtensionAPI) {
     runtime.ctx = undefined;
     for (const job of jobs.values()) job.invalidators.clear();
     if (event.reason === "reload") {
+      // A tool still preparing prompts has no child run to adopt after reload.
+      calls.clear();
+      callStates.clear();
       runtime.reloading = true;
       return;
     }
     runtime.session++;
     cancelRunning();
     jobs.clear();
+    calls.clear();
+    callStates.clear();
     runtime.pending.length = 0;
     runtime.reloading = false;
     runtimes.delete(runtimeKey);
@@ -348,11 +437,12 @@ export default function omp(pi: ExtensionAPI) {
       return;
     }
     event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
-    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background. Continue only independent work; if none remains, end your turn with a brief status, without claiming the task is finished. Completion steers an active turn at the next safe tool boundary or wakes an idle turn. Never use shell sleep or polling to wait for specialists. Use their findings only after the completion message arrives. Progress and assistant replies appear in the original OMP task card. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
+    event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background. Continue only independent work; if none remains, end your turn with a brief status, without claiming the task is finished. Completion steers an active turn at the next safe tool boundary or wakes an idle turn. Never use shell sleep or polling to wait for specialists. Use their findings only after the completion message arrives. Progress and assistant replies remain in the fixed OMP task card until the next user input. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
   });
 
   pi.registerTool({
     name: "omp_delegate", label: "OMP delegate",
+    renderShell: "self",
     description: "Start background specialist work and receive an automatic completion message. Any number of independent tasks run concurrently. Specialists: explorer, librarian, oracle, designer, fixer. Do not send secret credentials in tasks.",
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Specialist for a single task" })),
@@ -361,10 +451,11 @@ export default function omp(pi: ExtensionAPI) {
     }),
     renderCall(args, theme, context) {
       const tasks = args.tasks ?? [{ agent: args.agent ?? "explorer", task: args.task ?? "" }];
-      return renderOmpToolCall("OMP delegate", tasks as Assignment[], theme, context?.state ?? {}, context?.invalidate);
+      return renderChatCall("OMP delegate", tasks as Assignment[], theme, context);
     },
     renderResult(result, options, theme, context) { return visibleResult(result as AgentToolResult<OmpDetails>, options, theme, context); },
     async execute(_id, params, signal, onUpdate, ctx) {
+      bindContext(ctx);
       if (role === "pi") throw new Error("OMP delegation is disabled while the default agent is pi");
       const single = params.agent !== undefined || params.task !== undefined;
       const list = params.tasks !== undefined;
@@ -374,31 +465,35 @@ export default function omp(pi: ExtensionAPI) {
         throw new Error("Only explorer/librarian/oracle/designer/fixer are supported; task must be 1-12000 characters");
       }
       const assignments = items as Assignment[];
+      beginCall(_id, assignments);
       await reconcileModels(ctx);
       // Reject stale overrides before paying for translation or starting other children.
       for (const assignment of assignments) resolveModel(ctx, assignment.agent);
       onUpdate?.({ content: [{ type: "text", text: "OMP: preparing user-language prompts" }], details: { progress: queuedProgress(assignments) } });
       const prepared = await prepareAssignments(ctx, assignments, signal);
-      return startJob(ctx, prepared, "delegate");
+      return startJob(ctx, prepared, "delegate", _id);
     },
   });
 
   pi.registerTool({
     name: "omp_council", label: "OMP council",
+    renderShell: "self",
     description: "Consult three independent review sessions (failure modes, architecture, minimal alternative). Costs three model runs; synthesize the actual opinions and disclose disagreements. All reviewers inherit the current main session's model and thinking level.",
     parameters: Type.Object({ question: Type.String({ description: "A consequential technical decision to review" }) }),
     renderCall(args, theme, context) {
-      return renderOmpToolCall("OMP council", councilAssignments(args.question), theme, context?.state ?? {}, context?.invalidate);
+      return renderChatCall("OMP council", councilAssignments(args.question), theme, context);
     },
     renderResult(result, options, theme, context) { return visibleResult(result as AgentToolResult<OmpDetails>, options, theme, context); },
     async execute(_id, { question }, signal, onUpdate, ctx) {
+      bindContext(ctx);
       if (role === "pi") throw new Error("OMP delegation is disabled while the default agent is pi");
       if (!question.trim() || question.length > 12_000) throw new Error("question must be 1-12000 characters");
       const model = resolveModel(ctx, "council");
       const assignments = councilAssignments(question);
+      beginCall(_id, assignments);
       onUpdate?.({ content: [{ type: "text", text: "Council: preparing user-language prompts" }], details: { progress: queuedProgress(assignments) } });
       const prepared = await prepareAssignments(ctx, assignments, signal);
-      return startJob(ctx, prepared, "council", model);
+      return startJob(ctx, prepared, "council", _id, model);
     },
   });
 }

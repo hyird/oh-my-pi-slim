@@ -16,11 +16,11 @@ These are **read-only inspiration**, not runtime dependencies or promises of API
 
 ## [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents)
 
-- Its async completion notifier uses `pi.sendMessage` with `triggerTurn` and Pi's default steering delivery. OMP explicitly uses `deliverAs: "steer"` so a busy main agent receives completed work at the next safe boundary instead of waiting until its turn settles. OMP retains its own inline task card and does not import the package.
+- Its async completion notifier uses `pi.sendMessage` with `triggerTurn` and Pi's default steering delivery. OMP explicitly uses `deliverAs: "steer"` so a busy main agent receives completed work at the next safe boundary instead of waiting until its turn settles. OMP retains its own fixed task card and does not import the package.
 
 ## [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents) (0.19.0 reference)
 
-- `src/index.ts`, `src/ui/agent-widget.ts`, `src/ui/fleet-list.ts`, `README.md`: native subagent tools, background sessions, live widget, and session-backed conversation browsing. OMP borrows only presentation ideas: it has **inline tool progress, no OMP widget**, and individual task rows that expand to show task text and assistant replies. It neither imports this package nor provides its FleetView or persistent/resumable sessions.
+- `src/index.ts`, `src/ui/agent-widget.ts`, `src/ui/fleet-list.ts`, `README.md`: native subagent tools, background sessions, live widget, and session-backed conversation browsing. OMP uses its own fixed task card with rows that expand to show task text and assistant replies. It neither imports this package nor provides its FleetView or persistent/resumable sessions.
 - `docs/rpc.md` documents an in-process RPC path that requires that package to be installed and active. OMP does **not** use it or install it. Model selection and result delivery on that path would require explicit design and testing before any future integration.
 
 ## MCP DEFAULTS mapping (pi-mcp-adapter 2.37.0)
@@ -33,7 +33,7 @@ For main roles OMP filters active adapter tools at startup, role switches, and e
 
 ## What OMP actually does
 
-`/omp` opens settings only. The main model may call `omp_delegate` for one task or any non-empty task array, or `omp_council` for three perspectives. Independent child subprocesses run concurrently across calls without a fixed count limit. Running progress and assistant replies appear in the fixed task card, and completion is automatically delivered to the main agent. There is no separate status/result tool. Neither dispatch tool is automatically invoked by a keyword rule. Council perspectives inherit the main session's model and thinking level; they are separate runs, not different-model agreement. The main session remains responsible for verification and synthesis. Children have role tool allowlists, inherit project trust, and are not OS-sandboxed.
+`/omp` opens settings only. The main model may call `omp_delegate` for one task or any non-empty task array, or `omp_council` for three perspectives. Independent child subprocesses run concurrently across calls without a fixed count limit. Progress and assistant replies appear only in the fixed task card from dispatch until the next user message after completion; then the card returns to the conversation. Completion is automatically delivered to the main agent. There is no separate status/result tool. Neither dispatch tool is automatically invoked by a keyword rule. Council perspectives inherit the main session's model and thinking level; they are separate runs, not different-model agreement. The main session remains responsible for verification and synthesis. Children have role tool allowlists, inherit project trust, and are not OS-sandboxed.
 
 Inline cards show task names and status. Clicking one task row expands its task text and assistant replies from JSON event logs in `getAgentDir()/omp/conversations`; tool activity and thinking are not displayed. Model-facing replies are truncated independently of the recording. Older logs remain on disk and may hold sensitive data until manually removed. Do not treat them as Pi-native persisted sessions. OMP does not capture hidden provider thinking that was never emitted.
 
