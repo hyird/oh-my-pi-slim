@@ -110,6 +110,8 @@ export default function omp(pi: ExtensionAPI) {
     }
     ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (tui, theme) => {
       const list = new Container();
+      const cardStarts = new Map<OmpRenderState, number>();
+      let rowOffset = 0;
       const states = [...pending.map((call) => call.state), ...pinned.map((job) => job.pinnedState)];
       const toggle = (state: OmpRenderState, taskIndex: number) => {
         const wasExpanded = state.expanded?.has(taskIndex) ?? false;
@@ -119,33 +121,40 @@ export default function omp(pi: ExtensionAPI) {
         refreshPinned();
       };
       for (const [index, call] of pending.entries()) {
-        if (index) list.addChild(new Spacer(1));
+        if (index) { list.addChild(new Spacer(1)); rowOffset++; }
+        cardStarts.set(call.state, rowOffset);
         const card = new Box(1, 1, (text) => theme.bg("toolPendingBg", text));
         card.addChild(renderPinnedOmpCall(call.tasks, theme, call.state, refreshPinned, (taskIndex) => toggle(call.state, taskIndex)));
         list.addChild(card);
+        rowOffset += call.tasks.length + 3;
       }
       for (const [index, job] of pinned.entries()) {
-        if (index || pending.length) list.addChild(new Spacer(1));
+        if (index || pending.length) { list.addChild(new Spacer(1)); rowOffset++; }
+        cardStarts.set(job.pinnedState, rowOffset);
         const card = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
         card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned, job.state === "running", (taskIndex) => toggle(job.pinnedState, taskIndex)));
         list.addChild(card);
+        rowOffset += Math.max(job.progress.length, job.results?.length ?? 0) + 3;
       }
       let detail: Box | undefined;
+      let insertAfterRow: number | undefined;
       for (const call of pending) {
         const index = call.state.expanded?.values().next().value;
         if (index === undefined || !call.tasks[index]) continue;
-        detail = new Box(1, 1, (text) => theme.bg("toolPendingBg", text));
+        detail = new Box(1, 0, (text) => theme.bg("toolPendingBg", text));
         detail.addChild(renderPinnedOmpDetail(call.tasks[index].task, undefined, undefined, theme));
+        insertAfterRow = cardStarts.get(call.state)! + 3 + index;
         break;
       }
       if (!detail) for (const job of pinned) {
         const index = job.pinnedState.expanded?.values().next().value;
         if (index === undefined || !job.progress[index]) continue;
-        detail = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
+        detail = new Box(1, 0, (text) => theme.bg("toolSuccessBg", text));
         detail.addChild(renderPinnedOmpDetail(job.progress[index].task, job.progress[index], job.results?.[index], theme));
+        insertAfterRow = cardStarts.get(job.pinnedState)! + 3 + index;
         break;
       }
-      return scrollablePinnedCard(list, detail, tui.terminal?.rows ?? 24, runtime.scroll,
+      return scrollablePinnedCard(list, detail, insertAfterRow, tui.terminal?.rows ?? 24, runtime.scroll,
         () => tui.requestRender(), (text) => theme.fg("muted", text));
     } : undefined, { placement: "aboveEditor" });
   };

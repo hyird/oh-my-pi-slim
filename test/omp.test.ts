@@ -756,10 +756,15 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   expect(card.render(100).join("\n")).toContain("Explorer task 1");
   card.handleMouse?.(mouse("click", 2));
   card = pinned(tui, theme);
-  expect(card.render(100)).toHaveLength(13);
-  expect(card.render(100).join("\n")).toContain("detail line 1");
-  expect(card.render(100).join("\n")).toContain("Explorer task 1");
-  expect(card.render(100).join("\n")).toContain("Fixer task 2");
+  const expandedLines = card.render(100);
+  expect(expandedLines).toHaveLength(13);
+  expect(expandedLines.join("\n")).toContain("detail line 1");
+  expect(expandedLines.join("\n")).toContain("Explorer task 1");
+  expect(expandedLines.join("\n")).toContain("Fixer task 2");
+  expect(expandedLines.findIndex((line: string) => line.includes("Explorer task 1")))
+    .toBeLessThan(expandedLines.findIndex((line: string) => line.includes("detail line 1")));
+  expect(expandedLines.findIndex((line: string) => line.includes("detail line 1")))
+    .toBeLessThan(expandedLines.findIndex((line: string) => line.includes("Fixer task 2")));
   card.handleMouse?.(mouse("wheel", 5, 100));
   card = pinned(tui, theme);
   const scrolled = card.render(100);

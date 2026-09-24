@@ -2,10 +2,11 @@ import { truncateToWidth, type Component, type TuiMouseEvent, type TuiMouseEvent
 
 export interface PinnedScrollState { listTop: number; detailTop: number; focusedListRow?: number }
 
-/** Bound the fixed widget while keeping task rows above the scrolling detail. */
+/** Bound the fixed widget while inserting a scrollable detail below its task row. */
 export function scrollablePinnedCard(
   list: Component,
   detail: Component | undefined,
+  insertAfterRow: number | undefined,
   terminalRows: number,
   state: PinnedScrollState,
   requestRender: () => void,
@@ -17,6 +18,8 @@ export function scrollablePinnedCard(
   let listContentRows = 0;
   let detailContentRows = 0;
   let listScreenRows = 0;
+  let detailScreenRows = 0;
+  let detailStart = 0;
   let viewportWidth = 0;
   const clamp = (top: number, height: number, contentRows: number) =>
     Math.max(0, Math.min(top, height - contentRows));
@@ -60,19 +63,28 @@ export function scrollablePinnedCard(
       const visibleDetail = region(detailLines, maxRows - listScreenRows, state.detailTop, width);
       state.detailTop = visibleDetail.top;
       detailContentRows = visibleDetail.contentRows;
-      return [...visibleList.lines, ...visibleDetail.lines];
+      detailScreenRows = visibleDetail.lines.length;
+      detailStart = detail ? Math.max(0, Math.min(listContentRows, (insertAfterRow ?? listHeight) - state.listTop)) : listScreenRows;
+      return [
+        ...visibleList.lines.slice(0, detailStart),
+        ...visibleDetail.lines,
+        ...visibleList.lines.slice(detailStart),
+      ];
     },
     invalidate() { list.invalidate(); detail?.invalidate(); },
     handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-      const inList = event.y < listScreenRows;
+      const inDetail = !!detail && event.y >= detailStart && event.y < detailStart + detailScreenRows;
+      const inList = !inDetail;
       const regionTop = inList ? state.listTop : state.detailTop;
       const regionHeight = inList ? listHeight : detailHeight;
       const regionContentRows = inList ? listContentRows : detailContentRows;
       const target = inList ? list : detail;
-      const localY = inList ? event.y : event.y - listScreenRows;
+      const localY = inList
+        ? event.y - (event.y >= detailStart + detailScreenRows ? detailScreenRows : 0)
+        : event.y - detailStart;
       if (event.type === "wheel") {
         // When all task rows fit, wheel motion anywhere scrolls the detail.
-        const scrollDetail = !!detail && (!inList || listHeight <= listScreenRows);
+        const scrollDetail = !!detail && (inDetail || listHeight <= listScreenRows);
         const key = scrollDetail ? "detailTop" : "listTop";
         const height = scrollDetail ? detailHeight : listHeight;
         const contentRows = scrollDetail ? detailContentRows : listContentRows;
