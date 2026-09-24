@@ -5,7 +5,7 @@ import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } fro
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
 import { formatResults, queuedProgress, resolveModel, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result } from "./subagents.ts";
-import { renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
+import { OMP_SPINNER_FRAMES, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
@@ -27,6 +27,8 @@ type BackgroundJob = {
   results?: Result[];
   controller: AbortController;
   invalidators: Map<string, () => void>;
+  animationFrame: number;
+  animationTimer?: ReturnType<typeof setInterval>;
 };
 
 export default function omp(pi: ExtensionAPI) {
@@ -72,14 +74,21 @@ export default function omp(pi: ExtensionAPI) {
       try { invalidate(); } catch { /* A closed tool card must not affect the job. */ }
     }
   };
+  const stopAnimation = (job: BackgroundJob) => {
+    if (job.animationTimer) clearInterval(job.animationTimer);
+    job.animationTimer = undefined;
+  };
   const cancelRunning = () => {
-    for (const job of jobs.values()) if (job.state === "running") job.controller.abort();
+    for (const job of jobs.values()) if (job.state === "running") {
+      job.controller.abort();
+      stopAnimation(job);
+    }
   };
   const visibleResult = (result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Parameters<typeof renderOmpToolResult>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string }) => {
     const job = result.details?.jobId ? jobs.get(result.details.jobId) : undefined;
     if (job && context?.toolCallId) job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
     return renderOmpToolResult(
-      job ? { ...result, details: { ...result.details, progress: job.progress, results: job.results } } : result,
+      job ? { ...result, details: { ...result.details, progress: job.progress, results: job.results, animationFrame: job.animationFrame } } : result,
       job ? { ...options, isPartial: job.state === "running" } : options,
       theme, context?.state ?? {}, context?.invalidate,
     );
@@ -95,9 +104,14 @@ export default function omp(pi: ExtensionAPI) {
     const controller = new AbortController();
     const job: BackgroundJob = {
       id, kind, session, state: "running", progress: queuedProgress(prepared.items),
-      controller, invalidators: new Map(),
+      controller, invalidators: new Map(), animationFrame: 0,
     };
     jobs.set(id, job);
+    job.animationTimer = setInterval(() => {
+      job.animationFrame = (job.animationFrame + 1) % OMP_SPINNER_FRAMES.length;
+      repaint(job);
+    }, 80);
+    job.animationTimer.unref?.();
     const deliver = (content: string) => {
       if (job.session !== session) return;
       try {
@@ -109,6 +123,7 @@ export default function omp(pi: ExtensionAPI) {
       job.progress = progress;
       repaint(job);
     }, modelOverride, id).then((results) => {
+      stopAnimation(job);
       job.results = results;
       job.state = controller.signal.aborted ? "cancelled" : results.some((result) => !result.ok) ? "failed" : "done";
       repaint(job);
@@ -120,13 +135,14 @@ export default function omp(pi: ExtensionAPI) {
         : "Verify and integrate these specialist results before finalizing.\n\n";
       deliver(`OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
     }).catch(() => {
+      stopAnimation(job);
       job.state = controller.signal.aborted ? "cancelled" : "failed";
       repaint(job);
       deliver(`OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
     });
     return {
       content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work. If nothing independent remains, end this turn with a brief status; completion will wake you. Never use shell sleep or polling to wait.` }],
-      details: { jobId: id, progress: job.progress }, usage: prepared.usage,
+      details: { jobId: id, progress: job.progress, animationFrame: job.animationFrame }, usage: prepared.usage,
     };
   };
 

@@ -469,7 +469,7 @@ test("OMP cards show only safe progress until final outputs, regardless of expan
   const compact = render(false, true);
   expect(compact).toContain("running · 0/2");
   expect(compact).toContain("○ queued · Explorer task 1");
-  expect(compact).toContain("◷ running · Fixer task 2");
+  expect(compact).toContain("⠋ running · Fixer task 2");
   expect(compact).not.toMatch(/SECRET_|private-command|assistant message|Ctrl\+Alt\+O/);
   const expanded = render(true, true);
   expect(expanded).not.toContain("Ctrl+Alt+O");
@@ -644,6 +644,40 @@ test("background delegation returns immediately, updates its card and delivers c
     expect(card.render(100).join("\n")).toContain("done");
     expect(invalidations).toBeGreaterThan(0);
   } finally {
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
+test("running OMP rows animate like Pi Working and stop after completion", async () => {
+  initTheme();
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "300";
+  const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  try {
+    const tool = h.tools.omp_delegate;
+    const context = { state: {} as Record<string, unknown>, toolCallId: "animated-call", invalidate: () => {} };
+    const card = tool.renderCall({ agent: "explorer", task: "inspect" }, theme, context);
+    const result = await tool.execute("animated-call", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    const first = card.render(80).join("\n");
+    expect(first).toContain("running · Explorer task");
+    await Bun.sleep(100);
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    const second = card.render(80).join("\n");
+    expect(second).toContain("running · Explorer task");
+    expect(second).not.toBe(first);
+    await waitFor(() => h.sentMessages.length === 1);
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    const finished = card.render(80).join("\n");
+    expect(finished).toContain("done · Explorer task");
+    await Bun.sleep(100);
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    expect(card.render(80).join("\n")).toBe(finished);
+  } finally {
+    h.handlers.session_shutdown?.({}, h.ctx);
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_WAIT_MS;
   }

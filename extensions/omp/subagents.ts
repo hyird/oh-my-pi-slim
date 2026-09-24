@@ -22,7 +22,7 @@ export interface AgentProgress {
   text: string;
   activities: string[];
 }
-export interface OmpDetails { progress: AgentProgress[]; results?: Result[]; jobId?: string }
+export interface OmpDetails { progress: AgentProgress[]; results?: Result[]; jobId?: string; animationFrame?: number }
 const MAX_OUTPUT = 20_000;
 const MAX_CONCURRENT_CHILDREN = 3;
 let activeChildren = 0;

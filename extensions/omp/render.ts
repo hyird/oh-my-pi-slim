@@ -6,6 +6,8 @@ import { safeText, transcriptBlocks } from "./viewer.ts";
 
 const OUTPUT_LIMIT = 12_000;
 const OUTPUT_LINES = 180;
+// Match Pi's Working loader cadence and glyphs.
+export const OMP_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
 // Progress is presentation data, not a terminal escape stream. Never render raw tool
 // result content: it can contain arbitrarily long output, arguments, or credentials.
@@ -24,9 +26,9 @@ function boundedOutput(value: string): string {
   return lines.length > OUTPUT_LINES ? `${shown}\n… (output truncated)` : shown;
 }
 
-function stateInfo(state: AgentProgress["state"]): { icon: string; name: string; color: "muted" | "warning" | "success" | "error" } {
+function stateInfo(state: AgentProgress["state"], frame = 0): { icon: string; name: string; color: "muted" | "warning" | "success" | "error" } {
   switch (state) {
-    case "running": return { icon: "◷", name: "running", color: "warning" };
+    case "running": return { icon: OMP_SPINNER_FRAMES[frame % OMP_SPINNER_FRAMES.length], name: "running", color: "warning" };
     case "done": return { icon: "✓", name: "done", color: "success" };
     case "failed": return { icon: "✗", name: "failed", color: "error" };
     case "cancelled": return { icon: "■", name: "cancelled", color: "warning" };
@@ -150,6 +152,7 @@ export function renderOmpResult(
   const details = result.details;
   const progress = Array.isArray(details?.progress) ? details.progress : [];
   const results = Array.isArray(details?.results) ? details.results : [];
+  const frame = details?.animationFrame ?? 0;
   // Results and progress are indexed by assignment, not role: council and
   // parallel delegate calls may contain several instances of the same role.
   const count = Math.max(progress.length, results.length);
@@ -160,14 +163,14 @@ export function renderOmpResult(
   const headerColor = cancelled ? "warning" : failed || (!options.isPartial && results.some((item) => !item.ok)) ? "error" : queued ? "muted" : options.isPartial ? "warning" : "success";
   const finished = progress.length ? complete + failed + cancelled : results.length;
   const status = options.isPartial ? queued ? "queued" : "running" : cancelled ? "cancelled" : headerColor === "error" ? "failed" : "done";
-  view.addChild(new TruncatedText(theme.fg(headerColor, options.isPartial ? queued ? "○ " : "◷ " : cancelled ? "■ " : headerColor === "error" ? "✗ " : "✓ ") + theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · ${status} · ${finished}/${count}`)));
+  view.addChild(new TruncatedText(theme.fg(headerColor, options.isPartial ? queued ? "○ " : `${OMP_SPINNER_FRAMES[frame % OMP_SPINNER_FRAMES.length]} ` : cancelled ? "■ " : headerColor === "error" ? "✗ " : "✓ ") + theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · ${status} · ${finished}/${count}`)));
   if (!count) return view;
 
   for (let index = 0; index < count; index++) {
     const item = progress[index];
     const final = results[index];
     const state = !options.isPartial && final ? final.ok ? "done" : final.cancelled ? "cancelled" : "failed" : item?.state ?? "queued";
-    const { icon, name, color } = stateInfo(state);
+    const { icon, name, color } = stateInfo(state, frame);
     const agent = item?.agent ?? final?.agent ?? "agent";
     const expanded = interaction?.state.expanded?.has(index) ?? false;
     view.addChild(taskRow(
