@@ -5,7 +5,7 @@ import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { configPath, parseConfig, parseModel, readConfig, updateConfig } from "../extensions/omp/config.ts";
-import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Result } from "../extensions/omp/subagents.ts";
+import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Assignment, type Result } from "../extensions/omp/subagents.ts";
 import { getChoices, getSettingsRows, INHERIT, INHERIT_THINKING } from "../extensions/omp/settings-ui.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { renderOmpCall, renderOmpResult, renderOmpToolCall, renderPinnedOmpCard } from "../extensions/omp/render.ts";
@@ -642,20 +642,30 @@ test("delegation keeps its completed card fixed until the next user input", asyn
   }
 });
 
-test("dispatch appears in the fixed card before the chat call renders and failed preparation clears it", () => {
+test("dispatch starts in the fixed card at the height required by its tasks", async () => {
   const h = harness();
   let pinned: any;
   h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  await h.handlers.session_start({ reason: "new" }, h.ctx);
   const tool = h.tools.omp_delegate;
   const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
-  const context = { state: {} as any, toolCallId: "pending-call", invalidate: () => {} };
-  const args = { agent: "explorer", task: "inspect" };
-  h.handlers.tool_execution_start({ toolCallId: "pending-call", toolName: "omp_delegate", args }, h.ctx);
-  expect(widgetText(pinned)).toContain("queued · Explorer task");
+  const context = { state: {} as any, toolCallId: "pending-call", invalidate: () => {}, isPartial: true };
+  const args: { tasks: Assignment[] } = { tasks: [
+    { agent: "explorer", task: "inspect" }, { agent: "fixer", task: "edit" }, { agent: "oracle", task: "review" },
+  ] };
   expect(tool.renderCall(args, theme, context).render(80)).toEqual([]);
+  expect(pinned).toBeUndefined();
+  h.handlers.tool_execution_start({ toolCallId: "pending-call", toolName: "omp_delegate", args }, h.ctx);
+  const initial = widgetText(pinned);
+  expect(initial.split("\n")).toHaveLength(6); // box padding + header + three rows
+  expect(initial).toContain("queued · Explorer task 1");
+  expect(initial).toContain("queued · Fixer task 2");
+  expect(initial).toContain("queued · Oracle task 3");
+  expect(tool.renderCall(args, theme, context).render(80)).toEqual([]);
+  expect(tool.renderResult({ content: [], details: { progress: queuedProgress(args.tasks) } }, { expanded: false, isPartial: true }, theme, context).render(80)).toEqual([]);
   h.handlers.tool_execution_end({ toolCallId: "pending-call", toolName: "omp_delegate", isError: true, result: { content: [] } }, h.ctx);
   expect(pinned).toBeUndefined();
-  expect(tool.renderCall(args, theme, context).render(80).join("\n")).toContain("Explorer task");
+  expect(tool.renderCall(args, theme, { ...context, isPartial: false, isError: true }).render(80).join("\n")).toContain("Explorer task");
 });
 
 test("background delegation returns immediately, updates its card and delivers completion", async () => {
@@ -668,6 +678,7 @@ test("background delegation returns immediately, updates its card and delivers c
   let pinned: any;
   h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
   try {
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
     const tool = h.tools.omp_delegate;
     const state: Record<string, unknown> = {};
     let invalidations = 0;
@@ -712,9 +723,10 @@ test("background delegation returns immediately, updates its card and delivers c
     h.handlers.input({ source: "extension", text: "automatic completion" }, h.ctx);
     expect(widgetText(pinned)).toContain("done · Explorer task");
     h.handlers.input({ source: "interactive", text: "next message" }, h.ctx);
+    const releasedCall = tool.renderCall({ agent: "explorer", task: "inspect" }, theme, { ...context, isPartial: false });
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
-    expect(card.render(100).join("\n")).toContain("done");
-    expect(card.render(100).join("\n")).toContain("inspect");
+    expect(releasedCall.render(100).join("\n")).toContain("done");
+    expect(releasedCall.render(100).join("\n")).toContain("inspect");
     expect(pinned).toBeUndefined();
     expect(invalidations).toBeGreaterThan(0);
   } finally {

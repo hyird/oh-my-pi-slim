@@ -36,7 +36,7 @@ type BackgroundJob = {
   animationTimer?: ReturnType<typeof setInterval>;
 };
 
-type PendingCall = { tasks: Assignment[]; state: OmpRenderState; invalidate: () => void };
+type PendingCall = { tasks: Assignment[]; state: OmpRenderState };
 
 type OmpRuntime = {
   session: number;
@@ -60,7 +60,6 @@ export default function omp(pi: ExtensionAPI) {
   };
   const jobs = runtime.jobs;
   const calls = runtime.calls;
-  const callStates = new Map<string, { state: OmpRenderState; invalidate: () => void }>();
   const reconcileTools = installMcpPolicy(pi, () => role);
 
   const reconcileModels = async (ctx: ExtensionContext) => {
@@ -126,25 +125,21 @@ export default function omp(pi: ExtensionAPI) {
   const pinnedJob = (callId: string) => [...jobs.values()].find((job) => job.callId === callId && !job.released);
   const beginCall = (callId: string, tasks: Assignment[]) => {
     if (runtime.ctx?.mode !== "tui" || !callId || calls.has(callId) || pinnedJob(callId)) return;
-    const existing = callStates.get(callId);
-    const call: PendingCall = { tasks, state: existing?.state ?? {}, invalidate: existing?.invalidate ?? (() => {}) };
-    calls.set(callId, call);
-    call.state.card?.clear();
-    call.invalidate();
+    calls.set(callId, { tasks, state: {} });
     refreshPinned();
   };
   const renderChatCall = (label: string, tasks: Assignment[], theme: Parameters<typeof renderOmpToolCall>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string; isPartial?: boolean; isError?: boolean }) => {
     if (context?.toolCallId) {
-      callStates.set(context.toolCallId, { state: context.state, invalidate: context.invalidate });
       const pending = calls.get(context.toolCallId);
-      if (pending && pending.state !== context.state) {
-        pending.state = context.state;
-        pending.invalidate = context.invalidate;
-        refreshPinned();
-      }
-      if (pending || pinnedJob(context.toolCallId)) {
+      // Pi renders a call before tool_execution_start. Keep that first frame
+      // empty; the start event creates the fixed card from the complete task list.
+      if (runtime.ctx?.mode === "tui" && (context.isPartial !== false || pending || pinnedJob(context.toolCallId))) {
         context.state.card?.clear();
         return new Container();
+      }
+      const released = [...jobs.values()].find((job) => job.callId === context.toolCallId && job.released);
+      if (released && context.state.expanded === undefined && released.pinnedState.expanded) {
+        context.state.expanded = new Set(released.pinnedState.expanded);
       }
     }
     const shell = new Box(1, 1, (text) => theme.bg?.(context?.isPartial === false
@@ -201,11 +196,8 @@ export default function omp(pi: ExtensionAPI) {
       job.callId = context.toolCallId;
       job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
     }
-    if (job && context?.state.card && job.pinnedState !== context.state) {
-      job.pinnedState = context.state;
-      refreshPinned();
-    }
-    const moved = runtime.ctx?.mode === "tui" && !!context?.state.card && (!!(job && !job.released) || !!(context?.toolCallId && calls.has(context.toolCallId)));
+    const moved = runtime.ctx?.mode === "tui" && !!context &&
+      (options.isPartial || !!(job && !job.released) || !!(context?.toolCallId && calls.has(context.toolCallId)));
     return renderOmpToolResult(
       job ? { ...result, details: { ...result.details, progress: job.progress, results: job.results, animationFrame: job.animationFrame } } : result,
       job ? { ...options, isPartial: job.state === "running" } : options,
@@ -335,10 +327,8 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", (event) => {
-    const call = calls.get(event.toolCallId);
-    if (!call) return;
+    if (!calls.has(event.toolCallId)) return;
     calls.delete(event.toolCallId);
-    call.invalidate();
     refreshPinned();
   });
 
@@ -348,7 +338,6 @@ export default function omp(pi: ExtensionAPI) {
       if (job.session !== runtime.session || job.state === "running" || job.released) continue;
       job.released = true;
       repaint(job);
-      callStates.delete(job.callId);
     }
   });
 
@@ -356,7 +345,6 @@ export default function omp(pi: ExtensionAPI) {
     cancelRunning();
     jobs.clear();
     calls.clear();
-    callStates.clear();
     runtime.pending.length = 0;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
@@ -384,7 +372,6 @@ export default function omp(pi: ExtensionAPI) {
     cancelRunning();
     jobs.clear();
     calls.clear();
-    callStates.clear();
     runtime.pending.length = 0;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;

@@ -40,7 +40,7 @@ With pi-mcp-adapter, Orchestrator can use verified non-context7 namespace proxie
 
 Running OMP task rows use the same spinner frames and cadence as Pi's Working indicator. The animation stops when the batch completes or is cancelled.
 
-From the start of delegation, the interactive task card appears only above Pi's editor, with Pi's normal tool-card background and padding. Click its task rows to read tasks and assistant replies. After completion, it stays fixed until the next user message; then it returns to the conversation. Automatic specialist completion messages do not move it.
+From the start of delegation, the interactive task card appears only above Pi's editor, with Pi's normal tool-card background and padding. Its initial height follows the number of dispatched tasks; it is never first drawn in the conversation. Click its task rows to read tasks and assistant replies. After completion, it stays fixed until the next user message; then it returns to the conversation. Automatic specialist completion messages do not move it.
 
 Pi's `/reload`, switching sessions, and quitting Pi cancel active OMP children. Start any interrupted task again after reload; child processes are not resumed.
 
