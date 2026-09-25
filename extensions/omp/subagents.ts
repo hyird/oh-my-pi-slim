@@ -21,6 +21,8 @@ export interface AgentProgress {
   activity: string;
   text: string;
   activities: string[];
+  /** Confirmed output token throughput across assistant messages; tool time is excluded. */
+  tokensPerSecond?: number;
 }
 export interface OmpDetails { progress: AgentProgress[]; results?: Result[]; jobId?: string; animationFrame?: number }
 const MAX_OUTPUT = 20_000;
@@ -148,6 +150,14 @@ export async function runAgent(
       let exited = false;
       const usage = emptyUsage();
       let streamingText = "";
+      let messageStartedAt: number | undefined;
+      let completedOutputTokens = 0;
+      let completedGenerationMs = 0;
+      const updateThroughput = (partialOutput = 0, partialMs = 0) => {
+        const output = completedOutputTokens + partialOutput;
+        const duration = completedGenerationMs + partialMs;
+        progress.tokensPerSecond = output > 0 && duration > 0 ? output * 1000 / duration : undefined;
+      };
       const proc = spawn(child.command, child.args, {
         cwd, shell: false, stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, PI_OMP_CHILD: "1", ...(mcpPath ? { PI_MCP_CONFIG_MODE: "exclusive" } : {}), MCP_DIRECT_TOOLS: undefined },
@@ -168,8 +178,18 @@ export async function runAgent(
           return;
         }
         try {
+          if (event.type === "message_start" && event.message?.role === "assistant") {
+            messageStartedAt = performance.now();
+            return;
+          }
           if (event.type === "message_update") {
             const update = event.assistantMessageEvent;
+            messageStartedAt ??= performance.now();
+            const partialOutput = update?.partial?.usage?.output;
+            if (Number.isFinite(partialOutput) && partialOutput > 0) {
+              updateThroughput(partialOutput, Math.max(1, performance.now() - messageStartedAt));
+              publish();
+            }
             if (update?.type === "text_delta" && typeof update.delta === "string") {
               streamingText = (streamingText + update.delta).slice(-2000);
               progress.text = streamingText;
@@ -207,7 +227,14 @@ export async function runAgent(
           if (u) {
             for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) usage[key] += u[key] ?? 0;
             for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) usage.cost[key] += u.cost?.[key] ?? 0;
+            if (Number.isFinite(u.output) && u.output > 0 && messageStartedAt !== undefined) {
+              completedOutputTokens += u.output;
+              completedGenerationMs += Math.max(1, performance.now() - messageStartedAt);
+              updateThroughput();
+              publish();
+            }
           }
+          messageStartedAt = undefined;
         } catch { /* Ignore non-JSON lines from unexpected provider output. */ }
       };
       proc.stdout?.on("data", (chunk: Buffer) => {

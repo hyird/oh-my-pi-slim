@@ -395,6 +395,7 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
     expect(snapshots.some((snapshot) => snapshot.some((item) => item.text.includes("Inspecting the code")))).toBe(true);
     expect(snapshots.at(-1)?.map((item) => item.state)).toEqual(["done", "done"]);
     expect(snapshots.at(-1)?.map((item) => item.task)).toEqual(["find auth", "find config"]);
+    expect(snapshots.at(-1)?.every((item) => Number.isFinite(item.tokensPerSecond) && item.tokensPerSecond! > 0)).toBe(true);
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_WAIT_MS;
@@ -545,6 +546,18 @@ test("the fixed OMP list marks the selected task without inlining its detail", (
   expect(state.expanded.has(0)).toBe(true);
   expect(card.render(80).join("\n")).toContain("Explorer task ▾");
   expect(card.render(80).join("\n")).not.toContain("inspect private task");
+});
+
+test("OMP task rows show measured output token speed without clipping the task name", () => {
+  initTheme();
+  const theme: any = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const progress: AgentProgress[] = [{
+    agent: "explorer", task: "inspect", state: "running", activity: "", text: "", activities: [], tokensPerSecond: 42.3,
+  }];
+  const card = renderPinnedOmpCard(progress, undefined, 0, theme, {}, () => {});
+  expect(card.render(80).join("\n")).toContain("Explorer task ▸ · 42 token/s");
+  expect(card.render(34).join("\n")).toContain("Explorer task ▸");
+  expect(card.render(34).join("\n")).not.toContain("token/s");
 });
 
 test("OMP rendering tracks theme changes and stays within narrow widths", () => {

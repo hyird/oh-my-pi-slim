@@ -4,6 +4,7 @@ const args = process.argv.slice(2);
 if (process.env.OMP_TEST_CAPTURE) {
   fs.writeFileSync(process.env.OMP_TEST_CAPTURE, JSON.stringify({ args, childGuard: process.env.PI_OMP_CHILD, prompt: fs.readFileSync(args[args.indexOf("--append-system-prompt") + 1], "utf8") }));
 }
+console.log(JSON.stringify({ type: "message_start", message: { role: "assistant" } }));
 console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Inspecting the code" } }));
 console.log(JSON.stringify({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: { path: "src/index.ts" } }));
 console.log(JSON.stringify({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "read", isError: false }));

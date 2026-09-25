@@ -46,15 +46,22 @@ function taskName(agent: string, index: number, count: number): string {
 export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number; inlineRange?: string }
 interface Interaction { state: OmpRenderState; invalidate: () => void; toggle?: (index: number) => void }
 
-function taskRow(line: string, index: number, theme: Theme, interaction?: Interaction): Component {
+function taskRow(line: string, index: number, theme: Theme, interaction?: Interaction, throughput?: number): Component {
   const text = new TruncatedText(line);
-  if (!interaction) return text;
+  const renderText = (width: number) => {
+    let content = line;
+    const range = interaction?.state.expanded?.has(index) ? interaction.state.inlineRange : undefined;
+    if (range && visibleWidth(content) + visibleWidth(range) <= width) content += theme.fg("muted", range);
+    if (throughput !== undefined && Number.isFinite(throughput) && throughput > 0) {
+      const rate = ` · ${throughput < 10 ? throughput.toFixed(1) : Math.round(throughput)} token/s`;
+      if (visibleWidth(content) + visibleWidth(rate) <= width) content += theme.fg("muted", rate);
+    }
+    return content === line ? text.render(width) : new TruncatedText(content).render(width);
+  };
+  if (!interaction) return { render: renderText, invalidate() { text.invalidate(); } };
   const highlighted: Component = {
     render(width) {
-      const range = interaction.state.expanded?.has(index) ? interaction.state.inlineRange : undefined;
-      const rows = range && visibleWidth(line) + visibleWidth(range) <= width
-        ? new TruncatedText(line + theme.fg("muted", range)).render(width)
-        : text.render(width);
+      const rows = renderText(width);
       return interaction.state.hovered === index && theme.bg ? rows.map((row) => theme.bg("selectedBg", row)) : rows;
     },
     invalidate() { text.invalidate(); },
@@ -205,7 +212,7 @@ export function renderOmpResult(
     const expanded = interaction?.state.expanded?.has(index) ?? false;
     view.addChild(taskRow(
       theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") + theme.fg("accent", taskName(agent, index, count)) + (interaction ? theme.fg("muted", expanded ? " ▾" : " ▸") : ""),
-      index, theme, interaction,
+      index, theme, interaction, item?.tokensPerSecond,
     ));
     if (expanded && showDetails) view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme));
     // Only completed, successful final output. Progress text may be an interim
