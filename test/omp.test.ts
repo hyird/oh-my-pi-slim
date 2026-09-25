@@ -135,10 +135,10 @@ describe("/omp settings entry point", () => {
   });
   test("settings show one row per delegated role with model and thinking", () => {
     const rows = getSettingsRows();
-    expect(rows.map((r) => r.id)).toEqual(["default", "role:explorer", "role:librarian", "role:oracle", "role:designer", "role:fixer"]);
+    expect(rows.map((r) => r.id)).toEqual(["default", "role:oracle", "role:librarian", "role:explorer", "role:designer", "role:fixer"]);
     expect(rows[0].label).toBe("Default main agent");
     expect(rows[0].description).toContain("does not change Pi's current model");
-    expect(rows.slice(1).map((row) => row.label)).toEqual(["explorer", "librarian", "oracle", "designer", "fixer"]);
+    expect(rows.slice(1).map((row) => row.label)).toEqual(["oracle", "librarian", "explorer", "designer", "fixer"]);
     expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
     expect(rows[1].description).toContain("Choose the model, then the thinking level");
     expect(getChoices("default", harness().ctx)).toEqual(["pi", "orchestrator", "council"]);
@@ -160,7 +160,7 @@ describe("/omp settings entry point", () => {
     h.ctx.mode = "rpc";
     let calls = 0;
     h.ctx.ui.select = async (_title: string, options: string[]) => {
-      if (++calls === 1) return options[1];
+      if (++calls === 1) return options[3];
       if (calls === 2) return "openai-codex/gpt-5.5"; // forged, now disabled
       if (calls === 3) return "high";
       return undefined;
@@ -186,7 +186,7 @@ describe("/omp settings entry point", () => {
     component.handleInput("\x1b[A"); // pi native (only pi/orchestrator are primary)
     component.handleInput("\r");
     await waitFor(() => readConfig().defaultAgent === "pi");
-    component.handleInput("\x1b[B"); // explorer row
+    for (let i = 0; i < 3; i++) component.handleInput("\x1b[B"); // explorer row
     component.handleInput("\r");
     for (const char of "spark") component.handleInput(char);
     expect(component.render(90).join("\n")).toContain("Search models:");
@@ -240,7 +240,7 @@ describe("/omp settings entry point", () => {
     expect(narrow.join("\n")).toContain("Current: orchestrator");
     expect(narrow.join("\n")).toContain("\x1b[32m");
     expect(narrow.join("\n")).not.toContain("\x1b[31m");
-    component.handleInput("\x1b[B");
+    for (let i = 0; i < 3; i++) component.handleInput("\x1b[B");
     expect(component.render(32).join("\n").replace(/\x1b\[[\d;]*m/g, "").replace(/\s+/g, "")).toContain("openai-codex/gpt-5.3-codex-spark");
     component.handleInput("\r");
     const picker = component.render(24);
@@ -280,7 +280,7 @@ describe("/omp settings entry point", () => {
     let calls = 0;
     h.ctx.ui.select = async (title: string, options: string[]) => {
       titles.push(title);
-      if (++calls === 1) return options[1]; // explorer role
+      if (++calls === 1) return options[3]; // explorer role
       if (calls === 2) return "openai-codex/gpt-5.5";
       if (calls === 3) {
         expect(readConfig().models.explorer).toBeUndefined();

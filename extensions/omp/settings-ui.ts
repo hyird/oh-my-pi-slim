@@ -1,12 +1,13 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, Input, SelectList, SettingsList, truncateToWidth, visibleWidth, type SelectItem, type SettingItem } from "@earendil-works/pi-tui";
 import { readConfig, THINKING_LEVELS } from "./config.ts";
-import { MAIN_AGENT_NAMES, ROLES, ROLE_NAMES } from "./roles.ts";
+import { MAIN_AGENT_NAMES, ROLES } from "./roles.ts";
 import { availableChildModels } from "./models.ts";
 
 const INHERIT = "Inherit";
 const INHERIT_THINKING = "Inherit";
 const SETTING_SEPARATOR = " · ";
+const SETTING_ROLE_ORDER = ["oracle", "librarian", "explorer", "designer", "fixer"] as const;
 
 export const roleSettingValue = (model: string, thinking: string): string => `${model}${SETTING_SEPARATOR}${thinking}`;
 export function parseRoleSettingValue(value: string): { model: string; thinking: string } | undefined {
@@ -25,7 +26,7 @@ export function getSettingsRows(ctx?: ExtensionCommandContext): SettingItem[] {
   const enabled = ctx && new Set(availableChildModels(ctx).map((model) => `${model.provider}/${model.id}`));
   return [
     { id: "default", label: "Default main agent", currentValue: config.defaultAgent, description: "Default role for the main session; does not change Pi's current model." },
-    ...ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => ({
+    ...SETTING_ROLE_ORDER.map((name) => ({
       id: `role:${name}`, label: name,
       currentValue: roleSettingValue(config.models[name] ?? INHERIT, config.thinking[name] ?? INHERIT_THINKING),
       description: `${ROLES[name].description}. Choose the model, then the thinking level.${enabled && config.models[name] && !enabled.has(config.models[name]) ? " Configured model is disabled or unavailable; choose an enabled model or Inherit." : ""}`,
