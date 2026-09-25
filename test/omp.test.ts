@@ -769,7 +769,87 @@ test("background delegation returns immediately, updates its card and delivers c
   }
 });
 
-test("long fixed task details scroll within 65% height and keep task rows clickable", () => {
+test("a new dispatch returns finished batches to chat while keeping batches separate", async () => {
+  initTheme();
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  let pinned: any;
+  let invalidations = 0;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
+  try {
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    const tool = h.tools.omp_delegate;
+    const firstArgs = { agent: "explorer", task: "first batch" };
+    const firstContext = { state: {} as Record<string, unknown>, toolCallId: "first-batch", invalidate: () => { invalidations++; } };
+    h.handlers.tool_execution_start({ toolCallId: "first-batch", toolName: "omp_delegate", args: firstArgs }, h.ctx);
+    const firstResult = await tool.execute("first-batch", firstArgs, undefined, undefined, h.ctx);
+    tool.renderResult(firstResult, { expanded: false, isPartial: false }, theme, firstContext);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(widgetText(pinned)).toContain("done · Explorer task");
+
+    h.handlers.tool_execution_start({ toolCallId: "second-batch", toolName: "omp_delegate", args: { agent: "fixer", task: "second batch" } }, h.ctx);
+    const fixed = widgetText(pinned);
+    expect(fixed).toContain("queued · Fixer task");
+    expect(fixed).not.toContain("Explorer task");
+    expect(fixed.match(/OMP/g)).toHaveLength(1);
+    const releasedCard = tool.renderCall(firstArgs, theme, { ...firstContext, isPartial: false });
+    tool.renderResult(firstResult, { expanded: false, isPartial: false }, theme, firstContext);
+    expect(releasedCard.render(100).join("\n")).toContain("done · Explorer task");
+    expect(invalidations).toBeGreaterThan(0);
+    h.handlers.tool_execution_end({ toolCallId: "second-batch", toolName: "omp_delegate", isError: true, result: { content: [] } }, h.ctx);
+    h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+  } finally {
+    process.argv[1] = originalArgv;
+  }
+});
+
+test("a new dispatch leaves an unfinished earlier batch fixed", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "300";
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  try {
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    const tool = h.tools.omp_delegate;
+    h.handlers.tool_execution_start({ toolCallId: "running-first", toolName: "omp_delegate", args: { agent: "explorer", task: "still working" } }, h.ctx);
+    await tool.execute("running-first", { agent: "explorer", task: "still working" }, undefined, undefined, h.ctx);
+    h.handlers.tool_execution_start({ toolCallId: "queued-second", toolName: "omp_delegate", args: { agent: "fixer", task: "next batch" } }, h.ctx);
+    const fixed = widgetText(pinned);
+    expect(fixed).toContain("running · Explorer task");
+    expect(fixed).toContain("queued · Fixer task");
+    expect((fixed.match(/OMP/g) ?? []).length).toBe(2);
+    h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+  } finally {
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
+test("separate fixed batches scroll together within half the terminal", () => {
+  const h = harness();
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  for (let batch = 1; batch <= 3; batch++) {
+    h.handlers.tool_execution_start({ toolCallId: `batch-${batch}`, toolName: "omp_delegate", args: { tasks:
+      Array.from({ length: 3 }, (_, index) => ({ agent: batch === 3 ? "oracle" : "explorer", task: `batch ${batch} task ${index + 1}` })),
+    } }, h.ctx);
+  }
+  const theme: any = { fg: (_color: string, value: string) => value, bg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const card = pinned({ terminal: { rows: 20 }, requestRender: () => {} }, theme);
+  expect(card.render(100)).toHaveLength(10);
+  expect(card.render(100).join("\n")).toContain("Explorer task 1");
+  card.handleMouse?.({ type: "wheel", button: "left", x: 10, y: 3, screenX: 10, screenY: 3,
+    width: 100, height: 10, shift: false, alt: false, ctrl: false, wheelDelta: 100 } as any);
+  const scrolled = card.render(100);
+  expect(scrolled).toHaveLength(10);
+  expect(scrolled.join("\n")).toContain("Oracle task 3");
+});
+
+test("long fixed task details scroll within half the terminal and keep task rows clickable", () => {
   initTheme();
   const h = harness();
   let pinned: any;
@@ -789,7 +869,7 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   card.handleMouse?.(mouse("click", 2));
   card = pinned(tui, theme);
   const expandedLines = card.render(100);
-  expect(expandedLines).toHaveLength(13);
+  expect(expandedLines).toHaveLength(10);
   expect(expandedLines.join("\n")).toContain("detail line 1");
   expect(expandedLines.join("\n")).toContain("Explorer task 1");
   expect(stripTerminalSequences(expandedLines.find((line: string) => line.includes("Explorer task 1")) ?? ""))
@@ -806,7 +886,7 @@ test("long fixed task details scroll within 65% height and keep task rows clicka
   card.handleMouse?.(mouse("wheel", 5, 100));
   card = pinned(tui, theme);
   const scrolled = card.render(100);
-  expect(scrolled).toHaveLength(13);
+  expect(scrolled).toHaveLength(10);
   expect(scrolled.join("\n")).toContain("Explorer task 1");
   expect(scrolled.join("\n")).toContain("Fixer task 2");
   const secondRow = scrolled.findIndex((line: string) => line.includes("Fixer task 2"));
@@ -843,12 +923,12 @@ test("five fixed tasks keep their order around the expanded second task", () => 
   card.handleMouse?.(mouse("click", 3));
   card = pinned(tui, theme);
   const expanded = card.render(100);
-  expect(expanded).toHaveLength(13);
+  expect(expanded).toHaveLength(10);
   const positions = rowPositions(expanded);
   expect(positions[0]).toBeLessThan(positions[1]);
   expect(positions[1]).toBeLessThan(expanded.findIndex((line: string) => line.includes("detail line 1")));
   expect(expanded.findIndex((line: string) => line.includes("detail line 1"))).toBeLessThan(positions[2]);
-  expect(positions.slice(2)).toEqual([10, 11, 12].map(y => y - 1));
+  expect(positions.slice(2)).toEqual([6, 7, 8]);
   card.handleMouse?.(mouse("wheel", 6, 100));
   card = pinned(tui, theme);
   const scrolled = card.render(100);

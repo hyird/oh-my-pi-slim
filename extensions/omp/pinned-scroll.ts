@@ -13,7 +13,7 @@ export function scrollablePinnedCard(
   hint: (text: string) => string,
   setInlineRange?: (label: string | undefined) => boolean,
 ): Component {
-  const maxRows = Math.max(1, Math.floor(terminalRows * 0.65));
+  const maxRows = Math.max(1, Math.floor(terminalRows * 0.5));
   let listHeight = 0;
   let detailHeight = 0;
   let listContentRows = 0;
@@ -27,14 +27,15 @@ export function scrollablePinnedCard(
   const region = (lines: string[], budget: number, top: number, width: number, footer = true) => {
     if (budget <= 0) return { lines: [], top: 0, contentRows: 0 };
     if (lines.length <= budget) return { lines, top: 0, contentRows: lines.length };
-    const contentRows = budget - (footer ? 1 : 0);
+    const showFooter = footer && budget > 1;
+    const contentRows = budget - (showFooter ? 1 : 0);
     const position = clamp(top, lines.length, contentRows);
     const first = position + 1;
     const last = Math.min(lines.length, position + contentRows);
     return {
       lines: [
         ...lines.slice(position, position + contentRows),
-        ...(footer ? [hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width))] : []),
+        ...(showFooter ? [hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width))] : []),
       ],
       top: position,
       contentRows,
@@ -47,9 +48,11 @@ export function scrollablePinnedCard(
       const detailLines = detail?.render(width) ?? [];
       listHeight = listLines.length;
       detailHeight = detailLines.length;
-      // Reserve up to four rows for an open detail when the task list is long.
-      const listBudget = detail ? Math.min(listHeight, Math.max(1, maxRows - Math.min(4, detailHeight))) : maxRows;
-      const listVisibleContent = listHeight > listBudget ? Math.max(0, listBudget - 1) : listHeight;
+      // Keep all task rows visible when they fit, even if the detail gets only
+      // one or two rows. Long lists share the viewport with a scrollable detail.
+      const listBudget = !detail ? maxRows : listHeight < maxRows ? listHeight
+        : Math.max(1, maxRows - Math.min(4, detailHeight));
+      const listVisibleContent = listHeight > listBudget ? Math.max(1, listBudget - 1) : listHeight;
       if (state.focusedListRow !== undefined && listVisibleContent > 0) {
         if (state.focusedListRow < state.listTop) state.listTop = state.focusedListRow;
         else if (state.focusedListRow >= state.listTop + listVisibleContent) {

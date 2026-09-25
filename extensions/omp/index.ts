@@ -174,8 +174,21 @@ export default function omp(pi: ExtensionAPI) {
   const pinnedJob = (callId: string) => [...jobs.values()].find((job) => job.callId === callId && !job.released);
   const beginCall = (callId: string, tasks: Assignment[]) => {
     if (runtime.ctx?.mode !== "tui" || !callId || calls.has(callId) || pinnedJob(callId)) return;
+    // A new dispatch closes previous finished batches in the fixed area. Their
+    // original tool cards become visible in the conversation again.
+    const released: BackgroundJob[] = [];
+    for (const job of jobs.values()) {
+      if (job.session !== runtime.session || job.released || job.state === "running") continue;
+      job.released = true;
+      released.push(job);
+    }
     calls.set(callId, { tasks, state: {} });
     refreshPinned();
+    for (const job of released) {
+      for (const invalidate of job.invalidators.values()) {
+        try { invalidate(); } catch { /* A closed tool card must not affect the new call. */ }
+      }
+    }
   };
   const renderChatCall = (label: string, tasks: Assignment[], theme: Parameters<typeof renderOmpToolCall>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string; isPartial?: boolean; isError?: boolean }) => {
     if (context?.toolCallId) {
