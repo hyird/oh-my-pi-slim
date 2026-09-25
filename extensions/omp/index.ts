@@ -6,7 +6,7 @@ import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } fro
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
 import { formatResults, queuedProgress, resolveModel, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result } from "./subagents.ts";
-import { OMP_SPINNER_FRAMES, renderPinnedOmpCall, renderPinnedOmpCard, renderPinnedOmpDetail, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
+import { formatTokenRate, OMP_SPINNER_FRAMES, renderPinnedOmpCall, renderPinnedOmpCard, renderPinnedOmpDetail, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
@@ -53,6 +53,11 @@ export default function omp(pi: ExtensionAPI) {
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
   let role: MainAgent = "orchestrator";
+  let mainMessageStartedAt: number | undefined;
+  let mainOutputTokens = 0;
+  let mainGenerationMs = 0;
+  let mainTokenRate: number | undefined;
+  let lastRateStatusAt = 0;
   // Each extension instance owns its jobs. Reloading disposes this instance and
   // cancels its children; no cross-version runtime state is shared.
   const runtime: OmpRuntime = {
@@ -299,9 +304,28 @@ export default function omp(pi: ExtensionAPI) {
     };
   };
 
-  function status(ctx: ExtensionContext) {
-    ctx.ui.setStatus("omp", `OMP:${role}`);
+  function status(ctx?: ExtensionContext) {
+    ctx?.ui.setStatus("omp", `OMP:${role}${mainTokenRate !== undefined ? ` · ${formatTokenRate(mainTokenRate)}` : ""}`);
   }
+
+  const resetMainThroughput = () => {
+    mainMessageStartedAt = undefined;
+    mainOutputTokens = 0;
+    mainGenerationMs = 0;
+    mainTokenRate = undefined;
+    lastRateStatusAt = 0;
+  };
+  const updateMainThroughput = (ctx: ExtensionContext, partialOutput = 0, partialMs = 0, force = false) => {
+    const output = mainOutputTokens + partialOutput;
+    const duration = mainGenerationMs + partialMs;
+    if (!(output > 0 && duration > 0)) return;
+    mainTokenRate = output * 1000 / duration;
+    const now = performance.now();
+    if (force || lastRateStatusAt === 0 || now - lastRateStatusAt >= 250) {
+      lastRateStatusAt = now;
+      status(ctx);
+    }
+  };
 
   async function applySetting(id: string, value: string, ctx: ExtensionCommandContext): Promise<void> {
     if (id === "default" && isMainAgent(value)) {
@@ -386,6 +410,7 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (event, ctx) => {
+    resetMainThroughput();
     cancelRunning();
     jobs.clear();
     calls.clear();
@@ -408,6 +433,7 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    resetMainThroughput();
     runtime.ctx?.ui.setWidget?.("omp-active", undefined);
     runtime.pi = undefined;
     runtime.ctx = undefined;
@@ -421,7 +447,9 @@ export default function omp(pi: ExtensionAPI) {
     runtime.retryTimer = undefined;
   });
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    resetMainThroughput();
+    status(ctx);
     reconcileTools(role);
     if (role === "pi") {
       delete event.systemPromptOptions.sections.omp_role;
@@ -430,6 +458,29 @@ export default function omp(pi: ExtensionAPI) {
     }
     event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
     event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council").map((name) => `${name} (${ROLES[name].description})`).join("; ")}. All delegation and Council work runs in the background. Continue only independent work; if none remains, end your turn with a brief status, without claiming the task is finished. Completion steers an active turn at the next safe tool boundary or wakes an idle turn. Never use shell sleep or polling to wait for specialists. Use their findings only after the completion message arrives. Progress and assistant replies remain in the fixed OMP task card until the next user input. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
+  });
+
+  pi.on("message_start", (event) => {
+    if (event.message.role === "assistant") mainMessageStartedAt = performance.now();
+  });
+
+  pi.on("message_update", (event, ctx) => {
+    const partial = "partial" in event.assistantMessageEvent ? event.assistantMessageEvent.partial : undefined;
+    const output = partial?.usage?.output;
+    if (mainMessageStartedAt !== undefined && typeof output === "number" && Number.isFinite(output) && output > 0) {
+      updateMainThroughput(ctx, output, Math.max(1, performance.now() - mainMessageStartedAt));
+    }
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    if (event.message.role !== "assistant") return;
+    const output = event.message.usage?.output;
+    if (mainMessageStartedAt !== undefined && typeof output === "number" && Number.isFinite(output) && output > 0) {
+      mainOutputTokens += output;
+      mainGenerationMs += Math.max(1, performance.now() - mainMessageStartedAt);
+      updateMainThroughput(ctx, 0, 0, true);
+    }
+    mainMessageStartedAt = undefined;
   });
 
   pi.registerTool({

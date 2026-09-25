@@ -9,6 +9,10 @@ const OUTPUT_LINES = 180;
 // Match Pi's Working loader cadence and glyphs.
 export const OMP_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
+export function formatTokenRate(rate: number): string {
+  return `${rate < 10 ? rate.toFixed(1) : Math.round(rate)} token/s`;
+}
+
 // Progress is presentation data, not a terminal escape stream. Never render raw tool
 // result content: it can contain arbitrarily long output, arguments, or credentials.
 function clean(value: string): string {
@@ -53,7 +57,7 @@ function taskRow(line: string, index: number, theme: Theme, interaction?: Intera
     const range = interaction?.state.expanded?.has(index) ? interaction.state.inlineRange : undefined;
     if (range && visibleWidth(content) + visibleWidth(range) <= width) content += theme.fg("muted", range);
     if (throughput !== undefined && Number.isFinite(throughput) && throughput > 0) {
-      const rate = ` · ${throughput < 10 ? throughput.toFixed(1) : Math.round(throughput)} token/s`;
+      const rate = ` · ${formatTokenRate(throughput)}`;
       if (visibleWidth(content) + visibleWidth(rate) <= width) content += theme.fg("muted", rate);
     }
     return content === line ? text.render(width) : new TruncatedText(content).render(width);

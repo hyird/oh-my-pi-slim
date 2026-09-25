@@ -560,6 +560,25 @@ test("OMP task rows show measured output token speed without clipping the task n
   expect(card.render(34).join("\n")).not.toContain("token/s");
 });
 
+test("OMP main status shows its own measured token speed and resets for a new turn", async () => {
+  const h = harness();
+  const statuses: string[] = [];
+  h.ctx.ui.setStatus = (_key: string, value: string) => { statuses.push(value); };
+  await h.handlers.session_start({ reason: "new" }, h.ctx);
+  expect(statuses.at(-1)).toBe("OMP:orchestrator");
+  const beforeAgent = () => h.handlers.before_agent_start({ systemPromptOptions: { sections: {} } }, h.ctx);
+  beforeAgent();
+  h.handlers.message_start({ message: { role: "assistant" } }, h.ctx);
+  h.handlers.message_update({ assistantMessageEvent: { type: "text_delta", partial: { usage: { output: 10 } } } }, h.ctx);
+  expect(statuses.at(-1)).toMatch(/^OMP:orchestrator · [\d.]+ token\/s$/);
+  await Bun.sleep(5);
+  h.handlers.message_end({ message: { role: "assistant", usage: { output: 25 } } }, h.ctx);
+  expect(statuses.at(-1)).toMatch(/^OMP:orchestrator · [\d.]+ token\/s$/);
+  beforeAgent();
+  expect(statuses.at(-1)).toBe("OMP:orchestrator");
+  h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+});
+
 test("OMP rendering tracks theme changes and stays within narrow widths", () => {
   initTheme();
   let palette = 1;
