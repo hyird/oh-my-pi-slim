@@ -1,14 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { configPath, parseConfig, parseModel, readConfig, updateConfig } from "../extensions/omp/config.ts";
-import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, sumUsage, type AgentProgress, type Assignment, type Result } from "../extensions/omp/subagents.ts";
+import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, type AgentProgress, type Assignment, type Result } from "../extensions/omp/subagents.ts";
 import { getChoices, getSettingsRows, INHERIT, INHERIT_THINKING } from "../extensions/omp/settings-ui.ts";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { renderOmpCall, renderOmpResult, renderOmpToolCall, renderPinnedOmpCard } from "../extensions/omp/render.ts";
+import { renderOmpCall, renderOmpResult, renderOmpToolCall, renderPinnedOmpCard, renderPinnedOmpDetail } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
@@ -158,6 +158,7 @@ describe("/omp settings entry point", () => {
       if (++calls === 1) return options[3];
       if (calls === 2) return "openai-codex/gpt-5.5"; // forged, now disabled
       if (calls === 3) return "high";
+      if (calls === 4) return "Default";
       return undefined;
     };
     await h.commands.omp.handler("", h.ctx);
@@ -191,6 +192,8 @@ describe("/omp settings entry point", () => {
     expect(readConfig().models.explorer).toBeUndefined(); // save after thinking is chosen
     for (let i = 0; i < 5; i++) component.handleInput("\x1b[B"); // high
     component.handleInput("\r");
+    expect(component.render(90).join("\n")).toContain("explorer speed");
+    component.handleInput("\r"); // provider default speed
     await waitFor(() => readConfig().models.explorer === "openai-codex/gpt-5.3-codex-spark" && readConfig().thinking.explorer === "high");
     expect(h.selected).toEqual([]); // main model stays with Pi, regardless of specialist model
     component.handleInput("\r"); // reopen explorer role
@@ -198,6 +201,7 @@ describe("/omp settings entry point", () => {
     component.handleInput("\r");
     for (let i = 0; i < 5; i++) component.handleInput("\x1b[A"); // inherit
     component.handleInput("\r");
+    component.handleInput("\r"); // provider default speed
     await waitFor(() => !readConfig().models.explorer && !readConfig().thinking.explorer);
     expect(h.selected).toEqual([]);
     component.handleInput("\x1b");
@@ -281,6 +285,7 @@ describe("/omp settings entry point", () => {
         expect(readConfig().models.explorer).toBeUndefined();
         return "high";
       }
+      if (calls === 4) return "Fast";
       return undefined;
     };
     await h.commands.omp.handler("", h.ctx);
@@ -291,6 +296,7 @@ describe("/omp settings entry point", () => {
     ]);
     expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.5");
     expect(readConfig().thinking.explorer).toBe("high");
+    expect(readConfig().serviceTier?.explorer).toBe("priority");
   });
   test("pi main agent cannot launch OMP children even through a stale tool call", async () => {
     await updateConfig((config) => ({ ...config, defaultAgent: "pi" }));
@@ -350,6 +356,7 @@ test("isolated child uses the configured specialist model and tool allowlist (of
     expect(result.usage.cost.total).toBe(0.3);
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
     expect(recorded.args).not.toContain("--no-extensions");
+    expect(recorded.args).not.toContain("--mcp-config"); // adapter is optional for non-Librarians
     expect(recorded.childGuard).toBe("1");
     expect(recorded.args).toContain("--no-approve");
     expect(recorded.args[recorded.args.indexOf("--tools") + 1]).toBe("read,grep,find,ls");
@@ -1287,9 +1294,90 @@ test("cancelled delegation and Council calls do not launch children", async () =
   }
 });
 
-test("delegation sums usage and displays failures", () => {
+test("delegation displays failures", () => {
   const u = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.2 } };
   const results: Result[] = [{ agent: "oracle", model: "openai-codex/gpt-5.5", ok: false, output: "Failed", usage: u }];
-  expect(sumUsage(results).cost.total).toBe(0.2);
   expect(formatResults(results)).toContain("FAILED oracle");
+});
+
+
+test("one animation timer serves concurrent batches without rebuilding unchanged widgets", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  const oldWait = process.env.OMP_TEST_WAIT_MS;
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "900";
+  const realInterval = globalThis.setInterval;
+  let timers = 0;
+  const interval = spyOn(globalThis, "setInterval").mockImplementation(((fn: any, delay: any, ...args: any[]) => {
+    if (delay === 80) timers++;
+    return realInterval(fn, delay, ...args);
+  }) as any);
+  let builds = 0;
+  let renders = 0;
+  let widget: any;
+  const theme: any = { fg: (_: string, value: string) => value, bg: (_: string, value: string) => value, bold: (value: string) => value };
+  h.ctx.ui.setWidget = (_: string, factory: any) => {
+    builds++;
+    widget = factory?.({ terminal: { rows: 30 }, requestRender: () => { renders++; } }, theme);
+  };
+  try {
+    await h.tools.omp_delegate.execute("one", { agent: "explorer", task: "one" }, undefined, undefined, h.ctx);
+    await h.tools.omp_delegate.execute("two", { agent: "fixer", task: "two" }, undefined, undefined, h.ctx);
+    expect(timers).toBe(1);
+    await Bun.sleep(300); // drain initial child events and progress throttles
+    const before = widget.render(90).join("\n");
+    const built = builds;
+    await Bun.sleep(180);
+    expect(builds).toBe(built);
+    expect(renders).toBeGreaterThan(0);
+    expect(widget.render(90).join("\n")).not.toBe(before);
+    await waitFor(() => h.sentMessages.length === 2, 160);
+    const after = renders;
+    await Bun.sleep(100);
+    expect(renders).toBe(after);
+    expect(widget.render(90).join("\n")).toContain("done");
+  } finally {
+    h.handlers.session_shutdown({}, h.ctx);
+    interval.mockRestore();
+    process.argv[1] = oldArgv;
+    if (oldWait === undefined) delete process.env.OMP_TEST_WAIT_MS; else process.env.OMP_TEST_WAIT_MS = oldWait;
+  }
+});
+
+test("dispatch reads configuration and model availability once for a batch", async () => {
+  const h = harness();
+  await updateConfig(c => ({ ...c, thinking: { explorer: "high", fixer: "low" } }));
+  const oldArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  const originalRead = fs.readFileSync;
+  let configReads = 0;
+  const read = spyOn(fs, "readFileSync").mockImplementation(((file: any, ...args: any[]) => {
+    if (file === configPath()) configReads++;
+    return (originalRead as any)(file, ...args);
+  }) as any);
+  const available = spyOn(h.ctx.modelRegistry, "getAvailable");
+  try {
+    await h.tools.omp_delegate.execute("snapshot", { tasks: [
+      { agent: "explorer", task: "one" }, { agent: "explorer", task: "two" }, { agent: "fixer", task: "three" },
+    ] }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(configReads).toBe(1);
+    expect(available).toHaveBeenCalledTimes(1);
+  } finally { read.mockRestore(); available.mockRestore(); process.argv[1] = oldArgv; }
+});
+
+test("live details reuse assistant previews and markdown components without disk reads", () => {
+  initTheme();
+  const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+  const state = {};
+  const progress: AgentProgress = { ...queuedProgress([{ agent: "explorer", task: "inspect" }])[0], conversationId: "recording", replyText: "first reply" };
+  const read = spyOn(fs, "readFileSync");
+  try {
+    const first = renderPinnedOmpDetail("inspect", progress, undefined, theme, state);
+    for (let i = 0; i < 20; i++) expect(renderPinnedOmpDetail("inspect", progress, undefined, theme, state)).toBe(first);
+    expect(read).not.toHaveBeenCalled();
+    progress.replyText = "updated reply";
+    expect(renderPinnedOmpDetail("inspect", progress, undefined, theme, state)).not.toBe(first);
+  } finally { read.mockRestore(); }
 });

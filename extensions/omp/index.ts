@@ -5,10 +5,11 @@ import { Box, Container, Spacer } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
-import { formatResults, queuedProgress, resolveModel, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result } from "./subagents.ts";
+import { formatResults, queuedProgress, resolveLaunches, runAssignments, type AgentProgress, type Assignment, type OmpDetails, type Result, type AgentLaunch, type ModelSnapshot } from "./subagents.ts";
 import { formatTokenRate, OMP_SPINNER_FRAMES, renderPinnedOmpCall, renderPinnedOmpCard, renderPinnedOmpDetail, renderOmpToolCall, renderOmpToolResult, type OmpRenderState } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
-import { installMcpPolicy } from "./mcp-policy.ts";
+import { installChildServiceTier, supportsServiceTier } from "./service-tier.ts";
+import { hasMcpAdapter, installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 
@@ -33,7 +34,6 @@ type BackgroundJob = {
   pinnedState: OmpRenderState;
   released: boolean;
   animationFrame: number;
-  animationTimer?: ReturnType<typeof setInterval>;
 };
 
 type PendingCall = { tasks: Assignment[]; state: OmpRenderState };
@@ -47,9 +47,13 @@ type OmpRuntime = {
   pending: Array<{ session: number; content: string; attempts: number }>;
   retryTimer?: ReturnType<typeof setTimeout>;
   scroll: PinnedScrollState;
+  animationTimer?: ReturnType<typeof setInterval>;
+  requestPinnedRender?: () => void;
+  dirtyJobs: Set<BackgroundJob>;
 };
 
 export default function omp(pi: ExtensionAPI) {
+  installChildServiceTier(pi);
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
   let role: MainAgent = "orchestrator";
@@ -61,29 +65,30 @@ export default function omp(pi: ExtensionAPI) {
   // Each extension instance owns its jobs. Reloading disposes this instance and
   // cancels its children; no cross-version runtime state is shared.
   const runtime: OmpRuntime = {
-    session: 0, jobs: new Map(), calls: new Map(), pending: [], scroll: { listTop: 0, detailTop: 0 },
+    session: 0, jobs: new Map(), calls: new Map(), pending: [], dirtyJobs: new Set(), scroll: { listTop: 0, detailTop: 0 },
   };
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const reconcileTools = installMcpPolicy(pi, () => role);
 
-  const reconcileModels = async (ctx: ExtensionContext) => {
-    const available = availableChildModels(ctx);
+  const reconcileModels = async (ctx: ExtensionContext): Promise<ModelSnapshot> => {
+    const snapshot: ModelSnapshot = { config: readConfig(), available: ctx.modelRegistry.getAvailable() };
+    const available = availableChildModels(ctx, snapshot.available);
     const byName = new Map(available.map((model) => [`${model.provider}/${model.id}`, model]));
-    const configured = readConfig().models;
+    const configured = snapshot.config.models;
     const stale = ROLE_NAMES.filter((name) => name !== "orchestrator" && name !== "council"
       && configured[name] && !byName.has(configured[name]));
-    if (!stale.length) return;
+    if (!stale.length) return snapshot;
     const currentName = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
     const fallback = (currentName && byName.has(currentName) ? currentName : undefined)
       ?? ctx.scopedModels?.map(({ model }) => `${model.provider}/${model.id}`).find((name) => byName.has(name))
       ?? (available[0] && `${available[0].provider}/${available[0].id}`);
     if (!fallback) {
       ctx.ui.notify(`OMP: ${stale.join(", ")} has an unavailable model and no enabled model can replace it. Check /scoped-models or /omp.`, "warning");
-      return;
+      return snapshot;
     }
     const changed: string[] = [];
-    await updateConfig((config) => {
+    snapshot.config = await updateConfig((config) => {
       const models = { ...config.models };
       for (const name of stale) {
         const previous = models[name];
@@ -95,12 +100,19 @@ export default function omp(pi: ExtensionAPI) {
       return { ...config, models };
     });
     if (changed.length) ctx.ui.notify(`OMP switched unavailable specialist models to enabled models: ${changed.join("; ")}`, "warning");
+    return snapshot;
   };
 
-  const repaint = (job: BackgroundJob) => {
-    for (const invalidate of job.invalidators.values()) {
+  const repaint = (job: BackgroundJob, immediate = true) => {
+    if (job.session !== runtime.session) return;
+    runtime.dirtyJobs.add(job);
+    if (immediate) flushPaint();
+  };
+  const flushPaint = () => {
+    for (const job of runtime.dirtyJobs) for (const invalidate of job.invalidators.values()) {
       try { invalidate(); } catch { /* A closed tool card must not affect the job. */ }
     }
+    runtime.dirtyJobs.clear();
     refreshPinned();
   };
   const refreshPinned = () => {
@@ -113,7 +125,9 @@ export default function omp(pi: ExtensionAPI) {
       runtime.scroll.detailTop = 0;
       runtime.scroll.focusedListRow = undefined;
     }
+    runtime.requestPinnedRender = undefined;
     ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (tui, theme) => {
+      runtime.requestPinnedRender = () => tui.requestRender();
       const list = new Container();
       const cardStarts = new Map<OmpRenderState, number>();
       let rowOffset = 0;
@@ -137,7 +151,7 @@ export default function omp(pi: ExtensionAPI) {
         if (index || pending.length) { list.addChild(new Spacer(1)); rowOffset++; }
         cardStarts.set(job.pinnedState, rowOffset);
         const card = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
-        card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned, job.state === "running", (taskIndex) => toggle(job.pinnedState, taskIndex)));
+        card.addChild(renderPinnedOmpCard(job.progress, job.results, job.animationFrame, theme, job.pinnedState, refreshPinned, job.state === "running", (taskIndex) => toggle(job.pinnedState, taskIndex), () => job.animationFrame));
         list.addChild(card);
         rowOffset += Math.max(job.progress.length, job.results?.length ?? 0) + 3;
       }
@@ -148,7 +162,7 @@ export default function omp(pi: ExtensionAPI) {
         const index = call.state.expanded?.values().next().value;
         if (index === undefined || !call.tasks[index]) continue;
         detail = new Box(1, 0, (text) => theme.bg("toolPendingBg", text));
-        detail.addChild(renderPinnedOmpDetail(call.tasks[index].task, undefined, undefined, theme));
+        detail.addChild(renderPinnedOmpDetail(call.tasks[index].task, undefined, undefined, theme, call.state));
         insertAfterRow = cardStarts.get(call.state)! + 3 + index;
         expandedState = call.state;
         break;
@@ -157,7 +171,7 @@ export default function omp(pi: ExtensionAPI) {
         const index = job.pinnedState.expanded?.values().next().value;
         if (index === undefined || !job.progress[index]) continue;
         detail = new Box(1, 0, (text) => theme.bg("toolSuccessBg", text));
-        detail.addChild(renderPinnedOmpDetail(job.progress[index].task, job.progress[index], job.results?.[index], theme));
+        detail.addChild(renderPinnedOmpDetail(job.progress[index].task, job.progress[index], job.results?.[index], theme, job.pinnedState));
         insertAfterRow = cardStarts.get(job.pinnedState)! + 3 + index;
         expandedState = job.pinnedState;
         break;
@@ -209,15 +223,32 @@ export default function omp(pi: ExtensionAPI) {
     shell.addChild(renderOmpToolCall(label, tasks, theme, context?.state ?? {}, context?.invalidate));
     return shell;
   };
-  const stopAnimation = (job: BackgroundJob) => {
-    if (job.animationTimer) clearInterval(job.animationTimer);
-    job.animationTimer = undefined;
+  const stopAnimation = () => {
+    if (runtime.animationTimer) clearInterval(runtime.animationTimer);
+    runtime.animationTimer = undefined;
+  };
+  const startAnimation = () => {
+    if (runtime.animationTimer || runtime.ctx?.mode !== "tui") return;
+    runtime.animationTimer = setInterval(() => {
+      let running = false;
+      for (const job of jobs.values()) {
+        if (job.session !== runtime.session || job.state !== "running" || job.controller.signal.aborted) continue;
+        job.animationFrame = (job.animationFrame + 1) % OMP_SPINNER_FRAMES.length;
+        running = true;
+      }
+      if (runtime.dirtyJobs.size) flushPaint();
+      else if (running) runtime.requestPinnedRender?.();
+      if (!running) stopAnimation();
+    }, 80);
+    runtime.animationTimer.unref?.();
+  };
+  const stopAnimationIfIdle = () => {
+    if (![...jobs.values()].some(job => job.session === runtime.session && job.state === "running" && !job.controller.signal.aborted)) stopAnimation();
   };
   const cancelRunning = () => {
-    for (const job of jobs.values()) if (job.state === "running") {
-      job.controller.abort();
-      stopAnimation(job);
-    }
+    stopAnimation();
+    runtime.dirtyJobs.clear();
+    for (const job of jobs.values()) if (job.state === "running") job.controller.abort();
   };
   const bindContext = (ctx: ExtensionContext) => {
     runtime.pi = pi;
@@ -273,8 +304,10 @@ export default function omp(pi: ExtensionAPI) {
     prepared: ReturnType<typeof prepareAssignments>,
     kind: BackgroundJob["kind"],
     callId: string,
-    modelOverride?: string,
+    launches: ReadonlyMap<Role, AgentLaunch>,
   ): AgentToolResult<OmpDetails> => {
+    const mcpAdapter = hasMcpAdapter(pi.getAllTools?.() ?? []);
+    const childLaunches = new Map([...launches].map(([role, launch]) => [role, { ...launch, mcpAdapter }]));
     const id = randomUUID();
     const controller = new AbortController();
     const job: BackgroundJob = {
@@ -285,18 +318,14 @@ export default function omp(pi: ExtensionAPI) {
     calls.delete(callId);
     jobs.set(id, job);
     refreshPinned();
-    job.animationTimer = setInterval(() => {
-      job.animationFrame = (job.animationFrame + 1) % OMP_SPINNER_FRAMES.length;
-      repaint(job);
-    }, 80);
-    job.animationTimer.unref?.();
+    startAnimation();
     void runAssignments(ctx, prepared.items, controller.signal, (progress) => {
       job.progress = progress;
-      repaint(job);
-    }, modelOverride).then((results) => {
-      stopAnimation(job);
+      repaint(job, runtime.ctx?.mode !== "tui");
+    }, childLaunches).then((results) => {
       job.results = results;
       job.state = controller.signal.aborted ? "cancelled" : results.some((result) => !result.ok) ? "failed" : "done";
+      stopAnimationIfIdle();
       repaint(job);
       const summary = formatResults(results);
       const councilHeader = job.state === "cancelled"
@@ -306,11 +335,12 @@ export default function omp(pi: ExtensionAPI) {
         : "Verify and integrate these specialist results before finalizing.\n\n";
       deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
     }).catch(() => {
-      stopAnimation(job);
       job.state = controller.signal.aborted ? "cancelled" : "failed";
+      stopAnimationIfIdle();
       repaint(job);
       deliver(job, `OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
     });
+    flushPaint();
     return {
       content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work. If nothing independent remains, end this turn with a brief status; completion will wake you. Never use shell sleep or polling to wait.` }],
       details: { jobId: id, progress: job.progress, animationFrame: job.animationFrame },
@@ -357,6 +387,9 @@ export default function omp(pi: ExtensionAPI) {
         : isThinkingLevel(selected.thinking) ? selected.thinking : null;
       if (thinkingLevel === null) throw new Error(`Invalid specialist model/thinking selection: ${value}`);
       const model = selected.model === INHERIT ? undefined : selected.model;
+      if (!["Default", "Standard", "Fast"].includes(selected.speed)) throw new Error("Invalid specialist speed");
+      const provider = model ? parseModel(model)?.provider : ctx.model?.provider;
+      if (selected.speed !== "Default" && !supportsServiceTier(provider)) throw new Error("Speed settings require an OpenAI or OpenAI Codex model");
       if (model) {
         const spec = parseModel(model);
         if (!spec || !availableChildModels(ctx).some((m) => m.provider === spec.provider && m.id === spec.id)) {
@@ -370,7 +403,10 @@ export default function omp(pi: ExtensionAPI) {
         const thinking = { ...current.thinking };
         if (thinkingLevel === undefined) delete thinking[name];
         else thinking[name] = thinkingLevel;
-        return { ...current, models, thinking };
+        const serviceTier = { ...current.serviceTier };
+        if (selected.speed === "Default") delete serviceTier[name];
+        else serviceTier[name] = selected.speed === "Fast" ? "priority" : "default";
+        return { ...current, models, thinking, serviceTier };
       });
       return;
     }
@@ -450,6 +486,7 @@ export default function omp(pi: ExtensionAPI) {
     runtime.ctx?.ui.setWidget?.("omp-active", undefined);
     runtime.pi = undefined;
     runtime.ctx = undefined;
+    runtime.requestPinnedRender = undefined;
     for (const job of jobs.values()) job.invalidators.clear();
     runtime.session++;
     cancelRunning();
@@ -522,12 +559,12 @@ export default function omp(pi: ExtensionAPI) {
       }
       const assignments = items as Assignment[];
       beginCall(_id, assignments);
-      await reconcileModels(ctx);
-      // Reject stale overrides before starting any children.
-      for (const assignment of assignments) resolveModel(ctx, assignment.agent);
+      const snapshot = await reconcileModels(ctx);
+      // Validate the entire batch once before starting any children.
+      const launches = resolveLaunches(ctx, assignments, snapshot);
       onUpdate?.({ content: [{ type: "text", text: "OMP: starting specialists" }], details: { progress: queuedProgress(assignments) } });
       const prepared = prepareAssignments(ctx, assignments, signal);
-      return startJob(ctx, prepared, "delegate", _id);
+      return startJob(ctx, prepared, "delegate", _id, launches);
     },
   });
 
@@ -544,12 +581,12 @@ export default function omp(pi: ExtensionAPI) {
       bindContext(ctx);
       if (role === "pi") throw new Error("OMP delegation is disabled while the default agent is pi");
       if (!question.trim() || question.length > 12_000) throw new Error("question must be 1-12000 characters");
-      const model = resolveModel(ctx, "council");
       const assignments = councilAssignments(question);
+      const launches = resolveLaunches(ctx, assignments, { config: readConfig(), available: ctx.modelRegistry.getAvailable() });
       beginCall(_id, assignments);
       onUpdate?.({ content: [{ type: "text", text: "Council: starting specialists" }], details: { progress: queuedProgress(assignments) } });
       const prepared = prepareAssignments(ctx, assignments, signal);
-      return startJob(ctx, prepared, "council", _id, model);
+      return startJob(ctx, prepared, "council", _id, launches);
     },
   });
 }

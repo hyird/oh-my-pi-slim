@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { assistantReplies, safeText } from "../extensions/omp/conversation-content.ts";
+import { assistantReplies, safeText, ReplyAccumulator } from "../extensions/omp/conversation-content.ts";
 
 test("task cards show only assistant replies and replace streamed drafts", () => {
   const events = [
@@ -22,4 +22,20 @@ test("child output cannot inject terminal controls into cards", () => {
   expect(assistantReplies([{ type: "message_end", message: { role: "assistant", content: [
     { type: "thinking", thinking: "hidden" }, { type: "text", text: "safe\x1b[1G reply" },
   ] } }])).toEqual(["safe reply"]);
+});
+
+
+test("incremental replies replace drafts, exclude tool data, and remain bounded", () => {
+  const replies = new ReplyAccumulator(100);
+  replies.record({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "draft" } });
+  expect(replies.text()).toBe("draft");
+  replies.record({ type: "tool_execution_end", result: { content: "secret" } });
+  expect(replies.text()).toBe("draft");
+  replies.record({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final" }, { type: "thinking", thinking: "hidden" }] } });
+  expect(replies.text()).toBe("final");
+  for (let i = 0; i < 1000; i++) replies.record({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: i, delta: "x".repeat(1000) } });
+  expect(replies.text().length).toBeLessThanOrEqual(100);
+  expect(replies.text()).not.toMatch(/draft|secret|hidden/);
+  replies.record({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "next" }] } });
+  expect(replies.text()).toBe("final\n\nnext");
 });

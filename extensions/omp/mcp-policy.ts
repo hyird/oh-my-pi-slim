@@ -28,6 +28,8 @@ function adapterTool(tool: ToolInfo | undefined): boolean {
     typeof value === "string" && /(^|[\\/])pi-mcp-adapter([\\/]|$)/i.test(value));
 }
 
+export const hasMcpAdapter = (tools: readonly ToolInfo[]): boolean => tools.some(adapterTool);
+
 /** Namespaces have unambiguous server ownership. Direct tools do not: deny them unless
  * the adapter exposes a trustworthy server-to-tool mapping in a future API. */
 export function allowedMcpTool(name: string, role: MainAgent, tools: readonly ToolInfo[]): boolean {

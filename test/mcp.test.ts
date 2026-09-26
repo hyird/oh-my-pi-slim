@@ -206,8 +206,14 @@ test("librarian child uses only public exclusive MCP servers; other roles inheri
     expect(args[args.indexOf("--tools") + 1]).not.toContain("mcp__private");
     expect(args[args.indexOf("--tools") + 1]).not.toContain("mcpScript");
     expect(captured.prompt).toContain("do not use mcp or mcpScript");
-    await runAgent(h.ctx, { agent: "fixer", task: "fix" });
-    expect(JSON.parse(fs.readFileSync(capture, "utf8")).args).not.toContain("--mcp-config");
+    await runAgent(h.ctx, { agent: "fixer", task: "fix" }, undefined, { model: "test/model", mcpAdapter: true });
+    const fixer = JSON.parse(fs.readFileSync(capture, "utf8"));
+    expect(fixer.mcpMode).toBe("exclusive");
+    expect(fixer.mcpConfig.mcpServers).toEqual({});
+    expect(fixer.args).toContain("--no-themes");
+    expect(fixer.args).toContain("--no-prompt-templates");
+    expect(fixer.args).not.toContain("--no-extensions");
+    expect(fixer.args).not.toContain("--no-skills");
   } finally {
     process.argv[1] = savedArgv;
     delete process.env.OMP_TEST_CAPTURE;

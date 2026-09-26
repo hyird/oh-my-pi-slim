@@ -47,20 +47,24 @@ function taskName(agent: string, index: number, count: number): string {
   return count > 1 ? `${title} ${index + 1}` : title;
 }
 
-export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number; inlineRange?: string }
+export interface OmpRenderState { card?: Container; expanded?: Set<number>; hovered?: number; inlineRange?: string; detail?: { task: string; reply: string | undefined; theme: Theme; palette: string; view: Component } }
 interface Interaction { state: OmpRenderState; invalidate: () => void; toggle?: (index: number) => void }
 
-function taskRow(line: string, index: number, theme: Theme, interaction?: Interaction, throughput?: number): Component {
-  const text = new TruncatedText(line);
+function taskRow(line: string | (() => string), index: number, theme: Theme, interaction?: Interaction, throughput?: number): Component {
+  const currentLine = () => typeof line === "function" ? line() : line;
+  let previousLine = currentLine();
+  let text = new TruncatedText(previousLine);
   const renderText = (width: number) => {
-    let content = line;
+    const base = currentLine();
+    if (base !== previousLine) { text = new TruncatedText(base); previousLine = base; }
+    let content = base;
     const range = interaction?.state.expanded?.has(index) ? interaction.state.inlineRange : undefined;
     if (range && visibleWidth(content) + visibleWidth(range) <= width) content += theme.fg("muted", range);
     if (throughput !== undefined && Number.isFinite(throughput) && throughput > 0) {
       const rate = ` · ${formatTokenRate(throughput)}`;
       if (visibleWidth(content) + visibleWidth(rate) <= width) content += theme.fg("muted", rate);
     }
-    return content === line ? text.render(width) : new TruncatedText(content).render(width);
+    return content === base ? text.render(width) : new TruncatedText(content).render(width);
   };
   if (!interaction) return { render: renderText, invalidate() { text.invalidate(); } };
   const highlighted: Component = {
@@ -118,6 +122,7 @@ function taskDetails(task: string, reply: string | undefined, theme: Theme): Com
 }
 
 function assistantReply(item: AgentProgress | undefined, final: Result | undefined): string | undefined {
+  if (item?.replyText !== undefined) return item.replyText || (final?.ok ? final.output : undefined);
   if (item?.conversationId) {
     try {
       const conversation = getConversation(item.conversationId);
@@ -175,25 +180,31 @@ export function renderPinnedOmpCall(
 /** Status rows for the fixed editor area; the selected detail renders separately. */
 export function renderPinnedOmpCard(
   progress: AgentProgress[], results: Result[] | undefined, animationFrame: number,
-  theme: Theme, state: OmpRenderState, invalidate: () => void, isPartial = true, toggle?: (index: number) => void,
+  theme: Theme, state: OmpRenderState, invalidate: () => void, isPartial = true, toggle?: (index: number) => void, frame?: () => number,
 ): Component {
   const interaction = { state, invalidate, toggle };
   const result: AgentToolResult<OmpDetails> = { content: [], details: { progress, results, animationFrame } };
-  return clearHoverOutsideRows(renderOmpResult(result, { expanded: false, isPartial }, theme, interaction, false), interaction);
+  return clearHoverOutsideRows(renderOmpResult(result, { expanded: false, isPartial }, theme, interaction, false, frame), interaction);
 }
 
-export function renderPinnedOmpDetail(task: string, item: AgentProgress | undefined, final: Result | undefined, theme: Theme): Component {
-  return taskDetails(task, assistantReply(item, final), theme);
+export function renderPinnedOmpDetail(task: string, item: AgentProgress | undefined, final: Result | undefined, theme: Theme, state?: OmpRenderState): Component {
+  const reply = assistantReply(item, final);
+  const palette = theme.fg("muted", "Task") + theme.fg("text", "Assistant");
+  const cached = state?.detail;
+  if (cached && cached.task === task && cached.reply === reply && cached.theme === theme && cached.palette === palette) return cached.view;
+  const view = taskDetails(task, reply, theme);
+  if (state) state.detail = { task, reply, theme, palette, view };
+  return view;
 }
 
 export function renderOmpResult(
-  result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Theme, interaction?: Interaction, showDetails = true,
+  result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Theme, interaction?: Interaction, showDetails = true, currentFrame?: () => number,
 ): Component {
   const view = new Container();
   const details = result.details;
   const progress = Array.isArray(details?.progress) ? details.progress : [];
   const results = Array.isArray(details?.results) ? details.results : [];
-  const frame = details?.animationFrame ?? 0;
+  const frame = () => currentFrame?.() ?? details?.animationFrame ?? 0;
   // Results and progress are indexed by assignment, not role: council and
   // parallel delegate calls may contain several instances of the same role.
   const count = Math.max(progress.length, results.length);
@@ -204,18 +215,23 @@ export function renderOmpResult(
   const headerColor = cancelled ? "warning" : failed || (!options.isPartial && results.some((item) => !item.ok)) ? "error" : queued ? "muted" : options.isPartial ? "warning" : "success";
   const finished = progress.length ? complete + failed + cancelled : results.length;
   const status = options.isPartial ? queued ? "queued" : "running" : cancelled ? "cancelled" : headerColor === "error" ? "failed" : "done";
-  view.addChild(new TruncatedText(theme.fg(headerColor, options.isPartial ? queued ? "○ " : `${OMP_SPINNER_FRAMES[frame % OMP_SPINNER_FRAMES.length]} ` : cancelled ? "■ " : headerColor === "error" ? "✗ " : "✓ ") + theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · ${status} · ${finished}/${count}`)));
+  let heading = new TruncatedText("");
+  let headingText = "";
+  view.addChild({ render(width) {
+    const next = theme.fg(headerColor, options.isPartial ? queued ? "○ " : `${OMP_SPINNER_FRAMES[frame() % OMP_SPINNER_FRAMES.length]} ` : cancelled ? "■ " : headerColor === "error" ? "✗ " : "✓ ") + theme.fg("toolTitle", theme.bold("OMP")) + theme.fg("muted", ` · ${status} · ${finished}/${count}`);
+    if (next !== headingText) { heading = new TruncatedText(next); headingText = next; }
+    return heading.render(width);
+  }, invalidate() { heading.invalidate(); } });
   if (!count) return view;
 
   for (let index = 0; index < count; index++) {
     const item = progress[index];
     const final = results[index];
     const state = !options.isPartial && final ? final.ok ? "done" : final.cancelled ? "cancelled" : "failed" : item?.state ?? "queued";
-    const { icon, name, color } = stateInfo(state, frame);
     const agent = item?.agent ?? final?.agent ?? "agent";
     const expanded = interaction?.state.expanded?.has(index) ?? false;
     view.addChild(taskRow(
-      theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") + theme.fg("accent", taskName(agent, index, count)) + (interaction ? theme.fg("muted", expanded ? " ▾" : " ▸") : ""),
+      () => { const { icon, name, color } = stateInfo(state, frame()); return theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") + theme.fg("accent", taskName(agent, index, count)) + (interaction ? theme.fg("muted", expanded ? " ▾" : " ▸") : ""); },
       index, theme, interaction, item?.tokensPerSecond,
     ));
     if (expanded && showDetails) view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme));

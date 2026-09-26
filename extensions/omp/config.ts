@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
+import type { ServiceTier } from "./service-tier.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -12,6 +13,7 @@ export interface OmpConfig {
   defaultAgent: MainAgent;
   models: Partial<Record<Role, string>>;
   thinking: Partial<Record<Role, ThinkingLevel>>;
+  serviceTier?: Partial<Record<Role, ServiceTier>>;
 }
 
 export const DEFAULT_CONFIG: OmpConfig = { defaultAgent: "orchestrator", models: {}, thinking: {} };
@@ -50,7 +52,18 @@ export function parseConfig(raw: unknown): OmpConfig {
     }
     validatedThinking[role] = level;
   }
-  return { defaultAgent, models: validated, thinking: validatedThinking };
+  const tiers = value.serviceTier;
+  const serviceTier: NonNullable<OmpConfig["serviceTier"]> = {};
+  if (tiers !== undefined) {
+    if (!tiers || typeof tiers !== "object" || Array.isArray(tiers)) throw new Error("serviceTier must be an object");
+    for (const [role, tier] of Object.entries(tiers)) {
+      if (!isRole(role) || role === "council" || role === "orchestrator" || (tier !== "default" && tier !== "priority")) {
+        throw new Error(`Invalid serviceTier.${role}: expected default/priority for a specialist`);
+      }
+      serviceTier[role] = tier;
+    }
+  }
+  return { defaultAgent, models: validated, thinking: validatedThinking, ...(Object.keys(serviceTier).length ? { serviceTier } : {}) };
 }
 
 export function readConfig(file = configPath()): OmpConfig {

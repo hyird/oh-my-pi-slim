@@ -5,9 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readConfig, parseModel } from "./config.ts";
+import { readConfig, parseModel, type OmpConfig, type ThinkingLevel } from "./config.ts";
 import { ROLES, isRole, type Role } from "./roles.ts";
 import { startConversation } from "./transcript.ts";
+import { ReplyAccumulator } from "./conversation-content.ts";
+import { supportsServiceTier, type ServiceTier } from "./service-tier.ts";
 import { availableChildModels } from "./models.ts";
 
 export interface Assignment { agent: Role; task: string; prompt?: string }
@@ -16,6 +18,8 @@ export interface AgentProgress {
   agent: Role;
   task: string;
   conversationId?: string;
+  /** Incremental, bounded assistant-only preview; present even before the first reply. */
+  replyText?: string;
   model?: string;
   state: "queued" | "running" | "done" | "failed" | "cancelled";
   activity: string;
@@ -52,23 +56,33 @@ const emptyUsage = (): Usage => ({
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 });
 
-export function sumUsage(results: Result[], additional?: Usage): Usage {
-  const usage = emptyUsage();
-  for (const source of [...results.map((result) => result.usage), ...(additional ? [additional] : [])]) {
-    for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) usage[key] += source[key];
-    for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) usage.cost[key] += source.cost[key];
+export interface ModelSnapshot {
+  config: OmpConfig;
+  available: ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>;
+}
+export interface AgentLaunch { model: string; thinking?: ThinkingLevel; serviceTier?: ServiceTier; mcpAdapter?: boolean }
+
+export function resolveLaunches(ctx: ExtensionContext, items: readonly Assignment[], snapshot: ModelSnapshot): ReadonlyMap<Role, AgentLaunch> {
+  const launches = new Map<Role, AgentLaunch>();
+  for (const { agent } of items) {
+    if (launches.has(agent)) continue;
+    launches.set(agent, {
+      model: resolveModel(ctx, agent, snapshot),
+      thinking: agent === "council" ? ctx.thinkingLevel : snapshot.config.thinking[agent] ?? ctx.thinkingLevel,
+      serviceTier: snapshot.config.serviceTier?.[agent],
+    });
   }
-  return usage;
+  return launches;
 }
 
-export function resolveModel(ctx: ExtensionContext, role: Role): string {
-  const configured = role === "council" ? undefined : readConfig().models[role];
+export function resolveModel(ctx: ExtensionContext, role: Role, snapshot: ModelSnapshot = { config: readConfig(), available: ctx.modelRegistry.getAvailable() }): string {
+  const configured = role === "council" ? undefined : snapshot.config.models[role];
   const model = configured ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
   if (!model) throw new Error(role === "council"
     ? "No main-session model to inherit; choose a model with Pi's /model"
     : "No model to inherit; use Pi's /model or configure a specialist model in /omp");
   const parsed = parseModel(model);
-  const allowed = configured ? availableChildModels(ctx) : ctx.modelRegistry.getAvailable();
+  const allowed = configured ? availableChildModels(ctx, snapshot.available) : snapshot.available;
   if (!parsed || !allowed.some((item) => item.provider === parsed.provider && item.id === parsed.id)) {
     throw new Error(role === "council"
       ? `Main-session model ${model} is unavailable; check /model and authentication`
@@ -93,17 +107,24 @@ function invocation(args: string[]): { command: string; args: string[] } {
 // Never grant project trust that the parent did not already have.
 export async function runAgent(
   ctx: ExtensionContext, assignment: Assignment, signal?: AbortSignal,
-  modelOverride?: string,
+  modelOverride?: string | AgentLaunch,
   onActivity?: (snapshot: AgentProgress) => void,
 ): Promise<Result> {
   const { agent, task } = assignment;
   if (!isRole(agent) || !task.trim()) throw new Error("A valid agent and nonempty task are required");
-  const model = modelOverride ?? resolveModel(ctx, agent);
-  const thinking = agent === "council" ? ctx.thinkingLevel : readConfig().thinking[agent] ?? ctx.thinkingLevel;
+  if (signal?.aborted) throw new Error("Specialist tasks cancelled");
+  const config = typeof modelOverride === "object" ? undefined : readConfig();
+  const model = typeof modelOverride === "object" ? modelOverride.model : modelOverride ?? resolveModel(ctx, agent, {
+    config: config!, available: ctx.modelRegistry.getAvailable(),
+  });
+  const thinking = typeof modelOverride === "object" ? modelOverride.thinking
+    : agent === "council" ? ctx.thinkingLevel : config!.thinking[agent] ?? ctx.thinkingLevel;
+  const tier = typeof modelOverride === "object" ? modelOverride.serviceTier : config?.serviceTier?.[agent];
+  const serviceTier = agent !== "council" && supportsServiceTier(parseModel(model)?.provider) ? tier : undefined;
   const cwd = ctx.cwd;
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
-  const progress: AgentProgress = { agent, task, model, state: "running", activity: "Starting specialist", text: "", activities: [] };
+  const progress: AgentProgress = { agent, task, model, state: "running", activity: "Starting specialist", text: "", replyText: "", activities: [] };
   const publish = () => {
     // A renderer or UI subscriber must never prevent the child process from settling.
     try { onActivity?.({ ...progress, activities: [...progress.activities] }); } catch { /* presentation is best-effort */ }
@@ -114,7 +135,7 @@ export async function runAgent(
     if (progress.activities.length > 32) progress.activities.shift();
     publish();
   };
-  publish();
+  const replies = new ReplyAccumulator();
   const conversation = startConversation(agent, task, model);
   progress.conversationId = conversation.id;
   publish();
@@ -125,16 +146,20 @@ export async function runAgent(
     const promptPath = path.join(tmpDir, "role.md");
     await fs.promises.writeFile(promptPath, agent === "librarian" ? `${prompt}\nOnly mcp__context7 and mcp__gh_grep are permitted MCP tools. If either namespace is missing, report that the pi-mcp-adapter must be loaded and its eager metadata initialized; do not use mcp or mcpScript.\n` : prompt, { mode: 0o600 });
     let tools: string[] = [...ROLES[agent].tools];
-    let mcpPath: string | undefined;
+    // The adapter flag is unavailable in installations without pi-mcp-adapter.
+    const mcpPath = agent === "librarian" || (typeof modelOverride === "object" && modelOverride.mcpAdapter)
+      ? path.join(tmpDir, "mcp.json") : undefined;
+    if (mcpPath) {
+      const mcpConfig = librarianMcpConfig();
+      await fs.promises.writeFile(mcpPath, JSON.stringify(agent === "librarian" ? mcpConfig : { ...mcpConfig, mcpServers: {} }), { mode: 0o600, flag: "wx" });
+    }
     if (agent === "librarian") {
       // Pi ignores unknown --tools names. Require the adapter, and never fall back
       // to the global mcp/mcpScript gateways if namespace metadata is unavailable.
-      mcpPath = path.join(tmpDir, "mcp.json");
-      await fs.promises.writeFile(mcpPath, JSON.stringify(librarianMcpConfig()), { mode: 0o600, flag: "wx" });
       tools = [...tools, "mcp__context7", "mcp__gh_grep"];
     }
     const args = [
-      "--mode", "json", "--print", "--no-session", projectTrusted ? "--approve" : "--no-approve",
+      "--mode", "json", "--print", "--no-session", "--no-themes", "--no-prompt-templates", projectTrusted ? "--approve" : "--no-approve",
       "--model", model, ...(thinking ? ["--thinking", thinking] : []), "--tools", tools.join(","),
       ...(mcpPath ? ["--mcp-config", mcpPath] : []),
       // End flag parsing; a leading @ is treated as a file even after --, so add a newline.
@@ -158,9 +183,10 @@ export async function runAgent(
         const duration = completedGenerationMs + partialMs;
         progress.tokensPerSecond = output > 0 && duration > 0 ? output * 1000 / duration : undefined;
       };
+      if (signal?.aborted) throw new Error("Specialist tasks cancelled");
       const proc = spawn(child.command, child.args, {
-        cwd, shell: false, stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PI_OMP_CHILD: "1", ...(mcpPath ? { PI_MCP_CONFIG_MODE: "exclusive" } : {}), MCP_DIRECT_TOOLS: undefined },
+        cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PI_OMP_CHILD: "1", PI_OMP_SERVICE_TIER: serviceTier, PI_MCP_CONFIG_MODE: mcpPath ? "exclusive" : undefined, MCP_DIRECT_TOOLS: undefined },
       });
       const onAbort = () => {
         aborted = true;
@@ -178,6 +204,8 @@ export async function runAgent(
           return;
         }
         try {
+          replies.record(event);
+          progress.replyText = replies.text();
           if (event.type === "message_start" && event.message?.role === "assistant") {
             messageStartedAt = performance.now();
             return;
@@ -276,8 +304,27 @@ export async function runAgent(
 export async function runAssignments(
   ctx: ExtensionContext, items: Assignment[], signal?: AbortSignal,
   onProgress?: (snapshot: AgentProgress[]) => void,
-  modelOverride?: string,
+  modelOverride?: string | ReadonlyMap<Role, AgentLaunch>,
 ): Promise<Result[]> {
+  const launches = typeof modelOverride === "object" ? modelOverride : undefined;
+  const config = launches || signal?.aborted ? undefined : readConfig();
+  const snapshot = config && { config, available: modelOverride ? [] : ctx.modelRegistry.getAvailable() };
+  const resolved = new Map<Role, AgentLaunch>();
+  const launchFor = (agent: Role): AgentLaunch => {
+    if (launches) {
+      const launch = launches.get(agent);
+      if (!launch) throw new Error("Missing launch settings for " + agent);
+      return launch;
+    }
+    let launch = resolved.get(agent);
+    if (!launch) {
+      launch = { model: typeof modelOverride === "string" ? modelOverride : resolveModel(ctx, agent, snapshot!),
+        thinking: agent === "council" ? ctx.thinkingLevel : config!.thinking[agent] ?? ctx.thinkingLevel,
+        serviceTier: config!.serviceTier?.[agent] };
+      resolved.set(agent, launch);
+    }
+    return launch;
+  };
   const results = new Array<Result>(items.length);
   const progress = queuedProgress(items);
   let lastPublished = 0;
@@ -300,17 +347,14 @@ export async function runAssignments(
     await Promise.all(items.map(async (item, index) => {
       try {
         if (signal?.aborted) throw new Error("Specialist tasks cancelled");
-        if (signal?.aborted) throw new Error("Specialist tasks cancelled");
-        progress[index] = { ...progress[index], state: "running", activity: "Starting" };
-        publish(true);
-        results[index] = await runAgent(ctx, item, signal, modelOverride, (snapshot) => {
+        results[index] = await runAgent(ctx, item, signal, launchFor(item.agent), (snapshot) => {
           const important = snapshot.activities.length !== progress[index].activities.length || snapshot.state !== progress[index].state;
           progress[index] = snapshot;
           publish(important);
         });
       } catch (err) {
         results[index] = {
-          agent: item.agent, model: modelOverride ?? "inherit", ok: false, cancelled: signal?.aborted,
+          agent: item.agent, model: launches?.get(item.agent)?.model ?? resolved.get(item.agent)?.model ?? (typeof modelOverride === "string" ? modelOverride : "inherit"), ok: false, cancelled: signal?.aborted,
           output: signal?.aborted ? "Specialist cancelled" : err instanceof Error ? err.message : String(err), usage: emptyUsage(),
         };
       }
@@ -321,17 +365,6 @@ export async function runAssignments(
       };
       publish(true);
     }));
-    if (signal?.aborted) {
-      for (let index = 0; index < items.length; index++) {
-        if (results[index]) continue;
-        results[index] = {
-          agent: items[index].agent, model: modelOverride ?? "inherit", ok: false,
-          cancelled: true, output: "Specialist cancelled before starting", usage: emptyUsage(),
-        };
-        progress[index] = { ...progress[index], state: "cancelled", activity: "Cancelled" };
-      }
-      publish(true);
-    }
     return results;
   } finally {
     if (timer) clearTimeout(timer);

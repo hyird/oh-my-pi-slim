@@ -2,7 +2,7 @@
 import * as fs from "node:fs";
 const args = process.argv.slice(2);
 if (process.env.OMP_TEST_CAPTURE) {
-  fs.writeFileSync(process.env.OMP_TEST_CAPTURE, JSON.stringify({ args, childGuard: process.env.PI_OMP_CHILD, prompt: fs.readFileSync(args[args.indexOf("--append-system-prompt") + 1], "utf8") }));
+  fs.writeFileSync(process.env.OMP_TEST_CAPTURE, JSON.stringify({ args, childGuard: process.env.PI_OMP_CHILD, serviceTier: process.env.PI_OMP_SERVICE_TIER, mcpMode: process.env.PI_MCP_CONFIG_MODE, mcpConfig: args.includes("--mcp-config") ? JSON.parse(fs.readFileSync(args[args.indexOf("--mcp-config") + 1], "utf8")) : undefined, prompt: fs.readFileSync(args[args.indexOf("--append-system-prompt") + 1], "utf8") }));
 }
 console.log(JSON.stringify({ type: "message_start", message: { role: "assistant" } }));
 console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Inspecting the code" } }));
