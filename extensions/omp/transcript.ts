@@ -47,8 +47,7 @@ function evict(file: string) {
   if (old) { cacheSize -= old.cost; conversationCache.delete(file); }
 }
 
-function append(fd: number, value: unknown) {
-  const bytes = Buffer.from(JSON.stringify(value) + "\n");
+function append(fd: number, bytes: Buffer) {
   for (let offset = 0; offset < bytes.length;) {
     const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
     if (!written) throw new Error("Conversation write made no progress");
@@ -57,19 +56,55 @@ function append(fd: number, value: unknown) {
 }
 
 /** Record only parsed, child-visible JSON events; never copy the child environment or stderr. */
-export function startConversation(agent: Role, task: string, model: string) {
+export function startConversation(agent: Role, task: string, model: string, onError?: () => void) {
   const meta: ConversationMeta = { id: randomUUID(), agent, task, model, state: "running", startedAt: Date.now() };
   const dir = ensureDirectory();
   const file = path.join(dir, `${meta.id}.jsonl`);
   const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
-  try { append(fd, { type: "meta", meta }); }
+  try { append(fd, Buffer.from(JSON.stringify({ type: "meta", meta }) + "\n")); }
   catch (err) { fs.closeSync(fd); fs.unlinkSync(file); throw err; }
   let finished = false;
+  let pending: string[] = [];
+  let pendingBytes = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let failure: unknown;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    if (failure) throw failure;
+    if (!pending.length) return;
+    const bytes = Buffer.from(pending.join(""));
+    pending = [];
+    pendingBytes = 0;
+    try { append(fd, bytes); }
+    catch (err) { failure = err; throw err; }
+  };
+  const enqueue = (value: unknown) => {
+    const line = JSON.stringify(value) + "\n";
+    pending.push(line);
+    pendingBytes += Buffer.byteLength(line);
+  };
   return {
     id: meta.id,
+    flush,
     record(event: any) {
       if (finished) return;
-      append(fd, { type: "event", event });
+      if (failure) throw failure;
+      enqueue({ type: "event", event });
+      // Bound both live-log latency and buffered memory. Keep complete JSONL
+      // records, including tools and thinking, in their original order.
+      if (pendingBytes >= 64 * 1024) flush();
+      else {
+        timer ??= setTimeout(() => {
+          try { flush(); }
+          catch {
+            // Surface timer failures to the process supervisor, never as an
+            // uncaught timer exception. record/finish also retain the failure.
+            try { onError?.(); } catch { /* finish still reports the write failure */ }
+          }
+        }, 100);
+        timer.unref?.();
+      }
     },
     finish(state: "done" | "failed" | "cancelled", error?: string) {
       if (finished) return;
@@ -78,7 +113,8 @@ export function startConversation(agent: Role, task: string, model: string) {
       meta.finishedAt = Date.now();
       if (error) meta.error = error;
       try {
-        append(fd, { type: "completion", state, finishedAt: meta.finishedAt, ...(error ? { error } : {}) });
+        enqueue({ type: "completion", state, finishedAt: meta.finishedAt, ...(error ? { error } : {}) });
+        flush();
       } finally { fs.closeSync(fd); }
     },
   };

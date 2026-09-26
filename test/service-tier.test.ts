@@ -68,7 +68,7 @@ test("child launch snapshots Fast per role without inheriting it into other chil
   await runAgent(ctx, { agent: "fixer", task: "fix" }, undefined, launches.get("fixer"));
   expect(captured().serviceTier).toBe("default");
   await runAgent(ctx, { agent: "oracle", task: "review" }, undefined, { model: "openai-codex/gpt-6-luna" });
-  expect(captured().serviceTier).toBeUndefined();
+  expect(captured().serviceTier).toBe("default");
   await runAgent(ctx, { agent: "council", task: "review" }, undefined, { model: "openai-codex/gpt-6-luna", serviceTier: "priority" });
   expect(captured().serviceTier).toBeUndefined();
   await runAgent(ctx, { agent: "fixer", task: "fix" }, undefined, { model: "anthropic/test", serviceTier: "priority" });

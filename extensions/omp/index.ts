@@ -41,6 +41,9 @@ type PendingCall = { tasks: Assignment[]; state: OmpRenderState };
 type OmpRuntime = {
   session: number;
   jobs: Map<string, BackgroundJob>;
+  jobsByCall: Map<string, BackgroundJob>;
+  running: Set<BackgroundJob>;
+  pinned: Set<BackgroundJob>;
   calls: Map<string, PendingCall>;
   pi?: ExtensionAPI;
   ctx?: ExtensionContext;
@@ -65,7 +68,8 @@ export default function omp(pi: ExtensionAPI) {
   // Each extension instance owns its jobs. Reloading disposes this instance and
   // cancels its children; no cross-version runtime state is shared.
   const runtime: OmpRuntime = {
-    session: 0, jobs: new Map(), calls: new Map(), pending: [], dirtyJobs: new Set(), scroll: { listTop: 0, detailTop: 0 },
+    session: 0, jobs: new Map(), jobsByCall: new Map(), running: new Set(), pinned: new Set(),
+    calls: new Map(), pending: [], dirtyJobs: new Set(), scroll: { listTop: 0, detailTop: 0 },
   };
   const jobs = runtime.jobs;
   const calls = runtime.calls;
@@ -118,7 +122,7 @@ export default function omp(pi: ExtensionAPI) {
   const refreshPinned = () => {
     const ctx = runtime.ctx;
     if (ctx?.mode !== "tui" || typeof ctx.ui.setWidget !== "function") return;
-    const pinned = [...jobs.values()].filter((job) => job.session === runtime.session && !job.released);
+    const pinned = [...runtime.pinned];
     const pending = [...calls.values()];
     if (!pinned.length && !pending.length) {
       runtime.scroll.listTop = 0;
@@ -185,24 +189,28 @@ export default function omp(pi: ExtensionAPI) {
         });
     } : undefined, { placement: "aboveEditor" });
   };
-  const pinnedJob = (callId: string) => [...jobs.values()].find((job) => job.callId === callId && !job.released);
+  const pinnedJob = (callId: string) => {
+    const job = runtime.jobsByCall.get(callId);
+    return job && !job.released ? job : undefined;
+  };
+  const releaseFinished = () => {
+    let released = false;
+    for (const job of runtime.pinned) {
+      if (job.state === "running") continue;
+      job.released = true;
+      runtime.pinned.delete(job);
+      repaint(job, false);
+      released = true;
+    }
+    return released;
+  };
   const beginCall = (callId: string, tasks: Assignment[]) => {
     if (runtime.ctx?.mode !== "tui" || !callId || calls.has(callId) || pinnedJob(callId)) return;
     // A new dispatch closes previous finished batches in the fixed area. Their
     // original tool cards become visible in the conversation again.
-    const released: BackgroundJob[] = [];
-    for (const job of jobs.values()) {
-      if (job.session !== runtime.session || job.released || job.state === "running") continue;
-      job.released = true;
-      released.push(job);
-    }
+    releaseFinished();
     calls.set(callId, { tasks, state: {} });
-    refreshPinned();
-    for (const job of released) {
-      for (const invalidate of job.invalidators.values()) {
-        try { invalidate(); } catch { /* A closed tool card must not affect the new call. */ }
-      }
-    }
+    flushPaint();
   };
   const renderChatCall = (label: string, tasks: Assignment[], theme: Parameters<typeof renderOmpToolCall>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string; isPartial?: boolean; isError?: boolean }) => {
     if (context?.toolCallId) {
@@ -213,8 +221,8 @@ export default function omp(pi: ExtensionAPI) {
         context.state.card?.clear();
         return new Container();
       }
-      const released = [...jobs.values()].find((job) => job.callId === context.toolCallId && job.released);
-      if (released && context.state.expanded === undefined && released.pinnedState.expanded) {
+      const released = runtime.jobsByCall.get(context.toolCallId);
+      if (released?.released && context.state.expanded === undefined && released.pinnedState.expanded) {
         context.state.expanded = new Set(released.pinnedState.expanded);
       }
     }
@@ -231,8 +239,8 @@ export default function omp(pi: ExtensionAPI) {
     if (runtime.animationTimer || runtime.ctx?.mode !== "tui") return;
     runtime.animationTimer = setInterval(() => {
       let running = false;
-      for (const job of jobs.values()) {
-        if (job.session !== runtime.session || job.state !== "running" || job.controller.signal.aborted) continue;
+      for (const job of runtime.running) {
+        if (job.controller.signal.aborted) continue;
         job.animationFrame = (job.animationFrame + 1) % OMP_SPINNER_FRAMES.length;
         running = true;
       }
@@ -243,12 +251,13 @@ export default function omp(pi: ExtensionAPI) {
     runtime.animationTimer.unref?.();
   };
   const stopAnimationIfIdle = () => {
-    if (![...jobs.values()].some(job => job.session === runtime.session && job.state === "running" && !job.controller.signal.aborted)) stopAnimation();
+    if (!runtime.running.size) stopAnimation();
   };
   const cancelRunning = () => {
     stopAnimation();
     runtime.dirtyJobs.clear();
-    for (const job of jobs.values()) if (job.state === "running") job.controller.abort();
+    for (const job of runtime.running) job.controller.abort();
+    runtime.running.clear();
   };
   const bindContext = (ctx: ExtensionContext) => {
     runtime.pi = pi;
@@ -286,7 +295,9 @@ export default function omp(pi: ExtensionAPI) {
   const visibleResult = (result: AgentToolResult<OmpDetails>, options: { expanded: boolean; isPartial: boolean }, theme: Parameters<typeof renderOmpToolResult>[2], context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string }) => {
     const job = result.details?.jobId ? jobs.get(result.details.jobId) : undefined;
     if (job && context?.toolCallId) {
+      if (job.callId !== context.toolCallId && runtime.jobsByCall.get(job.callId) === job) runtime.jobsByCall.delete(job.callId);
       job.callId = context.toolCallId;
+      runtime.jobsByCall.set(job.callId, job);
       job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
     }
     const moved = runtime.ctx?.mode === "tui" && !!context &&
@@ -317,6 +328,9 @@ export default function omp(pi: ExtensionAPI) {
     bindContext(ctx);
     calls.delete(callId);
     jobs.set(id, job);
+    runtime.jobsByCall.set(callId, job);
+    runtime.running.add(job);
+    runtime.pinned.add(job);
     refreshPinned();
     startAnimation();
     void runAssignments(ctx, prepared.items, controller.signal, (progress) => {
@@ -325,6 +339,7 @@ export default function omp(pi: ExtensionAPI) {
     }, childLaunches).then((results) => {
       job.results = results;
       job.state = controller.signal.aborted ? "cancelled" : results.some((result) => !result.ok) ? "failed" : "done";
+      runtime.running.delete(job);
       stopAnimationIfIdle();
       repaint(job);
       const summary = formatResults(results);
@@ -336,6 +351,7 @@ export default function omp(pi: ExtensionAPI) {
       deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
     }).catch(() => {
       job.state = controller.signal.aborted ? "cancelled" : "failed";
+      runtime.running.delete(job);
       stopAnimationIfIdle();
       repaint(job);
       deliver(job, `OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
@@ -387,9 +403,9 @@ export default function omp(pi: ExtensionAPI) {
         : isThinkingLevel(selected.thinking) ? selected.thinking : null;
       if (thinkingLevel === null) throw new Error(`Invalid specialist model/thinking selection: ${value}`);
       const model = selected.model === INHERIT ? undefined : selected.model;
-      if (!["Default", "Standard", "Fast"].includes(selected.speed)) throw new Error("Invalid specialist speed");
+      if (!["Standard", "Fast"].includes(selected.speed)) throw new Error("Invalid specialist speed");
       const provider = model ? parseModel(model)?.provider : ctx.model?.provider;
-      if (selected.speed !== "Default" && !supportsServiceTier(provider)) throw new Error("Speed settings require an OpenAI or OpenAI Codex model");
+      if (selected.speed === "Fast" && !supportsServiceTier(provider)) throw new Error("Speed settings require an OpenAI or OpenAI Codex model");
       if (model) {
         const spec = parseModel(model);
         if (!spec || !availableChildModels(ctx).some((m) => m.provider === spec.provider && m.id === spec.id)) {
@@ -404,7 +420,7 @@ export default function omp(pi: ExtensionAPI) {
         if (thinkingLevel === undefined) delete thinking[name];
         else thinking[name] = thinkingLevel;
         const serviceTier = { ...current.serviceTier };
-        if (selected.speed === "Default") delete serviceTier[name];
+        if (!supportsServiceTier(provider)) delete serviceTier[name];
         else serviceTier[name] = selected.speed === "Fast" ? "priority" : "default";
         return { ...current, models, thinking, serviceTier };
       });
@@ -451,17 +467,15 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.on("input", (event) => {
     if (event.source === "extension") return;
-    for (const job of jobs.values()) {
-      if (job.session !== runtime.session || job.state === "running" || job.released) continue;
-      job.released = true;
-      repaint(job);
-    }
+    if (releaseFinished()) flushPaint();
   });
 
   pi.on("session_start", async (event, ctx) => {
     resetMainThroughput();
     cancelRunning();
     jobs.clear();
+    runtime.jobsByCall.clear();
+    runtime.pinned.clear();
     calls.clear();
     runtime.pending.length = 0;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
@@ -491,6 +505,8 @@ export default function omp(pi: ExtensionAPI) {
     runtime.session++;
     cancelRunning();
     jobs.clear();
+    runtime.jobsByCall.clear();
+    runtime.pinned.clear();
     calls.clear();
     runtime.pending.length = 0;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);

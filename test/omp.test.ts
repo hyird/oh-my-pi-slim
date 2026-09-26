@@ -134,7 +134,7 @@ describe("/omp settings entry point", () => {
     expect(rows[0].label).toBe("Default main agent");
     expect(rows[0].description).toContain("does not change Pi's current model");
     expect(rows.slice(1).map((row) => row.label)).toEqual(["oracle", "librarian", "explorer", "designer", "fixer"]);
-    expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
+    expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING} · Standard`);
     expect(rows[1].description).toContain("Choose the model, then the thinking level");
     expect(getChoices("default", harness().ctx)).toEqual(["pi", "orchestrator", "council"]);
     expect(getChoices("model:explorer", harness().ctx)[0]).toBe(INHERIT);
@@ -158,7 +158,7 @@ describe("/omp settings entry point", () => {
       if (++calls === 1) return options[3];
       if (calls === 2) return "openai-codex/gpt-5.5"; // forged, now disabled
       if (calls === 3) return "high";
-      if (calls === 4) return "Default";
+      if (calls === 4) return "Standard";
       return undefined;
     };
     await h.commands.omp.handler("", h.ctx);
@@ -193,7 +193,9 @@ describe("/omp settings entry point", () => {
     for (let i = 0; i < 5; i++) component.handleInput("\x1b[B"); // high
     component.handleInput("\r");
     expect(component.render(90).join("\n")).toContain("explorer speed");
-    component.handleInput("\r"); // provider default speed
+    expect(component.render(90).join("\n")).not.toContain("Default");
+    expect(component.render(90).join("\n")).toContain("Standard");
+    component.handleInput("\r"); // standard speed
     await waitFor(() => readConfig().models.explorer === "openai-codex/gpt-5.3-codex-spark" && readConfig().thinking.explorer === "high");
     expect(h.selected).toEqual([]); // main model stays with Pi, regardless of specialist model
     component.handleInput("\r"); // reopen explorer role
@@ -201,7 +203,7 @@ describe("/omp settings entry point", () => {
     component.handleInput("\r");
     for (let i = 0; i < 5; i++) component.handleInput("\x1b[A"); // inherit
     component.handleInput("\r");
-    component.handleInput("\r"); // provider default speed
+    component.handleInput("\r"); // standard speed
     await waitFor(() => !readConfig().models.explorer && !readConfig().thinking.explorer);
     expect(h.selected).toEqual([]);
     component.handleInput("\x1b");
@@ -393,6 +395,9 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
     ], undefined, (snapshot) => snapshots.push(snapshot));
     expect(results.map((item) => item.ok)).toEqual([true, true]);
     expect(snapshots[0].map((item) => item.state)).toEqual(["queued", "queued"]);
+    expect(snapshots[1][1]).toBe(snapshots[0][1]); // the other queued row is reused
+    expect(snapshots[1]).not.toBe(snapshots[0]);
+    expect(snapshots.every(rows => rows.every(row => Object.isFrozen(row) && Object.isFrozen(row.activities)))).toBe(true);
     expect(snapshots.some((snapshot) => snapshot.some((item) => item.activity.includes("read src/index.ts")))).toBe(true);
     expect(snapshots.some((snapshot) => snapshot.some((item) => item.text.includes("Inspecting the code")))).toBe(true);
     expect(snapshots.at(-1)?.map((item) => item.state)).toEqual(["done", "done"]);
@@ -1244,6 +1249,7 @@ test("clicking one task expands its task and assistant reply inline", () => {
     { type: "toolCall", id: "tool", name: "bash", arguments: { command: "SECRET_COMMAND" } },
   ] } });
   conversation.record({ type: "tool_execution_end", toolCallId: "tool", toolName: "bash", result: { content: "SECRET_RESULT" } });
+  conversation.flush(); // legacy cards read persisted logs, after the batch is flushed
   const runningProgress = queuedProgress.map((item, index) => index === 1 ? { ...item, state: "running", conversationId: conversation.id } : item);
   tool.renderResult({ content: [], details: { progress: runningProgress } }, { expanded: false, isPartial: true }, theme, context);
   expect(call.render(100).join("\n")).toContain("assistant answer");
@@ -1380,4 +1386,91 @@ test("live details reuse assistant previews and markdown components without disk
     progress.replyText = "updated reply";
     expect(renderPinnedOmpDetail("inspect", progress, undefined, theme, state)).not.toBe(first);
   } finally { read.mockRestore(); }
+});
+
+test("activity updates still publish immediately after the history reaches its cap", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  const script = path.join(tmp, "activities.mjs");
+  fs.writeFileSync(script, `
+    for (let i = 0; i < 35; i++) console.log(JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: "file-" + i } }));
+    console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }));
+  `);
+  process.argv[1] = script;
+  const snapshots: AgentProgress[][] = [];
+  try {
+    await runAssignments(h.ctx, [{ agent: "explorer", task: "activities" }], undefined, snapshot => snapshots.push(snapshot));
+    const activities = snapshots.map(rows => rows[0]).filter(row => row.state === "running" && row.activity.startsWith("read file-"));
+    expect(new Set(activities.map(row => row.activity)).size).toBe(35);
+    expect(activities.at(-1)?.activities).toHaveLength(32);
+    expect(activities[0].activities).toEqual(["read file-0"]);
+    expect(snapshots.at(-1)?.[0].state).toBe("done");
+  } finally { process.argv[1] = oldArgv; }
+});
+
+test("released history is retained without scans during dispatch, animation or rendering", async () => {
+  initTheme();
+  const h = harness();
+  const oldArgv = process.argv[1];
+  const oldWait = process.env.OMP_TEST_WAIT_MS;
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  delete process.env.OMP_TEST_WAIT_MS;
+  // Capture the history map at the dispatch boundary to measure scans without
+  // exposing mutable runtime state in the extension's production API.
+  let history: Map<string, any> | undefined;
+  const originalSet = Map.prototype.set;
+  const set = spyOn(Map.prototype, "set").mockImplementation(function (this: Map<any, any>, key: any, value: any) {
+    if (value?.id === key && value?.controller instanceof AbortController) history = this;
+    return originalSet.call(this, key, value);
+  });
+  let scans: ReturnType<typeof spyOn> | undefined;
+  let pinned: any;
+  let renders = 0;
+  const theme: any = { fg: (_: string, value: string) => value, bg: (_: string, value: string) => value, bold: (value: string) => value };
+  h.ctx.ui.setWidget = (_: string, factory: any) => {
+    pinned = factory?.({ terminal: { rows: 30 }, requestRender: () => { renders++; } }, theme);
+  };
+  const tool = h.tools.omp_delegate;
+  const args = { agent: "explorer", task: "history" };
+  let first: any;
+  try {
+    for (let i = 0; i < 12; i++) {
+      const callId = `history-${i}`;
+      h.handlers.tool_execution_start({ toolCallId: callId, toolName: "omp_delegate", args }, h.ctx);
+      const result = await tool.execute(callId, args, undefined, undefined, h.ctx);
+      if (i === 0) {
+        first = result;
+        set.mockRestore();
+        expect(history).toBeDefined();
+        scans = spyOn(history!, "values");
+      }
+      await waitFor(() => h.sentMessages.length === i + 1);
+      h.handlers.input({ source: "user" });
+      expect(pinned).toBeUndefined();
+    }
+    expect(history?.size).toBe(12);
+    process.env.OMP_TEST_WAIT_MS = "500";
+    h.handlers.tool_execution_start({ toolCallId: "active", toolName: "omp_delegate", args }, h.ctx);
+    await tool.execute("active", args, undefined, undefined, h.ctx);
+    await Bun.sleep(200);
+    expect(renders).toBeGreaterThan(0);
+    const context = { state: {}, toolCallId: "history-0", isPartial: false, invalidate: () => {} };
+    const card = tool.renderCall(args, theme, context);
+    tool.renderResult(first, { expanded: false, isPartial: false }, theme, context);
+    expect(card.render(100).join("\n")).toContain("done · Explorer task");
+    await waitFor(() => h.sentMessages.length === 13, 100);
+    h.handlers.input({ source: "user" });
+    expect(pinned).toBeUndefined();
+    expect(scans).not.toHaveBeenCalled();
+    scans?.mockRestore();
+    scans = undefined;
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    expect(history?.size).toBe(0);
+  } finally {
+    set.mockRestore();
+    scans?.mockRestore();
+    h.handlers.session_shutdown({}, h.ctx);
+    process.argv[1] = oldArgv;
+    if (oldWait === undefined) delete process.env.OMP_TEST_WAIT_MS; else process.env.OMP_TEST_WAIT_MS = oldWait;
+  }
 });

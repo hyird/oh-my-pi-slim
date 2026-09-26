@@ -41,8 +41,14 @@ Plugin UI text is English. The main agent writes delegated tasks and Council que
 
 ## Dispatch performance and speed settings
 
+Quota tracking belongs to the parent session: the companion `pi-better-usage` extension returns before registration when `PI_OMP_CHILD=1`, avoiding child account lookups, quota requests, and refresh timers. Normal TUI/RPC registrations are unchanged.
+
+Recordings accumulate complete JSONL events until 100 ms or 64 KiB, then write a batch. Completion, failure, and cancellation flush before closing. Timer write errors notify the child supervisor and remain observable at finalization; abrupt process termination can lose the last unflushed batch. Live replies update in memory independently of disk flushes.
+
+Historical batches remain addressable by job ID and tool-call ID. Separate running and pinned sets drive animation and fixed-card refreshes, so released history is not scanned on each tick or render. Session reset/shutdown clears the indexes. Progress callbacks share frozen unchanged rows and activity lists, copy only the outer batch array, and publish text plus usage once per child event. Activity changes still force updates after the 32-entry history cap; terminal updates remain immediate.
+
 OMP resolves configuration and enabled-model availability once per dispatch, reusing role launch settings across repeated assignments. All TUI batches share one 80ms animation timer; progress changes coalesce into a widget refresh, while animation-only ticks request a render of the existing components. Live assistant previews are bounded and updated as events arrive; private JSONL recordings still retain the full events. Duplicate cancellation checks and the unused usage aggregation helper have been removed.
 
 Child CLI processes retain provider extensions and skills, skip themes and prompt templates, and inherit project trust. A detected pi-mcp-adapter receives an empty exclusive configuration for non-Librarians; without the adapter, no adapter-only flag is added. Librarian still requires its exclusive public MCP configuration. Full process isolation is retained.
 
-OpenAI specialists can choose Default, Standard, or Fast after model and thinking settings. An OMP child-only request hook sets service_tier to default or priority for openai/openai-codex; the main process and Council receive no override. Fast availability, actual processing tier, and billing are provider-controlled. No live paid request is needed to test the configuration, child environment, or request payload.
+OpenAI specialists can choose Standard or Fast after model and thinking settings. Standard also applies to older configurations without a speed override. An OMP child-only request hook sets service_tier to default or priority for openai/openai-codex; the main process and Council receive no override. Fast availability, actual processing tier, and billing are provider-controlled. No live paid request is needed to test the configuration, child environment, or request payload.

@@ -24,7 +24,7 @@ export interface AgentProgress {
   state: "queued" | "running" | "done" | "failed" | "cancelled";
   activity: string;
   text: string;
-  activities: string[];
+  activities: readonly string[];
   /** Confirmed output token throughput across assistant messages; tool time is excluded. */
   tokensPerSecond?: number;
 }
@@ -32,8 +32,8 @@ export interface OmpDetails { progress: AgentProgress[]; results?: Result[]; job
 const MAX_OUTPUT = 20_000;
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
-  return items.map(({ agent, task }) => ({
-    agent, task, state: "queued", activity: "Waiting to run", text: "", activities: [],
+  return items.map(({ agent, task }) => Object.freeze({
+    agent, task, state: "queued", activity: "Waiting to run", text: "", activities: Object.freeze([]),
   }));
 }
 
@@ -120,23 +120,23 @@ export async function runAgent(
   const thinking = typeof modelOverride === "object" ? modelOverride.thinking
     : agent === "council" ? ctx.thinkingLevel : config!.thinking[agent] ?? ctx.thinkingLevel;
   const tier = typeof modelOverride === "object" ? modelOverride.serviceTier : config?.serviceTier?.[agent];
-  const serviceTier = agent !== "council" && supportsServiceTier(parseModel(model)?.provider) ? tier : undefined;
+  const serviceTier = agent !== "council" && supportsServiceTier(parseModel(model)?.provider) ? tier ?? "default" : undefined;
   const cwd = ctx.cwd;
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
-  const progress: AgentProgress = { agent, task, model, state: "running", activity: "Starting specialist", text: "", replyText: "", activities: [] };
+  const progress: AgentProgress = { agent, task, model, state: "running", activity: "Starting specialist", text: "", replyText: "", activities: Object.freeze([]) };
   const publish = () => {
     // A renderer or UI subscriber must never prevent the child process from settling.
-    try { onActivity?.({ ...progress, activities: [...progress.activities] }); } catch { /* presentation is best-effort */ }
+    try { onActivity?.(Object.freeze({ ...progress })); } catch { /* presentation is best-effort */ }
   };
   const report = (activity: string) => {
     progress.activity = activity;
-    progress.activities.push(activity);
-    if (progress.activities.length > 32) progress.activities.shift();
+    progress.activities = Object.freeze([...progress.activities.slice(-31), activity]);
     publish();
   };
   const replies = new ReplyAccumulator();
-  const conversation = startConversation(agent, task, model);
+  let failRecording: (() => void) | undefined;
+  const conversation = startConversation(agent, task, model, () => failRecording?.());
   progress.conversationId = conversation.id;
   publish();
   let settled = false;
@@ -188,6 +188,11 @@ export async function runAgent(
         cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, PI_OMP_CHILD: "1", PI_OMP_SERVICE_TIER: serviceTier, PI_MCP_CONFIG_MODE: mcpPath ? "exclusive" : undefined, MCP_DIRECT_TOOLS: undefined },
       });
+      const recordFailed = () => {
+        error = "Failed to save specialist conversation";
+        proc.kill();
+      };
+      failRecording = recordFailed;
       const onAbort = () => {
         aborted = true;
         proc.kill();
@@ -198,9 +203,8 @@ export async function runAgent(
         let event: any;
         try { event = JSON.parse(line); } catch { return; }
         try { conversation.record(event); }
-        catch (err) {
-          error = err instanceof Error ? err.message : String(err);
-          proc.kill();
+        catch {
+          recordFailed();
           return;
         }
         try {
@@ -213,19 +217,21 @@ export async function runAgent(
           if (event.type === "message_update") {
             const update = event.assistantMessageEvent;
             messageStartedAt ??= performance.now();
-            const partialOutput = update?.partial?.usage?.output;
+            let changed = false;
+            const partialOutput = event.usage?.output ?? update?.partial?.usage?.output;
             if (Number.isFinite(partialOutput) && partialOutput > 0) {
               updateThroughput(partialOutput, Math.max(1, performance.now() - messageStartedAt));
-              publish();
+              changed = true;
             }
             if (update?.type === "text_delta" && typeof update.delta === "string") {
               streamingText = (streamingText + update.delta).slice(-2000);
               progress.text = streamingText;
-              publish();
+              changed = true;
             } else if (update?.type === "text_end" && typeof update.content === "string") {
               progress.text = update.content.slice(-2000);
-              publish();
+              changed = true;
             }
+            if (changed) publish();
             return;
           }
           if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
@@ -248,7 +254,6 @@ export async function runAgent(
           if (text) {
             output = text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT)}\n[output truncated]` : text;
             progress.text = text.slice(-2000);
-            publish();
           }
           streamingText = "";
           const u = msg.usage;
@@ -259,10 +264,10 @@ export async function runAgent(
               completedOutputTokens += u.output;
               completedGenerationMs += Math.max(1, performance.now() - messageStartedAt);
               updateThroughput();
-              publish();
             }
           }
           messageStartedAt = undefined;
+          publish();
         } catch { /* Ignore non-JSON lines from unexpected provider output. */ }
       };
       proc.stdout?.on("data", (chunk: Buffer) => {
@@ -282,12 +287,12 @@ export async function runAgent(
         signal?.removeEventListener("abort", onAbort);
         buffer += decoder.end();
         if (buffer) consume(buffer);
-        const ok = !aborted && code === 0 && !error && !!output;
+        let ok = !aborted && code === 0 && !error && !!output;
         const failure = aborted ? "Specialist cancelled" : `Specialist run failed (exit code ${code ?? "unknown"})${agent === "librarian" ? "; if MCP namespaces are missing, load pi-mcp-adapter and initialize context7/gh_grep eager metadata (never enable the global gateway)" : ""}`;
         progress.state = ok ? "done" : aborted ? "cancelled" : "failed";
         // Raw stderr and provider errors may contain credentials. JSON events remain in the private recording.
         try { conversation.finish(ok ? "done" : aborted ? "cancelled" : "failed", ok ? undefined : failure); }
-        catch { error = "Failed to save specialist conversation"; progress.state = "failed"; }
+        catch { error = "Failed to save specialist conversation"; progress.state = aborted ? "cancelled" : "failed"; ok = false; }
         settled = true;
         report(ok ? "Work completed" : aborted ? "Cancelled" : "Run failed");
         resolve({ agent, model, ok: ok && !error, cancelled: aborted, output: ok && !error ? output : (error === "Failed to save specialist conversation" ? error : failure), usage });
@@ -339,7 +344,9 @@ export async function runAssignments(
     if (timer) clearTimeout(timer);
     timer = undefined;
     lastPublished = now;
-    try { onProgress(progress.map((item) => ({ ...item, activities: [...item.activities] }))); }
+    // Rows and activity lists are immutable snapshots. Copy only the outer
+    // ordering array; unchanged agents retain their existing row identities.
+    try { onProgress(progress.slice()); }
     catch { /* presentation is best-effort; keep supervising children */ }
   };
   publish(true);
@@ -348,7 +355,7 @@ export async function runAssignments(
       try {
         if (signal?.aborted) throw new Error("Specialist tasks cancelled");
         results[index] = await runAgent(ctx, item, signal, launchFor(item.agent), (snapshot) => {
-          const important = snapshot.activities.length !== progress[index].activities.length || snapshot.state !== progress[index].state;
+          const important = snapshot.activities !== progress[index].activities || snapshot.state !== progress[index].state;
           progress[index] = snapshot;
           publish(important);
         });
@@ -358,12 +365,17 @@ export async function runAssignments(
           output: signal?.aborted ? "Specialist cancelled" : err instanceof Error ? err.message : String(err), usage: emptyUsage(),
         };
       }
-      progress[index] = {
+      const completed: AgentProgress = {
         ...progress[index], model: results[index].model, state: results[index].ok ? "done" : results[index].cancelled ? "cancelled" : "failed",
         activity: results[index].ok ? "Work completed" : results[index].cancelled ? "Cancelled" : "Run failed",
         text: results[index].ok ? results[index].output.slice(-2000) : progress[index].text,
       };
-      publish(true);
+      const previous = progress[index];
+      if (completed.model !== previous.model || completed.state !== previous.state ||
+          completed.activity !== previous.activity || completed.text !== previous.text) {
+        progress[index] = Object.freeze(completed);
+        publish(true);
+      }
     }));
     return results;
   } finally {
