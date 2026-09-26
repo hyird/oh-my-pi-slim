@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,102 +6,83 @@ import { prepareAssignments } from "../extensions/omp/language.ts";
 import { ROLES } from "../extensions/omp/roles.ts";
 import { runAgent, type Assignment } from "../extensions/omp/subagents.ts";
 
-const usage = { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-const message = (content: string) => ({ type: "message", message: { role: "user", content } });
-function fixture(latest: string, language: string, translated: string) {
-  const calls: any[] = [];
-  let response: any;
+let agentDir: string;
+let savedDir: string | undefined;
+beforeEach(() => {
+  savedDir = process.env.PI_CODING_AGENT_DIR;
+  agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-language-profile-"));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+});
+afterEach(() => {
+  if (savedDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = savedDir;
+  fs.rmSync(agentDir, { recursive: true, force: true });
+});
+const message = (content: unknown) => ({ type: "message", message: { role: "user", content } });
+function fixture(latest: string) {
+  const calls: unknown[] = [];
   const ctx: any = {
     cwd: os.tmpdir(), model: { provider: "test", id: "main" },
     isProjectTrusted: () => false,
-    sessionManager: { getBranch: () => [message("old message"), { type: "compaction", summary: "English summary" }, message(latest), { type: "message", message: { role: "assistant", content: "English main task" } }, { type: "custom_message", content: "English injected task" }] },
+    sessionManager: { getBranch: () => [message("old message"), message(latest), { type: "message", message: { role: "assistant", content: "English main task" } }] },
     modelRegistry: {
       getAvailable: () => [{ provider: "test", id: "main" }],
-      streamSimple: (...args: any[]) => { calls.push(args); return { result: async () => response }; },
+      streamSimple: (...args: unknown[]) => { calls.push(args); throw new Error("Unexpected model call"); },
     },
   };
-  const setResponse = (items: Assignment[]) => {
-    const roles = [...new Set(items.map((item) => item.agent))];
-    response = { stopReason: "stop", usage, content: [{ type: "text", text: JSON.stringify({
-      language, prompts: Object.fromEntries(roles.map((role) => [role, `${translated} ${role}: ${ROLES[role].prompt}\nRespond in ${language}.`] )),
-      tasks: items.map((item, index) => `${translated} task ${index}: ${item.task}`),
-    }) }] };
-  };
-  return { ctx, calls, setResponse, setRaw: (value: any) => { response = value; } };
+  return { ctx, calls };
 }
 
-describe("runtime language preparation", () => {
-  for (const [language, latest, translated] of [
-    ["Chinese", "请修复这个问题", "修复"], ["English", "Please fix this", "Localized"],
-    ["Japanese", "この問題を修正して", "修正"], ["Spanish", "Corrige este problema", "Arreglar"],
-  ]) {
-    test(`${language}: uses the latest user message and prepares every role and task in one call`, async () => {
-      const f = fixture(latest, language, translated);
-      const items: Assignment[] = [{ agent: "fixer", task: "English main-authored task at src/a.ts" }, { agent: "oracle", task: "English review" }];
-      f.setResponse(items);
-      const prepared = await prepareAssignments(f.ctx, items);
-      expect(f.calls).toHaveLength(1);
-      const [model, context, options] = f.calls[0];
-      expect(model).toBe(f.ctx.model);
-      expect(context.systemPrompt).toContain("latestUserMessage field only");
-      expect(options.cacheRetention).toBe("none");
-      const input = JSON.parse(context.messages[0].content[0].text);
-      expect(input.latestUserMessage).toBe(latest);
-      expect(input.prompts).toEqual({ fixer: ROLES.fixer.prompt, oracle: ROLES.oracle.prompt });
-      expect(input.tasks).toEqual(items.map((item) => item.task));
-      expect(prepared.language).toBe(language);
-      expect(prepared.usage).toEqual(usage);
-      expect(prepared.items[0].prompt).toContain(`Respond in ${language}`);
-      expect(prepared.items[0].task).toContain(translated);
+describe("language guidance without translation", () => {
+  for (const latest of ["请修复这个问题", "Please fix this", "この問題を修正して", "Corrige este problema"]) {
+    test(latest + ": preserves tasks without a model request", () => {
+      const f = fixture(latest);
+      const items: Assignment[] = [{ agent: "fixer", task: latest + " src/a.ts" }, { agent: "oracle", task: "Review src/a.ts" }];
+      const prepared = prepareAssignments(f.ctx, items);
+      expect(f.calls).toEqual([]);
+      expect(prepared.items.map(item => item.task)).toEqual(items.map(item => item.task));
+      expect(prepared.items[0].prompt).toContain(ROLES.fixer.prompt);
+      expect(prepared.items[0].prompt).toContain(JSON.stringify(latest));
+      expect(prepared.items[0].prompt).toContain("Use the language of the latest user message");
       expect(items[0].prompt).toBeUndefined();
     });
   }
-
-  test("text parts and capped user sample, not a later tool or main-agent message", async () => {
-    const f = fixture("ignored", "Japanese", "Localized");
-    f.ctx.sessionManager.getBranch = () => [message("earlier"), { type: "message", message: { role: "user", content: [{ type: "image" }, { type: "text", text: "x".repeat(5000) }] } }, { type: "message", message: { role: "toolResult", content: "English" } }];
-    f.setResponse([{ agent: "explorer", task: "search" }]);
-    await prepareAssignments(f.ctx, [{ agent: "explorer", task: "search" }]);
-    expect(JSON.parse(f.calls[0][1].messages[0].content[0].text).latestUserMessage).toBe("x".repeat(4000));
+  test("uses current branch user text, skips image-only messages, and bounds the reference", () => {
+    const f = fixture("ignored");
+    f.ctx.sessionManager.getBranch = () => [message("earlier"), message([{ type: "image" }, { type: "text", text: "x".repeat(5000) }]), message([{ type: "image" }]), { type: "custom_message", content: "English injected task" }];
+    const prompt = prepareAssignments(f.ctx, [{ agent: "explorer", task: "search" }]).items[0].prompt!;
+    expect(prompt).toContain(JSON.stringify("x".repeat(4000)));
+    expect(prompt).not.toContain("x".repeat(4001));
+    expect(prompt).not.toContain("English injected task");
   });
-
-  test("three council perspectives share one call and one canonical council prompt", async () => {
-    const f = fixture("Compare alternatives", "English", "Localized");
-    const items: Assignment[] = ["security", "performance", "maintenance"].map((perspective) => ({ agent: "council", task: `Review ${perspective}` }));
-    f.setResponse(items);
-    const prepared = await prepareAssignments(f.ctx, items);
-    expect(f.calls).toHaveLength(1);
-    const input = JSON.parse(f.calls[0][1].messages[0].content[0].text);
-    expect(Object.keys(input.prompts)).toEqual(["council"]);
-    expect(prepared.items.map((item) => item.task)).toEqual(items.map((item, i) => `Localized task ${i}: ${item.task}`));
-  });
-
-  test("rejects malformed, failed and aborted responses before any child can run", async () => {
-    const f = fixture("Fix this", "English", "Localized");
-    const items: Assignment[] = [{ agent: "fixer", task: "Fix" }];
-    for (const value of ["not json", JSON.stringify({ language: "English", prompts: {}, tasks: ["Fix"] }), JSON.stringify({ language: "", prompts: { fixer: "Prompt" }, tasks: ["Fix"] }), JSON.stringify({ language: "English", prompts: { fixer: "Prompt" }, tasks: [] })]) {
-      f.setRaw({ stopReason: "stop", usage, content: [{ type: "text", text: value }] });
-      await expect(prepareAssignments(f.ctx, items)).rejects.toThrow("Invalid language preparation response");
+  test("Council keeps three perspective tasks and the current user language reference", () => {
+    const f = fixture("请审查方案");
+    const items: Assignment[] = ["security", "performance", "maintenance"].map(task => ({ agent: "council", task }));
+    const prepared = prepareAssignments(f.ctx, items);
+    expect(prepared.items.map(item => item.task)).toEqual(items.map(item => item.task));
+    for (const item of prepared.items) {
+      expect(item.prompt).toContain("请审查方案");
+      expect(item.prompt).toContain("Council perspective headings");
     }
-    f.setRaw({ stopReason: "error", usage, content: [] });
-    await expect(prepareAssignments(f.ctx, items)).rejects.toThrow("Language preparation failed");
+    expect(f.calls).toEqual([]);
+  });
+  test("falls back to task language without user text or a main model", () => {
+    const f = fixture("");
+    f.ctx.sessionManager.getBranch = () => [];
+    f.ctx.model = undefined;
+    expect(prepareAssignments(f.ctx, [{ agent: "fixer", task: "修复错误" }]).items[0].prompt).toContain("Use the language of the assigned task");
+  });
+  test("rejects invalid tasks and cancellation before dispatch", () => {
+    const f = fixture("Fix this");
+    expect(() => prepareAssignments(f.ctx, [{ agent: "fixer", task: " " }])).toThrow("Invalid assignment");
     const controller = new AbortController();
     controller.abort();
-    const count = f.calls.length;
-    await expect(prepareAssignments(f.ctx, items, controller.signal)).rejects.toThrow("cancelled");
-    expect(f.calls).toHaveLength(count);
-    f.setRaw({ stopReason: "aborted", usage, content: [] });
-    await expect(prepareAssignments(f.ctx, items)).rejects.toThrow("cancelled");
-    f.setRaw({ stopReason: "length", usage, content: [{ type: "text", text: "{}" }] });
-    await expect(prepareAssignments(f.ctx, items)).rejects.toThrow("Language preparation failed: length");
-    const inFlight = new AbortController();
-    f.setResponse(items);
-    f.ctx.modelRegistry.streamSimple = () => ({ result: async () => { inFlight.abort(); return { stopReason: "stop", usage, content: [{ type: "text", text: "{}" }] }; } });
-    await expect(prepareAssignments(f.ctx, items, inFlight.signal)).rejects.toThrow("cancelled");
+    expect(() => prepareAssignments(f.ctx, [{ agent: "fixer", task: "Fix" }], controller.signal)).toThrow("cancelled");
+    expect(f.calls).toEqual([]);
   });
 
-  test("CLI-safe task transport never interprets translated leading flags or file references", async () => {
-    const f = fixture("Please inspect", "English", "Localized");
+  test("CLI-safe task transport never interprets leading flags or file references", async () => {
+    const f = fixture("Please inspect");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-argv-test-"));
     const oldArgv = process.argv[1];
     const oldCapture = process.env.OMP_TEST_CAPTURE;
@@ -123,9 +104,8 @@ describe("runtime language preparation", () => {
   });
 
   test("the prepared prompt and task reach the child CLI unchanged", async () => {
-    const f = fixture("Please review", "English", "Localized");
+    const f = fixture("Please review");
     const items: Assignment[] = [{ agent: "explorer", task: "Find files" }];
-    f.setResponse(items);
     const prepared = await prepareAssignments(f.ctx, items);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-language-test-"));
     const oldArgv = process.argv[1];

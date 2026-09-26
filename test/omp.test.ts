@@ -36,18 +36,13 @@ function harness() {
   const notifications: string[] = [];
   const sentMessages: Array<{ message: any; options: any }> = [];
   const selected: string[] = [];
-  const translations: any[] = [];
+  const modelCalls: any[] = [];
   const branch: any[] = [{ type: "message", message: { role: "user", content: [{ type: "text", text: "请用中文处理这个任务" }] } }];
-  const translationUsage = { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0.05, output: 0.1, cacheRead: 0, cacheWrite: 0, total: 0.15 } };
   const ctx: any = {
     cwd: tmp, model: models[0], mode: "tui", hasUI: true,
     modelRegistry: { getAvailable: () => models, streamSimple: (_model: any, request: any, options: any) => {
-      const input = JSON.parse(request.messages[0].content[0].text);
-      translations.push({ input, request, options });
-      return { result: async () => ({ stopReason: "stop", usage: translationUsage, content: [{ type: "text", text: JSON.stringify({
-        language: "Chinese", prompts: Object.fromEntries(Object.keys(input.prompts).map((role) => [role, `请用中文回答。${input.prompts[role]}`])),
-        tasks: input.tasks.map((task: string, index: number) => `本地化任务 ${index + 1}: ${task}`),
-      }) }] }) };
+      modelCalls.push({ request, options });
+      throw new Error("Dispatch must not call the main model");
     } },
     sessionManager: { getBranch: () => branch },
     isProjectTrusted: () => false,
@@ -69,7 +64,7 @@ function harness() {
     appendEntry: () => { throw new Error("/omp must not modify session state"); },
   };
   omp(pi);
-  return { ctx, commands, shortcuts, tools, handlers, notifications, sentMessages, selected, translations, branch, translationUsage };
+  return { ctx, commands, shortcuts, tools, handlers, notifications, sentMessages, selected, modelCalls, branch };
 }
 
 async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
@@ -156,7 +151,7 @@ describe("/omp settings entry point", () => {
     await h.handlers.session_start({ reason: "new" }, h.ctx);
     expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.3-codex-spark");
     expect(h.notifications.at(-1)).toContain("explorer: openai-codex/gpt-5.5 → openai-codex/gpt-5.3-codex-spark");
-    expect(h.translations).toEqual([]);
+    expect(h.modelCalls).toEqual([]);
     h.ctx.mode = "rpc";
     let calls = 0;
     h.ctx.ui.select = async (_title: string, options: string[]) => {
@@ -303,7 +298,7 @@ describe("/omp settings entry point", () => {
     await h.handlers.session_start({ reason: "new" }, h.ctx);
     await expect(h.tools.omp_delegate.execute("id", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx)).rejects.toThrow("disabled while the default agent is pi");
     await expect(h.tools.omp_council.execute("id", { question: "review" }, undefined, undefined, h.ctx)).rejects.toThrow("disabled while the default agent is pi");
-    expect(h.translations).toEqual([]);
+    expect(h.modelCalls).toEqual([]);
   });
   test("rejects specialist defaults instead of migrating obsolete config", async () => {
     fs.writeFileSync(configPath(), JSON.stringify({ defaultAgent: "fixer", models: { fixer: "openai-codex/gpt-5.5" } }));
@@ -640,23 +635,20 @@ test("delegation keeps its completed card fixed until the next user input", asyn
     const result = await tool.execute("call-123", { agent: "explorer", task: "查看 src/index.ts" }, undefined, (partial: any) => partials.push(partial), h.ctx);
     expect(widgets.some((widget) => widget.key === "omp-active" && widgetText(widget.content).includes("Explorer task"))).toBe(true);
     expect(widgets.map((widget) => widgetText(widget.content)).join("\n")).not.toContain("src/index.ts");
-    expect(partials[0].content[0].text).toContain("preparing user-language prompts");
+    expect(partials[0].content[0].text).toContain("starting specialists");
     expect(partials[0].details.progress.map((item: AgentProgress) => item.state)).toEqual(["queued"]);
     const preparing = tool.renderResult(partials[0], { expanded: false, isPartial: true }, theme).render(100).join("\n");
     expect(preparing).toContain("queued · 0/1");
     expect(preparing).toContain("○ queued · Explorer task");
     expect(preparing).not.toContain("Ctrl+Alt+O");
-    expect(preparing).not.toContain("preparing user-language prompts");
-    expect(h.translations).toHaveLength(1);
-    expect(h.translations[0].input.latestUserMessage).toBe("请用中文处理这个任务");
-    expect(Object.keys(h.translations[0].input.prompts)).toEqual(["explorer"]);
+    expect(preparing).not.toContain("starting specialists");
+    expect(h.modelCalls).toHaveLength(0);
     await waitFor(() => fs.existsSync(capture));
     await waitFor(() => h.sentMessages.length === 1);
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
-    expect(recorded.prompt).toContain("请用中文回答");
-    expect(recorded.args.at(-1)).toBe("本地化任务 1: 查看 src/index.ts");
-    expect(result.usage.cost.total).toBeCloseTo(0.15);
-    expect(result.usage.totalTokens).toBe(5);
+    expect(recorded.prompt).toContain("请用中文处理这个任务");
+    expect(recorded.args.at(-1)).toBe("查看 src/index.ts");
+    expect(result.usage).toBeUndefined();
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
     for (const isExpanded of [false, true]) {
       const displayed = tool.renderResult(result, { expanded: isExpanded, isPartial: false }, theme).render(100).join("\n");
@@ -1114,24 +1106,19 @@ test("council moves all reviewer statuses to the fixed card and clears it on com
     expect(call).toContain("0/3");
     expect(call).not.toContain("如何审查方案？");
     const result = await tool.execute("council-123", { question: "如何审查方案？" }, undefined, (partial: any) => partials.push(partial), h.ctx);
-    expect(partials[0].content[0].text).toContain("preparing user-language prompts");
+    expect(partials[0].content[0].text).toContain("starting specialists");
     expect(partials[0].details.progress.map((item: AgentProgress) => item.state)).toEqual(["queued", "queued", "queued"]);
     const preparing = tool.renderResult(partials[0], { expanded: false, isPartial: true }, theme).render(100).join("\n");
     expect(preparing).toContain("queued · 0/3");
     expect(preparing.match(/○ queued · Council review/g)).toHaveLength(3);
-    expect(h.translations).toHaveLength(1);
-    expect(h.translations[0].input.latestUserMessage).toBe("请用中文处理这个任务");
-    expect(h.translations[0].input.tasks).toHaveLength(3);
-    expect(h.translations[0].input.tasks.every((task: string) => task.includes("如何审查方案？"))).toBe(true);
-    expect(Object.keys(h.translations[0].input.prompts)).toEqual(["council"]);
+    expect(h.modelCalls).toHaveLength(0);
     await waitFor(() => fs.existsSync(capture));
     await waitFor(() => h.sentMessages.length === 1);
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
-    expect(recorded.prompt).toContain("请用中文回答");
-    expect([1, 2, 3].map((i) => `本地化任务 ${i}: ${h.translations[0].input.tasks[i - 1]}`)).toContain(recorded.args.at(-1));
-    expect(result.details.progress.map((item: AgentProgress) => item.task)).toEqual([1, 2, 3].map((i) => `本地化任务 ${i}: ${h.translations[0].input.tasks[i - 1]}`));
-    expect(result.usage.cost.total).toBeCloseTo(0.15);
-    expect(result.usage.totalTokens).toBe(5);
+    expect(recorded.prompt).toContain("请用中文处理这个任务");
+    expect(result.details.progress.map((item: AgentProgress) => item.task)).toContain(recorded.args.at(-1));
+    expect(result.details.progress.every((item: AgentProgress) => item.task.includes("如何审查方案？"))).toBe(true);
+    expect(result.usage).toBeUndefined();
     expect(h.sentMessages[0].message.content).toContain("3/3 reviewers responded");
     for (const isExpanded of [false, true]) {
       const displayed = tool.renderResult(result, { expanded: isExpanded, isPartial: false }, theme).render(100).join("\n");
@@ -1176,7 +1163,7 @@ test("specialist failure clears the pinned status and exposes failure state in t
   }
 });
 
-test("parallel delegation translates all tasks and prompts in one call", async () => {
+test("parallel delegation preserves all tasks without a preparation model call", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
@@ -1192,11 +1179,9 @@ test("parallel delegation translates all tasks and prompts in one call", async (
     expect(queued).toContain("Explorer task 1");
     expect(queued).toContain("Oracle task 2");
     expect(queued).toContain("Librarian task 3");
-    expect(h.translations).toHaveLength(1);
-    expect(h.translations[0].input.tasks).toEqual(["find files", "review issue", "find docs"]);
-    expect(Object.keys(h.translations[0].input.prompts)).toEqual(["explorer", "oracle", "librarian"]);
-    expect(result.details.progress.map((item: AgentProgress) => item.task)).toEqual(["本地化任务 1: find files", "本地化任务 2: review issue", "本地化任务 3: find docs"]);
-    expect(result.usage.cost.total).toBeCloseTo(0.15);
+    expect(h.modelCalls).toHaveLength(0);
+    expect(result.details.progress.map((item: AgentProgress) => item.task)).toEqual(["find files", "review issue", "find docs"]);
+    expect(result.usage).toBeUndefined();
     await waitFor(() => h.sentMessages.length === 1);
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
   } finally {
@@ -1284,21 +1269,17 @@ test("clicking one task expands its task and assistant reply inline", () => {
   conversation.finish("done");
 });
 
-test("preparation errors and cancellation fail closed before launching any child", async () => {
+test("cancelled delegation and Council calls do not launch children", async () => {
   const h = harness();
   const capture = path.join(tmp, "must-not-launch.json");
   process.env.OMP_TEST_CAPTURE = capture;
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   try {
-    h.ctx.modelRegistry.streamSimple = () => ({ result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "invalid" }] }) });
-    for (const [tool, params] of [["omp_delegate", { agent: "explorer", task: "inspect" }], ["omp_council", { question: "review" }]] as const) {
-      await expect(h.tools[tool].execute("bad", params, undefined, undefined, h.ctx)).rejects.toThrow("Invalid language preparation response");
-    }
-    expect(fs.existsSync(capture)).toBe(false);
     const controller = new AbortController();
     controller.abort();
-    await expect(h.tools.omp_delegate.execute("abort", { agent: "explorer", task: "inspect" }, controller.signal, undefined, h.ctx)).rejects.toThrow("Language preparation cancelled");
+    await expect(h.tools.omp_delegate.execute("abort", { agent: "explorer", task: "inspect" }, controller.signal, undefined, h.ctx)).rejects.toThrow("Specialist dispatch cancelled");
+    await expect(h.tools.omp_council.execute("abort-council", { question: "review" }, controller.signal, undefined, h.ctx)).rejects.toThrow("Specialist dispatch cancelled");
     expect(fs.existsSync(capture)).toBe(false);
   } finally {
     process.argv[1] = originalArgv;

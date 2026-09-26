@@ -30,7 +30,7 @@ Settings live in `getAgentDir()/omp.json` (normally `~/.pi/agent/omp.json`, or u
 }
 ```
 
-If a previously saved specialist model is later disabled, OMP switches it to the current Pi model when that model is enabled, otherwise to the first available enabled model, and shows a notification. This happens when a session starts, `/omp` opens, or delegation runs. If no enabled model is available, `/omp` marks the role and delegation stops before translation or child work.
+If a previously saved specialist model is later disabled, OMP switches it to the current Pi model when that model is enabled, otherwise to the first available enabled model, and shows a notification. This happens when a session starts, `/omp` opens, or delegation runs. If no enabled model is available, `/omp` marks the role and delegation stops before child work.
 
 ## MCP mapping
 
@@ -52,6 +52,6 @@ The task card shows each task's status from queued through completion. Hovering 
 
 Recordings are persisted under `getAgentDir()/omp/conversations` (normally `~/.pi/agent/omp/conversations`) as local JSON event logs. Older recordings remain on disk. They can contain sensitive prompts, code, full tool arguments/results, and emitted thinking. Protect this directory, avoid sharing it, and delete old logs yourself when no longer needed: OMP does not automatically expire or purge them. Model-facing tool output is separately bounded/truncated; local logs retain the full recorded child-visible event data. Provider output may vary, and un-emitted content cannot be displayed.
 
-The plugin UI and status/progress labels remain in **English**. Before each delegation or Council call, OMP makes **one extra call to the current main model** to infer the language from the **most recent user text on the current session branch** and translate the child role prompts and tasks for that request. Children are instructed to reply in that language; providers may still respond differently. Translation/validation errors fail closed (children are not started). The extra translation call's usage is included with child usage in the tool result, so budget for its cost.
+The plugin UI and status/progress labels remain in **English**. The main agent is instructed to write delegated tasks and Council questions in the language of the latest user message. OMP passes those tasks through unchanged and appends reply-language guidance to the child role prompts using the most recent user text on the current session branch as a reference. If no user text is available, children are instructed to use the task language. Role prompts and Council perspective headings are not translated. There is no extra model call or translation cost before dispatch. Children are instructed to answer in the current conversation language; providers may still respond differently.
 
 See [references and boundaries](docs/references.md) for read-only upstream comparisons. Remove the GitHub installation with `pi remove git:github.com/hyird/oh-my-pi-slim`. Licensed under [MIT](LICENSE), retaining upstream attribution.

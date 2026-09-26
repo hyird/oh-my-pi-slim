@@ -270,7 +270,7 @@ export default function omp(pi: ExtensionAPI) {
 
   const startJob = (
     ctx: ExtensionContext,
-    prepared: Awaited<ReturnType<typeof prepareAssignments>>,
+    prepared: ReturnType<typeof prepareAssignments>,
     kind: BackgroundJob["kind"],
     callId: string,
     modelOverride?: string,
@@ -313,7 +313,7 @@ export default function omp(pi: ExtensionAPI) {
     });
     return {
       content: [{ type: "text", text: `OMP background ${kind} started. Continue independent work. If nothing independent remains, end this turn with a brief status; completion will wake you. Never use shell sleep or polling to wait.` }],
-      details: { jobId: id, progress: job.progress, animationFrame: job.animationFrame }, usage: prepared.usage,
+      details: { jobId: id, progress: job.progress, animationFrame: job.animationFrame },
     };
   };
 
@@ -502,8 +502,8 @@ export default function omp(pi: ExtensionAPI) {
     description: "Start background specialist work and receive an automatic completion message. Any number of independent tasks run concurrently. Specialists: explorer, librarian, oracle, designer, fixer. Do not send secret credentials in tasks.",
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Specialist for a single task" })),
-      task: Type.Optional(Type.String({ description: "Bounded task for the specialist" })),
-      tasks: Type.Optional(Type.Array(Type.Object({ agent: Type.String(), task: Type.String() }))),
+      task: Type.Optional(Type.String({ description: "Bounded task written in the language of the latest user message" })),
+      tasks: Type.Optional(Type.Array(Type.Object({ agent: Type.String(), task: Type.String({ description: "Task written in the language of the latest user message" }) }))),
     }),
     renderCall(args, theme, context) {
       const tasks = args.tasks ?? [{ agent: args.agent ?? "explorer", task: args.task ?? "" }];
@@ -523,10 +523,10 @@ export default function omp(pi: ExtensionAPI) {
       const assignments = items as Assignment[];
       beginCall(_id, assignments);
       await reconcileModels(ctx);
-      // Reject stale overrides before paying for translation or starting other children.
+      // Reject stale overrides before starting any children.
       for (const assignment of assignments) resolveModel(ctx, assignment.agent);
-      onUpdate?.({ content: [{ type: "text", text: "OMP: preparing user-language prompts" }], details: { progress: queuedProgress(assignments) } });
-      const prepared = await prepareAssignments(ctx, assignments, signal);
+      onUpdate?.({ content: [{ type: "text", text: "OMP: starting specialists" }], details: { progress: queuedProgress(assignments) } });
+      const prepared = prepareAssignments(ctx, assignments, signal);
       return startJob(ctx, prepared, "delegate", _id);
     },
   });
@@ -535,7 +535,7 @@ export default function omp(pi: ExtensionAPI) {
     name: "omp_council", label: "OMP council",
     renderShell: "self",
     description: "Consult three independent review sessions (failure modes, architecture, minimal alternative). Costs three model runs; synthesize the actual opinions and disclose disagreements. All reviewers inherit the current main session's model and thinking level.",
-    parameters: Type.Object({ question: Type.String({ description: "A consequential technical decision to review" }) }),
+    parameters: Type.Object({ question: Type.String({ description: "A consequential technical decision to review, written in the language of the latest user message" }) }),
     renderCall(args, theme, context) {
       return renderChatCall("OMP council", councilAssignments(args.question), theme, context);
     },
@@ -547,8 +547,8 @@ export default function omp(pi: ExtensionAPI) {
       const model = resolveModel(ctx, "council");
       const assignments = councilAssignments(question);
       beginCall(_id, assignments);
-      onUpdate?.({ content: [{ type: "text", text: "Council: preparing user-language prompts" }], details: { progress: queuedProgress(assignments) } });
-      const prepared = await prepareAssignments(ctx, assignments, signal);
+      onUpdate?.({ content: [{ type: "text", text: "Council: starting specialists" }], details: { progress: queuedProgress(assignments) } });
+      const prepared = prepareAssignments(ctx, assignments, signal);
       return startJob(ctx, prepared, "council", _id, model);
     },
   });
