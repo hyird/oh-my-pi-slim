@@ -149,20 +149,33 @@ export function getConversation(id: string): Conversation | undefined {
     // A rename or append during the read must never seed the cache.
     stable = stable && sameRevision(revision, fs.lstatSync(file, { bigint: true }));
     const lines = body.split("\n");
+    // Only newline-terminated JSONL records are complete. A partial write can
+    // contain valid JSON but still lack the final delimiter.
+    const trailing = body.endsWith("\n") ? "" : lines.pop() ?? "";
     const first = JSON.parse(lines.shift() ?? "");
     if (first.type !== "meta" || first.meta?.id !== id || !isRole(first.meta.agent)) return undefined;
-    const meta = first.meta as ConversationMeta;
+    // The header precedes execution; only a terminal completion record may
+    // establish the final state, even when metadata was modified on disk.
+    const meta = { ...first.meta, state: "running" } as ConversationMeta;
+    delete meta.finishedAt;
+    delete meta.error;
     const events: any[] = [];
+    let completed = false;
     for (const line of lines) {
       if (!line) continue;
+      if (completed) return undefined;
       let event: any;
-      try { event = JSON.parse(line); } catch { continue; } // Incomplete last write during a live read.
+      try { event = JSON.parse(line); }
+      catch { return undefined; }
       if (event.type === "completion") {
+        if (!["done", "failed", "cancelled"].includes(event.state) || !Number.isSafeInteger(event.finishedAt)) return undefined;
+        completed = true;
         meta.state = event.state;
         meta.finishedAt = event.finishedAt;
         if (event.error) meta.error = event.error;
       } else if (event.type === "event") events.push(event.event);
     }
+    if (completed && trailing) return undefined;
     const result = { meta, events };
     const cost = Number(revision.size) * 4 + 4096;
     if (stable && cost <= cacheBudget) {

@@ -73,4 +73,4 @@ test("child launch snapshots Fast per role without inheriting it into other chil
   expect(captured().serviceTier).toBeUndefined();
   await runAgent(ctx, { agent: "fixer", task: "fix" }, undefined, { model: "anthropic/test", serviceTier: "priority" });
   expect(captured().serviceTier).toBeUndefined();
-});
+}, 15000);

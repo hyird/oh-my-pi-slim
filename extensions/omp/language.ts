@@ -3,11 +3,29 @@ import { ROLES, isRole } from "./roles.ts";
 import type { Assignment } from "./subagents.ts";
 
 function latestUserText(ctx: ExtensionContext): string | undefined {
-  for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+  const branch = ctx.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index--) {
+    const entry = branch[index]!;
     if (entry.type !== "message" || entry.message.role !== "user") continue;
     const content = entry.message.content;
-    const text = typeof content === "string" ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-    if (text.trim()) return text.slice(0, 4000);
+    if (typeof content === "string") {
+      if (/\S/.test(content)) return content.slice(0, 4000);
+      continue;
+    }
+    let prefix = "";
+    let hasText = false;
+    let textParts = 0;
+    for (const part of content) {
+      if (part.type !== "text") continue;
+      if (/\S/.test(part.text)) hasText = true;
+      if (prefix.length < 4000) {
+        if (textParts) prefix += "\n";
+        prefix += part.text.slice(0, 4000 - prefix.length);
+      }
+      textParts++;
+      if (prefix.length >= 4000 && hasText) break;
+    }
+    if (hasText) return prefix;
   }
 }
 

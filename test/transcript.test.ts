@@ -159,10 +159,26 @@ test("a background recording failure stops the child and reports failure", async
   let result: Awaited<ReturnType<typeof runAgent>> | undefined;
   const pending = runAgent(ctx, { agent: "explorer", task: "record" }, controller.signal, "test/model").then(value => { result = value; });
   try {
-    await waitUntil(() => !!result);
+    for (let i = 0; i < 300 && !result; i++) await Bun.sleep(10);
+    expect(result).toBeDefined();
     expect(result?.ok).toBe(false);
     expect(result?.output).toBe("Failed to save specialist conversation");
   } finally { controller.abort(); await pending; write.mockRestore(); }
+});
+
+test("a final recording flush failure is reported as a recording failure", async () => {
+  fake([message("complete")]);
+  const originalWrite = fs.writeSync;
+  const write = spyOn(fs, "writeSync").mockImplementation(((...args: any[]) => {
+    if (Buffer.isBuffer(args[1]) && args[1].toString("utf8").includes('"type":"completion"'))
+      throw new Error("disk full");
+    return (originalWrite as any)(...args);
+  }) as any);
+  try {
+    const result = await runAgent(ctx, { agent: "explorer", task: "final flush" }, undefined, "test/model");
+    expect(result.ok).toBe(false);
+    expect(result.output).toBe("Failed to save specialist conversation");
+  } finally { write.mockRestore(); }
 });
 
 test("cancellation flushes events still inside the buffer", async () => {
@@ -207,6 +223,50 @@ test("incomplete live lines become readable once finished", () => {
   fs.appendFileSync(fileFor(run.id), tail.slice(cut));
   expect(getConversation(run.id)?.events).toEqual([message("completed")]);
   run.finish("done");
+});
+
+test("a completion is not accepted before its JSONL line is terminated", () => {
+  const run = startConversation("explorer", "partial completion", "test/model");
+  try {
+    fs.appendFileSync(fileFor(run.id), JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }));
+    expect(getConversation(run.id)?.meta.state).toBe("running");
+    fs.appendFileSync(fileFor(run.id), "\n");
+    expect(getConversation(run.id)?.meta.state).toBe("done");
+  } finally { run.finish("failed"); }
+});
+
+test("a corrupt middle line cannot turn an incomplete recording into a completed one", () => {
+  const run = startConversation("explorer", "corrupt", "test/model");
+  try {
+    fs.appendFileSync(fileFor(run.id), '{"type":"event","event":\n');
+    fs.appendFileSync(fileFor(run.id), JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }) + "\n");
+    expect(getConversation(run.id)).toBeUndefined();
+  } finally { run.finish("failed"); }
+});
+
+test("a completion must be the final JSONL record", () => {
+  for (const suffix of [
+    JSON.stringify({ type: "event", event: message("late") }) + "\n",
+    JSON.stringify({ type: "completion", state: "failed", finishedAt: Date.now() }) + "\n",
+    '{"type":"event"',
+  ]) {
+    const run = startConversation("explorer", "terminal completion", "test/model");
+    run.finish("done");
+    fs.appendFileSync(fileFor(run.id), suffix);
+    expect(getConversation(run.id)).toBeUndefined();
+  }
+});
+
+test("metadata alone cannot claim a recording is complete", () => {
+  const run = startConversation("explorer", "unfinished", "test/model");
+  run.finish("done");
+  const file = fileFor(run.id);
+  const header = JSON.parse(fs.readFileSync(file, "utf8").split("\n")[0]!);
+  header.meta.state = "done";
+  header.meta.finishedAt = Date.now();
+  fs.writeFileSync(file, JSON.stringify(header) + "\n");
+  expect(getConversation(run.id)?.meta.state).toBe("running");
+  expect(getConversation(run.id)?.meta.finishedAt).toBeUndefined();
 });
 
 test("invalid IDs and symlinked recordings are rejected even after caching", () => {

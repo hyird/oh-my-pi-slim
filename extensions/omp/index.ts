@@ -39,6 +39,7 @@ type BackgroundJob = {
 };
 
 type PendingCall = { tasks: Assignment[]; state: OmpRenderState };
+type PendingDelivery = { session: number; content: string; attempts: number; retryAt?: number; completed?: Array<{ result: Result; at: number }> };
 
 type OmpRuntime = {
   session: number;
@@ -49,11 +50,12 @@ type OmpRuntime = {
   calls: Map<string, PendingCall>;
   pi?: ExtensionAPI;
   ctx?: ExtensionContext;
-  pending: Array<{ session: number; content: string; attempts: number; completed?: Array<{ result: Result; at: number }> }>;
+  pending: PendingDelivery[];
   retryTimer?: ReturnType<typeof setTimeout>;
   scroll: PinnedScrollState;
   animationTimer?: ReturnType<typeof setInterval>;
   requestPinnedRender?: () => void;
+  pinnedUiAvailable: boolean;
   dirtyJobs: Set<BackgroundJob>;
 };
 
@@ -71,14 +73,18 @@ export default function omp(pi: ExtensionAPI) {
   // cancels its children; no cross-version runtime state is shared.
   const runtime: OmpRuntime = {
     session: 0, jobs: new Map(), jobsByCall: new Map(), running: new Set(), pinned: new Set(),
-    calls: new Map(), pending: [], dirtyJobs: new Set(), scroll: { listTop: 0, detailTop: 0 },
+    calls: new Map(), pending: [], dirtyJobs: new Set(), scroll: { listTop: 0, detailTop: 0 }, pinnedUiAvailable: false,
   };
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const sessions = new TaskSessions();
   const reconcileTools = installMcpPolicy(pi, () => role);
+  const warn = (ctx: ExtensionContext, message: string) => {
+    try { ctx.ui.notify(message, "warning"); }
+    catch { /* A stale notification UI must not interrupt model reconciliation. */ }
+  };
 
-  const reconcileModels = async (ctx: ExtensionContext): Promise<ModelSnapshot> => {
+  const reconcileModels = async (ctx: ExtensionContext, canCommit: () => boolean = () => true): Promise<ModelSnapshot> => {
     const snapshot: ModelSnapshot = { config: readConfig(), available: ctx.modelRegistry.getAvailable() };
     const available = availableChildModels(ctx, snapshot.available);
     const byName = new Map(available.map((model) => [`${model.provider}/${model.id}`, model]));
@@ -91,9 +97,10 @@ export default function omp(pi: ExtensionAPI) {
       ?? ctx.scopedModels?.map(({ model }) => `${model.provider}/${model.id}`).find((name) => byName.has(name))
       ?? (available[0] && `${available[0].provider}/${available[0].id}`);
     if (!fallback) {
-      ctx.ui.notify(`OMP: ${stale.join(", ")} has an unavailable model and no enabled model can replace it. Check /scoped-models or /omp.`, "warning");
+      if (canCommit()) warn(ctx, `OMP: ${stale.join(", ")} has an unavailable model and no enabled model can replace it. Check /scoped-models or /omp.`);
       return snapshot;
     }
+    if (!canCommit()) return snapshot;
     const changed: string[] = [];
     snapshot.config = await updateConfig((config) => {
       const models = { ...config.models };
@@ -105,8 +112,8 @@ export default function omp(pi: ExtensionAPI) {
         }
       }
       return { ...config, models };
-    });
-    if (changed.length) ctx.ui.notify(`OMP switched unavailable specialist models to enabled models: ${changed.join("; ")}`, "warning");
+    }, configPath(), canCommit);
+    if (canCommit() && changed.length) warn(ctx, `OMP switched unavailable specialist models to enabled models: ${changed.join("; ")}`);
     return snapshot;
   };
 
@@ -116,15 +123,31 @@ export default function omp(pi: ExtensionAPI) {
     if (immediate) flushPaint();
   };
   const flushPaint = () => {
-    for (const job of runtime.dirtyJobs) for (const invalidate of job.invalidators.values()) {
-      try { invalidate(); } catch { /* A closed tool card must not affect the job. */ }
+    for (const job of runtime.dirtyJobs) {
+      for (const invalidate of job.invalidators.values()) {
+        try { invalidate(); } catch { /* A closed tool card must not affect the job. */ }
+      }
+      // A released card has its final state. Do not retain callbacks into old UI trees.
+      if (job.released) job.invalidators.clear();
     }
     runtime.dirtyJobs.clear();
     refreshPinned();
   };
+  const setPinnedAvailability = (available: boolean) => {
+    if (runtime.pinnedUiAvailable === available) return;
+    runtime.pinnedUiAvailable = available;
+    // The tool card is hidden only while the fixed widget owns it. Redraw
+    // existing cards when that ownership changes in either direction.
+    for (const job of runtime.pinned) for (const invalidate of job.invalidators.values()) {
+      try { invalidate(); } catch { /* A closed tool card cannot block jobs. */ }
+    }
+  };
   const refreshPinned = () => {
     const ctx = runtime.ctx;
-    if (ctx?.mode !== "tui" || typeof ctx.ui.setWidget !== "function") return;
+    if (ctx?.mode !== "tui" || typeof ctx.ui.setWidget !== "function") {
+      setPinnedAvailability(false);
+      return;
+    }
     const pinned = [...runtime.pinned];
     const pending = [...calls.values()];
     if (!pinned.length && !pending.length) {
@@ -133,7 +156,7 @@ export default function omp(pi: ExtensionAPI) {
       runtime.scroll.focusedListRow = undefined;
     }
     runtime.requestPinnedRender = undefined;
-    ctx.ui.setWidget("omp-active", pinned.length || pending.length ? (tui, theme) => {
+    const content: Parameters<typeof ctx.ui.setWidget>[1] = pinned.length || pending.length ? (tui, theme) => {
       runtime.requestPinnedRender = () => tui.requestRender();
       const list = new Container();
       const cardStarts = new Map<OmpRenderState, number>();
@@ -190,7 +213,14 @@ export default function omp(pi: ExtensionAPI) {
           list.invalidate();
           return true;
         });
-    } : undefined, { placement: "aboveEditor" });
+    } : undefined;
+    try {
+      ctx.ui.setWidget("omp-active", content, { placement: "aboveEditor" });
+      setPinnedAvailability(true);
+    } catch {
+      setPinnedAvailability(false);
+      runtime.requestPinnedRender = undefined;
+    }
   };
   const pinnedJob = (callId: string) => {
     const job = runtime.jobsByCall.get(callId);
@@ -220,7 +250,8 @@ export default function omp(pi: ExtensionAPI) {
       const pending = calls.get(context.toolCallId);
       // Pi renders a call before tool_execution_start. Keep that first frame
       // empty; the start event creates the fixed card from the complete task list.
-      if (runtime.ctx?.mode === "tui" && (context.isPartial !== false || pending || pinnedJob(context.toolCallId))) {
+      if (runtime.ctx?.mode === "tui" && runtime.pinnedUiAvailable &&
+          (context.isPartial !== false || pending || pinnedJob(context.toolCallId))) {
         context.state.card?.clear();
         return new Container();
       }
@@ -269,29 +300,43 @@ export default function omp(pi: ExtensionAPI) {
     runtime.pi = pi;
     runtime.ctx = ctx;
   };
+  let delivering = false;
   const flushPending = () => {
-    if (!runtime.pi) return;
-    const pending = runtime.pending.splice(0);
-    for (const item of pending) {
-      if (item.session !== runtime.session) continue;
-      try {
-        runtime.pi.sendMessage({ customType: "omp-background-result", display: false, content: item.content },
-          { triggerTurn: true, deliverAs: "steer" });
-        for (const entry of item.completed ?? []) if (entry.result.timings) entry.result.timings.deliveryMs = performance.now() - entry.at;
-      } catch {
-        if (item.attempts < 5) {
-          runtime.pending.push({ ...item, attempts: item.attempts + 1 });
-        } else {
-          runtime.ctx?.ui.notify("OMP completed a background task, but could not deliver its result. Check the task card.", "warning");
+    if (!runtime.pi || delivering) return;
+    if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
+    runtime.retryTimer = undefined;
+    delivering = true;
+    try {
+      const pending = runtime.pending.splice(0);
+      for (const item of pending) {
+        if (item.session !== runtime.session) continue;
+        if (item.retryAt && item.retryAt > performance.now()) { runtime.pending.push(item); continue; }
+        try {
+          runtime.pi.sendMessage({ customType: "omp-background-result", display: false, content: item.content },
+            { triggerTurn: true, deliverAs: "steer" });
+        } catch {
+          if (item.session !== runtime.session) continue;
+          item.attempts++;
+          if (item.attempts === 6) {
+            try { runtime.ctx?.ui.notify("OMP completed a background task, but could not deliver its result yet. Check the task card; delivery will keep retrying.", "warning"); }
+            catch { /* A broken notification UI must not crash the extension timer. */ }
+          }
+          const delay = item.attempts < 6 ? 100 : Math.min(30_000, 1000 * 2 ** Math.min(item.attempts - 6, 5));
+          item.retryAt = performance.now() + delay;
+          runtime.pending.push(item);
+          continue;
         }
+        for (const entry of item.completed ?? []) if (entry.result.timings) entry.result.timings.deliveryMs = performance.now() - entry.at;
       }
-    }
-    if (runtime.pending.length) {
-      runtime.retryTimer ??= setTimeout(() => {
-        runtime.retryTimer = undefined;
-        flushPending();
-      }, 100);
-      runtime.retryTimer.unref?.();
+    } finally {
+      delivering = false;
+      if (runtime.pending.length) {
+        const now = performance.now();
+        const nextAttempt = runtime.pending.reduce((earliest, item) => Math.min(earliest, item.retryAt ?? now), Infinity);
+        const delay = Math.max(0, nextAttempt - now);
+        runtime.retryTimer = setTimeout(() => { runtime.retryTimer = undefined; flushPending(); }, delay);
+        runtime.retryTimer.unref?.();
+      }
     }
   };
   const deliver = (job: BackgroundJob, content: string, completed?: Array<{ result: Result; at: number }>) => {
@@ -305,9 +350,9 @@ export default function omp(pi: ExtensionAPI) {
       if (job.callId !== context.toolCallId && runtime.jobsByCall.get(job.callId) === job) runtime.jobsByCall.delete(job.callId);
       job.callId = context.toolCallId;
       runtime.jobsByCall.set(job.callId, job);
-      job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
+      if (!job.released) job.invalidators.set(context.toolCallId, context.invalidate ?? (() => {}));
     }
-    const moved = runtime.ctx?.mode === "tui" && !!context &&
+    const moved = runtime.ctx?.mode === "tui" && runtime.pinnedUiAvailable && !!context &&
       (options.isPartial || !!(job && !job.released) || !!(context?.toolCallId && calls.has(context.toolCallId)));
     return renderOmpToolResult(
       job ? { ...result, details: { ...result.details, progress: job.progress, results: job.results, animationFrame: job.animationFrame } } : result,
@@ -391,7 +436,8 @@ export default function omp(pi: ExtensionAPI) {
   };
 
   function status(ctx?: ExtensionContext) {
-    ctx?.ui.setStatus("omp", `OMP:${role}${mainTokenRate !== undefined ? ` · ${formatTokenRate(mainTokenRate)}` : ""}`);
+    try { ctx?.ui.setStatus("omp", `OMP:${role}${mainTokenRate !== undefined ? ` · ${formatTokenRate(mainTokenRate)}` : ""}`); }
+    catch { /* A stale UI must not interrupt session or worker lifecycle events. */ }
   }
 
   const resetMainThroughput = () => {
@@ -508,25 +554,27 @@ export default function omp(pi: ExtensionAPI) {
     runtime.pending.length = 0;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
-    runtime.session++;
+    const session = ++runtime.session;
     await clearing;
+    if (session !== runtime.session) return;
     bindContext(ctx);
     refreshPinned();
     try {
       role = readConfig().defaultAgent;
     } catch (err) {
       role = "orchestrator";
-      ctx.ui.notify(`OMP: failed to read ${configPath()}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+      warn(ctx, `OMP: failed to read ${configPath()}: ${err instanceof Error ? err.message : String(err)}`);
     }
     reconcileTools(role);
     status(ctx);
-    try { await reconcileModels(ctx); }
-    catch (err) { ctx.ui.notify(`OMP: could not update specialist models: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
+    try { await reconcileModels(ctx, () => session === runtime.session); }
+    catch (err) { if (session === runtime.session) warn(ctx, `OMP: could not update specialist models: ${err instanceof Error ? err.message : String(err)}`); }
   });
 
   pi.on("session_shutdown", () => {
     resetMainThroughput();
-    runtime.ctx?.ui.setWidget?.("omp-active", undefined);
+    try { runtime.ctx?.ui.setWidget?.("omp-active", undefined); }
+    catch { /* Continue closing children even if the previous UI was replaced. */ }
     runtime.pi = undefined;
     runtime.ctx = undefined;
     runtime.requestPinnedRender = undefined;

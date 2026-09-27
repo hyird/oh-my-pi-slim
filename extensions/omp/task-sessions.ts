@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -20,15 +20,102 @@ export interface TaskSession {
   finish?: () => void;
 }
 
+function statRevision(file: string): string {
+  try { const stat = fs.statSync(file, { bigint: true }); return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`; }
+  catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw err; }
+}
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
+    : item);
+}
+
+// Pi reads the first context file in this order from the agent directory and
+// each project ancestor. A warm RPC worker has already loaded its prompt.
+const CONTEXT_FILES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+function contextRevision(dir: string): string {
+  for (const name of CONTEXT_FILES) {
+    const file = path.join(dir, name);
+    try {
+      const stat = fs.statSync(file, { bigint: true });
+      if (stat.isFile()) return `${name}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch { /* Pi skips unreadable context candidates and tries the next name. */ }
+  }
+  return "missing";
+}
+
+function projectContextRevision(cwd: string, agentDir: string): string {
+  const revisions = [`${agentDir}:${contextRevision(agentDir)}`];
+  let dir = path.resolve(cwd);
+  while (true) {
+    if (dir !== agentDir) revisions.push(`${dir}:${contextRevision(dir)}`);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return revisions.join("|");
+}
+
+let cachedAuth: { path: string; stamp: string; revision: string; readAt: number } | undefined;
+function authRevision(file: string): string {
+  const stamp = statRevision(file);
+  if (stamp === "missing") return stamp;
+  if (cachedAuth?.path === file && cachedAuth.stamp === stamp && performance.now() - cachedAuth.readAt < 60_000)
+    return cachedAuth.revision;
+  let revision = stamp;
+  try {
+    const data: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (data && typeof data === "object" && !Array.isArray(data))
+      revision = createHash("sha256").update(stableJson(data)).digest("hex");
+  } catch { /* Unreadable or invalid auth must restart the child. */ }
+  cachedAuth = { path: file, stamp, revision, readAt: performance.now() };
+  return revision;
+}
+
+let cachedAccounts: { path: string; stamp: string; revision: string; readAt: number } | undefined;
+function accountsRevision(file: string): string {
+  const stamp = statRevision(file);
+  if (stamp === "missing") return stamp;
+  if (cachedAccounts?.path === file && cachedAccounts.stamp === stamp && performance.now() - cachedAccounts.readAt < 60_000)
+    return cachedAccounts.revision;
+  let raw: string;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw err; }
+  let revision = stamp;
+  try {
+    const data: unknown = JSON.parse(raw);
+    if (data && typeof data === "object" && !Array.isArray(data) &&
+      (data as { version?: unknown }).version === 1 && Array.isArray((data as { accounts?: unknown }).accounts)) {
+      const pool = data as { accounts: unknown[] };
+      const accounts = pool.accounts.map(account => {
+        if (!account || typeof account !== "object" || Array.isArray(account)) throw new Error("Invalid account");
+        const item = account as Record<string, unknown>;
+        if (typeof item.provider !== "string" || typeof item.name !== "string" ||
+          !item.credential || typeof item.credential !== "object" || Array.isArray(item.credential))
+          throw new Error("Invalid account");
+        const { email: _email, name: _name, ...relevant } = item;
+        return relevant;
+      });
+      // Display metadata and JSON key order do not change child authentication.
+      // Restart only for semantic credential or account-pool changes.
+      revision = createHash("sha256").update(stableJson({ ...data, accounts })).digest("hex");
+    }
+  } catch { /* Invalid pools use the file stamp so every replacement restarts the worker. */ }
+  cachedAccounts = { path: file, stamp, revision, readAt: performance.now() };
+  return revision;
+}
+
 /** Revision metadata only; credentials never enter task IDs, prompts or recordings. */
 export function resourceRevision(cwd: string): string {
+  const agentDir = getAgentDir();
+  const accountsPath = path.join(agentDir, "accounts.json");
   return [
-    ...["auth.json", "accounts.json", "models.json", "settings.json"].map(file => path.join(getAgentDir(), file)),
-    path.join(cwd, ".pi", "settings.json"),
-  ].map(file => {
-    try { const stat = fs.statSync(file, { bigint: true }); return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`; }
-    catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw err; }
-  }).join("|");
+    authRevision(path.join(agentDir, "auth.json")),
+    ...["models.json", "settings.json"].map(file => statRevision(path.join(agentDir, file))),
+    statRevision(path.join(cwd, ".pi", "settings.json")),
+    accountsRevision(accountsPath),
+    projectContextRevision(cwd, agentDir),
+  ].join("|");
 }
 
 /** Parent-session-scoped task ownership, with bounded retention of idle processes. */

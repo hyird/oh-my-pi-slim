@@ -11,15 +11,18 @@ let busy = false;
 let message;
 const capture = () => {
   if (!process.env.OMP_TEST_CAPTURE) return;
-  fs.writeFileSync(process.env.OMP_TEST_CAPTURE, JSON.stringify({ args, message, count, pid: process.pid,
+  const target = process.env.OMP_TEST_CAPTURE;
+  const temp = `${target}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify({ args, message, count, pid: process.pid,
     childGuard: process.env.PI_OMP_CHILD, serviceTier: process.env.PI_OMP_SERVICE_TIER,
     mcpMode: process.env.PI_MCP_CONFIG_MODE,
     mcpConfig: args.includes("--mcp-config") ? JSON.parse(fs.readFileSync(option("--mcp-config"), "utf8")) : undefined,
     prompt: fs.readFileSync(option("--append-system-prompt"), "utf8"),
   }));
+  fs.renameSync(temp, target);
 };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const finish = fail => ({ role: "assistant", content: [{ type: "text", text: "Specialist read the task" }], stopReason: fail ? "error" : "stop", errorMessage: fail ? "simulated secret failure" : undefined, usage: {
+const finish = fail => ({ role: "assistant", content: [{ type: "text", text: fail ? "failed provider draft" : "Specialist read the task" }], stopReason: fail ? "error" : process.env.OMP_TEST_LENGTH ? "length" : "stop", errorMessage: fail ? "simulated secret failure" : undefined, usage: {
   input: 4, output: 5, cacheRead: 1, cacheWrite: 0, totalTokens: 10,
   cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
 } });
@@ -56,10 +59,12 @@ input.on("line", async line => {
   if (process.env.OMP_TEST_RETRY) {
     emit({ type: "message_end", message: finish(true) });
     emit({ type: "agent_end", willRetry: true });
+    emit({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 40, errorMessage: "simulated secret failure" });
     await sleep(40);
     emit({ type: "message_start", message: { role: "assistant" } });
   }
   emit({ type: "message_end", message: finish(!!process.env.OMP_TEST_FAIL) });
+  if (process.env.OMP_TEST_RETRY) emit({ type: "auto_retry_end", success: !process.env.OMP_TEST_FAIL, attempt: 1 });
   emit({ type: "agent_end", willRetry: false });
   await sleep(Number(process.env.OMP_TEST_SETTLE_WAIT_MS ?? 0));
   busy = false;

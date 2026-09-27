@@ -113,6 +113,7 @@ export async function runAgent(
   modelOverride?: string | AgentLaunch,
   onActivity?: (snapshot: AgentProgress) => void,
   sessions?: TaskSessions,
+  resourceSnapshot?: string,
 ): Promise<Result> {
   const { agent, task } = assignment;
   if (!isRole(agent) || !task.trim()) throw new Error("A valid agent and nonempty task are required");
@@ -130,7 +131,7 @@ export async function runAgent(
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
   const ownedSessions = sessions ?? new TaskSessions(0, 0);
-  const signature = JSON.stringify([model, thinking, serviceTier, mcpAdapter, prompt, ROLES[agent].tools, resourceRevision(ctx.cwd)]);
+  const signature = JSON.stringify([model, thinking, serviceTier, mcpAdapter, prompt, ROLES[agent].tools, resourceSnapshot ?? resourceRevision(ctx.cwd)]);
   const lease: TaskSession = ownedSessions.claim(assignment, taskScope(ctx), signature);
   const { taskId, runId } = lease;
   const progress: AgentProgress = {
@@ -151,6 +152,7 @@ export async function runAgent(
   let recordingFailed = false;
   let output = "";
   let finalStop = "";
+  let retryFailed = false;
   let streamingText = "";
   let messageStartedAt: number | undefined;
   let completedOutputTokens = 0;
@@ -210,6 +212,20 @@ export async function runAgent(
       catch { recordingFailed = true; throw new Error("Failed to save specialist conversation"); }
       replies.record(event);
       progress.replyText = replies.text();
+      if (event.type === "auto_retry_start") {
+        retryFailed = false;
+        const attempt = Number.isSafeInteger(event.attempt) ? Math.max(0, event.attempt) : 0;
+        const max = Number.isSafeInteger(event.maxAttempts) ? Math.max(0, event.maxAttempts) : 0;
+        const delay = Number.isFinite(event.delayMs) ? Math.max(0, event.delayMs) : 0;
+        report(`Retrying model request ${attempt}/${max} after ${delay >= 1000 ? `${Math.round(delay / 1000)}s` : `${Math.round(delay)}ms`}`);
+        return;
+      }
+      if (event.type === "auto_retry_end") {
+        const retryCancelled = event.finalError === "Retry cancelled";
+        retryFailed = !event.success && !retryCancelled;
+        report(event.success ? "Model request recovered" : retryCancelled ? "Model request retry cancelled" : "Model request failed after retry");
+        return;
+      }
       if (event.type === "message_start" && event.message?.role === "assistant") {
         messageStartedAt = performance.now();
         output = "";
@@ -256,7 +272,7 @@ export async function runAgent(
       finalStop = msg.stopReason;
       const text = msg.content?.filter((part: { type: string }) => part.type === "text").map((part: { text: string }) => part.text).join("\n") ?? "";
       output = text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT)}\n[output truncated]` : text;
-      progress.text = text.slice(-2000);
+      progress.text = msg.stopReason === "error" || msg.stopReason === "aborted" ? "" : text.slice(-2000);
       streamingText = "";
       const u = msg.usage;
       if (u) {
@@ -271,9 +287,10 @@ export async function runAgent(
       messageStartedAt = undefined;
       publish();
     });
-    if (!output || !["stop", "length"].includes(finalStop)) throw new Error("Specialist run failed");
+    if (!output || finalStop !== "stop") throw new Error("Specialist run failed");
     timings.totalMs = performance.now() - started;
-    conversation.finish("done", undefined, { taskId, runId, timings });
+    try { conversation.finish("done", undefined, { taskId, runId, timings }); }
+    catch (err) { recordingFailed = true; throw err; }
     // Release ownership only after settlement and durable recording, before publishing done.
     ownedSessions.release(lease);
     progress.state = "done";
@@ -283,7 +300,9 @@ export async function runAgent(
     await worker?.stop();
     const cancelled = signal?.aborted;
     const failure = cancelled ? "Specialist cancelled" : recordingFailed ? "Failed to save specialist conversation"
+      : finalStop === "length" ? "Specialist response reached the model output limit. Inspect partial work before continuing."
       : err instanceof Error && err.message.includes("interactive input") ? err.message
+      : retryFailed && finalStop === "error" ? "Model request failed after retry. Inspect partial work before continuing."
       : `Specialist run failed${agent === "librarian" ? "; check pi-mcp-adapter and context7/gh_grep eager metadata" : ""}`;
     timings.totalMs = performance.now() - started;
     try { conversation?.finish(cancelled ? "cancelled" : "failed", failure, { taskId, runId, timings }); }
@@ -308,6 +327,8 @@ export async function runAssignments(
   const config = launches || signal?.aborted ? undefined : readConfig();
   const snapshot = config && { config, available: modelOverride ? [] : ctx.modelRegistry.getAvailable() };
   const resolved = new Map<Role, AgentLaunch>();
+  let resourceSnapshot: string | undefined;
+  const batchResources = () => resourceSnapshot ??= resourceRevision(ctx.cwd);
   const launchFor = (agent: Role): AgentLaunch => {
     if (launches) {
       const launch = launches.get(agent);
@@ -351,7 +372,7 @@ export async function runAssignments(
           const important = snapshot.activities !== progress[index].activities || snapshot.state !== progress[index].state;
           progress[index] = snapshot;
           publish(important);
-        }, sessions);
+        }, sessions, batchResources());
       } catch (err) {
         results[index] = {
           agent: item.agent, model: launches?.get(item.agent)?.model ?? resolved.get(item.agent)?.model ?? (typeof modelOverride === "string" ? modelOverride : "inherit"), ok: false, cancelled: signal?.aborted,
@@ -369,7 +390,8 @@ export async function runAssignments(
         progress[index] = Object.freeze(completed);
         publish(true);
       }
-      onComplete?.(results[index], index);
+      try { onComplete?.(results[index], index); }
+      catch { /* A delivery callback must not abandon other running children. */ }
     }));
     return results;
   } finally {

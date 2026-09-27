@@ -3,13 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { initTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { configPath, parseConfig, parseModel, readConfig, updateConfig } from "../extensions/omp/config.ts";
 import { formatResults, queuedProgress, resolveModel, runAgent, runAssignments, type AgentProgress, type Assignment, type Result } from "../extensions/omp/subagents.ts";
 import { getChoices, getSettingsRows, INHERIT, INHERIT_THINKING } from "../extensions/omp/settings-ui.ts";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { renderOmpCall, renderOmpResult, renderOmpToolCall, renderPinnedOmpCard, renderPinnedOmpDetail } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
+import { TaskSessions } from "../extensions/omp/task-sessions.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
 let tmp: string;
@@ -103,6 +104,8 @@ describe("config safety", () => {
     expect(parseConfig({ thinking: { explorer: "high" } }).thinking).toEqual({ explorer: "high" });
     expect(() => parseConfig({ thinking: { council: "off" } })).toThrow("Invalid thinking.council");
     expect(() => parseConfig({ models: { council: "openai-codex/gpt-5.5" } })).toThrow("Invalid models.council");
+    expect(() => parseConfig({ thinking: { orchestrator: "high" } })).toThrow("Invalid thinking.orchestrator");
+    expect(() => parseConfig({ models: { orchestrator: "openai-codex/gpt-5.5" } })).toThrow("Invalid models.orchestrator");
     expect(() => parseConfig({ thinking: { explorer: "ultra" } })).toThrow("Invalid thinking.explorer");
     expect(() => parseConfig({ thinking: { unknown: "high" } })).toThrow("Invalid thinking.unknown");
     expect(() => parseConfig({ thinking: [] })).toThrow("thinking must be an object");
@@ -115,6 +118,13 @@ describe("config safety", () => {
     expect(readConfig().models).toEqual({ explorer: "openai-codex/gpt-5.3-codex-spark", fixer: "openai-codex/gpt-5.5" });
     expect(readConfig().thinking).toEqual({ fixer: "high" });
     expect(fs.readdirSync(tmp)).toEqual(["omp.json"]);
+  });
+  test("saving unchanged settings does not replace the config file", async () => {
+    await updateConfig(config => ({ ...config, defaultAgent: "pi" }));
+    const before = fs.statSync(configPath(), { bigint: true });
+    await updateConfig(config => config);
+    const after = fs.statSync(configPath(), { bigint: true });
+    expect([after.ino, after.mtimeNs, after.ctimeNs]).toEqual([before.ino, before.mtimeNs, before.ctimeNs]);
   });
   test("does not overwrite malformed config", async () => {
     fs.writeFileSync(configPath(), "broken {");
@@ -168,6 +178,23 @@ describe("/omp settings entry point", () => {
     await h.commands.omp.handler("", h.ctx);
     expect(h.notifications.at(-1)).toContain("not enabled or available");
     expect(readConfig().thinking.explorer).toBeUndefined();
+  });
+  test("repairs a stale specialist model even if the warning UI is unavailable", async () => {
+    const h = harness();
+    h.ctx.scopedModels = [{ model: models[1] }];
+    await updateConfig(config => ({ ...config, models: { explorer: "openai-codex/gpt-5.5" } }));
+    h.ctx.ui.notify = () => { throw new Error("stale notification UI"); };
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.3-codex-spark");
+    await updateConfig(config => ({ ...config, models: { explorer: "openai-codex/gpt-5.5" } }));
+    const originalArgv = process.argv[1];
+    process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+    try {
+      const result = await h.tools.omp_delegate.execute("stale-model", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
+      expect(result.details.jobId).toBeString();
+      expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.3-codex-spark");
+      await waitFor(() => h.sentMessages.length === 1);
+    } finally { process.argv[1] = originalArgv; }
   });
   test("TUI selects model then thinking in one role row and saves both together", async () => {
     const h = harness();
@@ -413,6 +440,24 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
   }
 });
 
+test("a completion callback failure does not abandon the remaining specialists", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  try {
+    const completed: number[] = [];
+    const results = await runAssignments(h.ctx, [
+      { agent: "explorer", task: "first" },
+      { agent: "explorer", task: "second" },
+    ], undefined, undefined, undefined, undefined, (_result, index) => {
+      completed.push(index);
+      if (index === 0) throw new Error("UI delivery failed");
+    });
+    expect(results.map(result => result.ok)).toEqual([true, true]);
+    expect(completed.sort()).toEqual([0, 1]);
+  } finally { process.argv[1] = originalArgv; }
+});
+
 test("cancelled queued work finishes every task row without launching children", async () => {
   initTheme();
   const h = harness();
@@ -588,6 +633,50 @@ test("OMP main status shows its own measured token speed and resets for a new tu
   beforeAgent();
   expect(statuses.at(-1)).toBe("OMP:orchestrator");
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+});
+
+test("a session start finishing after shutdown cannot restore its stale UI", async () => {
+  const h = harness();
+  const status = spyOn(h.ctx.ui, "setStatus");
+  const originalClear = TaskSessions.prototype.clear;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let clears = 0;
+  const clear = spyOn(TaskSessions.prototype, "clear").mockImplementation(function (this: TaskSessions) {
+    return ++clears === 1 ? gate.then(() => originalClear.call(this)) : originalClear.call(this);
+  });
+  try {
+    const starting = h.handlers.session_start({ reason: "new" }, h.ctx);
+    expect(clears).toBe(1);
+    await h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+    release();
+    await starting;
+    expect(status).not.toHaveBeenCalled();
+  } finally {
+    release();
+    clear.mockRestore();
+    status.mockRestore();
+  }
+});
+
+test("a closed session cannot repair models after waiting for the config lock", async () => {
+  const h = harness();
+  await updateConfig(config => ({ ...config, models: { ...config.models, oracle: "missing/unavailable" } }));
+  let entered!: () => void;
+  const locked = new Promise<void>(resolve => { entered = resolve; });
+  let unlock!: () => void;
+  const gate = new Promise<void>(resolve => { unlock = resolve; });
+  const blocker = withFileMutationQueue(configPath(), async () => { entered(); await gate; });
+  await locked;
+  try {
+    const starting = h.handlers.session_start({ reason: "new" }, h.ctx);
+    await Bun.sleep(10);
+    await h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+    unlock();
+    await Promise.all([starting, blocker]);
+    expect(readConfig().models.oracle).toBe("missing/unavailable");
+    expect(h.notifications).not.toContainEqual(expect.stringContaining("switched unavailable specialist models"));
+  } finally { unlock(); await blocker; }
 });
 
 test("OMP rendering tracks theme changes and stays within narrow widths", () => {
@@ -1013,16 +1102,73 @@ test("running OMP rows animate like Pi Working and stop after completion", async
   }
 });
 
-test("session shutdown cancels background work without sending a stale result", async () => {
+test("session shutdown cancels background work even when the old UI throws", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
   process.env.OMP_TEST_WAIT_MS = "300";
   try {
+    h.ctx.ui.setStatus = () => { throw new Error("old status UI"); };
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    h.ctx.ui.setWidget = (_key: string, content: unknown) => {
+      if (content === undefined) throw new Error("old widget UI");
+    };
     await h.tools.omp_delegate.execute("background-cancel", { agent: "explorer", task: "inspect" }, undefined, undefined, h.ctx);
-    h.handlers.session_shutdown?.({}, h.ctx);
+    await h.handlers.session_shutdown?.({}, h.ctx);
     await Bun.sleep(100);
     expect(h.sentMessages).toHaveLength(0);
+  } finally {
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
+test("a failed fixed widget falls back to the tool card and still delivers the result", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  h.ctx.ui.setWidget = () => { throw new Error("widget unavailable"); };
+  const theme: any = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text };
+  try {
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    const args = { agent: "explorer", task: "inspect" };
+    const context = { state: {}, toolCallId: "widget-fallback", invalidate: () => {} };
+    h.handlers.tool_execution_start({ toolCallId: context.toolCallId, toolName: "omp_delegate", args }, h.ctx);
+    const tool = h.tools.omp_delegate;
+    const card = tool.renderCall(args, theme, context);
+    expect(card.render(100).join("\n")).toContain("queued · Explorer task");
+    const result = await tool.execute(context.toolCallId, args, undefined, undefined, h.ctx);
+    tool.renderResult(result, { expanded: false, isPartial: true }, theme, context);
+    expect(card.render(100).join("\n")).toContain("Explorer task");
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
+  } finally {
+    process.argv[1] = originalArgv;
+  }
+});
+
+test("tool cards redraw when the fixed widget fails and recovers", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "300";
+  const theme: any = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text };
+  try {
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    const args = { agent: "explorer", task: "inspect" };
+    let invalidations = 0;
+    const context = { state: {}, toolCallId: "widget-transition", invalidate: () => { invalidations++; } };
+    const tool = h.tools.omp_delegate;
+    const result = await tool.execute(context.toolCallId, args, undefined, undefined, h.ctx);
+    tool.renderResult(result, { expanded: false, isPartial: true }, theme, context);
+    expect(tool.renderCall(args, theme, context).render(100)).toEqual([]);
+    h.ctx.ui.setWidget = () => { throw new Error("widget unavailable"); };
+    h.handlers.tool_execution_start({ toolCallId: "probe", toolName: "omp_delegate", args }, h.ctx);
+    expect(invalidations).toBeGreaterThan(0);
+    expect(tool.renderCall(args, theme, context).render(100).join("\n")).toContain("Explorer task");
+    h.ctx.ui.setWidget = () => {};
+    h.handlers.tool_execution_end({ toolCallId: "probe", toolName: "omp_delegate" }, h.ctx);
+    expect(tool.renderCall(args, theme, context).render(100)).toEqual([]);
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_WAIT_MS;
@@ -1162,7 +1308,7 @@ test("specialist failure clears the pinned status and exposes failure state in t
   try {
     process.env.OMP_TEST_FAIL = "1";
     const failed = await h.tools.omp_delegate.execute("failed", { agent: "explorer", task: "simulate failure" }, undefined, undefined, h.ctx);
-    await waitFor(() => h.sentMessages.length === 1);
+    await waitFor(() => h.sentMessages.length === 1, 300);
     expect(h.sentMessages[0].message.content).toContain("Specialist run failed");
     expect(h.sentMessages[0].message.content).not.toContain("simulated failure");
     const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
@@ -1445,7 +1591,18 @@ test("released history is retained without scans during dispatch, animation or r
         scans = spyOn(history!, "values");
       }
       await waitFor(() => h.sentMessages.length === i + 1);
+      if (i === 0) {
+        const context = { state: {}, toolCallId: "history-0", isPartial: false, invalidate: () => {} };
+        tool.renderResult(first, { expanded: false, isPartial: false }, theme, context);
+        expect(history?.get(first.details.jobId)?.invalidators.size).toBe(1);
+      }
       h.handlers.input({ source: "user" });
+      if (i === 0) {
+        expect(history?.get(first.details.jobId)?.invalidators.size).toBe(0);
+        tool.renderResult(first, { expanded: false, isPartial: false }, theme,
+          { state: {}, toolCallId: "history-0", isPartial: false, invalidate: () => {} });
+        expect(history?.get(first.details.jobId)?.invalidators.size).toBe(0);
+      }
       expect(pinned).toBeUndefined();
     }
     expect(history?.size).toBe(12);
@@ -1540,6 +1697,56 @@ test("notification retries reuse a completed result without starting new child w
     await waitFor(() => h.sentMessages.length === 1);
     expect(attempts).toBe(2);
     expect(h.sentMessages[0].message.content.match(/OK fixer/g)).toHaveLength(1);
+    expect(fs.readdirSync(path.join(tmp, "omp", "conversations"))).toHaveLength(1);
+  } finally { process.argv[1] = oldArgv; }
+});
+
+test("a failed notification does not delay another completed task", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  const originalPush = h.sentMessages.push.bind(h.sentMessages);
+  let firstId = "";
+  let firstFailures = 0;
+  let allowFirst = false;
+  h.sentMessages.push = (...items: any[]) => {
+    if (firstId && items[0].message.content.includes(firstId) && !allowFirst) {
+      firstFailures++;
+      throw new Error("first notification unavailable");
+    }
+    return originalPush(...items);
+  };
+  try {
+    const first = await h.tools.omp_delegate.execute("first-delivery", { agent: "fixer", task: "first task" }, undefined, undefined, h.ctx);
+    firstId = first.details.progress[0].taskId;
+    await waitFor(() => firstFailures > 0);
+    const second = await h.tools.omp_delegate.execute("second-delivery", { agent: "fixer", task: "second task" }, undefined, undefined, h.ctx);
+    const secondId = second.details.progress[0].taskId;
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(h.sentMessages[0].message.content).toContain(secondId);
+    allowFirst = true;
+    await waitFor(() => h.sentMessages.length === 2, 150);
+    expect(h.sentMessages[1].message.content).toContain(firstId);
+  } finally { process.argv[1] = oldArgv; }
+});
+
+test("delivery resumes after six failures even when the warning UI is broken", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  let attempts = 0;
+  let warnings = 0;
+  const originalPush = h.sentMessages.push.bind(h.sentMessages);
+  h.sentMessages.push = (...items: any[]) => {
+    if (++attempts <= 6) throw new Error("message transport unavailable");
+    return originalPush(...items);
+  };
+  h.ctx.ui.notify = () => { warnings++; throw new Error("warning UI unavailable"); };
+  try {
+    await h.tools.omp_delegate.execute("failed-delivery", { agent: "fixer", task: "one run" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1, 250);
+    expect(attempts).toBe(7);
+    expect(warnings).toBe(1);
     expect(fs.readdirSync(path.join(tmp, "omp", "conversations"))).toHaveLength(1);
   } finally { process.argv[1] = oldArgv; }
 });

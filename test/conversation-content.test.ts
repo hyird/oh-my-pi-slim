@@ -24,6 +24,19 @@ test("child output cannot inject terminal controls into cards", () => {
   ] } }])).toEqual(["safe reply"]);
 });
 
+test("streamed escape sequences split across deltas never leak their fragments", () => {
+  const events = [
+    { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello \x1b[31" } },
+    { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "mworld" } },
+  ];
+  const replies = new ReplyAccumulator();
+  replies.record(events[0]);
+  expect(replies.text()).toBe("hello ");
+  replies.record(events[1]);
+  expect(replies.text()).toBe("hello world");
+  expect(assistantReplies(events)).toEqual(["hello world"]);
+});
+
 
 test("incremental replies replace drafts, exclude tool data, and remain bounded", () => {
   const replies = new ReplyAccumulator(100);
@@ -38,4 +51,21 @@ test("incremental replies replace drafts, exclude tool data, and remain bounded"
   expect(replies.text()).not.toMatch(/draft|secret|hidden/);
   replies.record({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "next" }] } });
   expect(replies.text()).toBe("final\n\nnext");
+});
+
+test("failed model attempts do not remain in task-card or recorded reply previews", () => {
+  const events = [
+    { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "valid prior work" }] } },
+    { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "failed draft" } },
+    { type: "message_end", message: { role: "assistant", stopReason: "error", content: [{ type: "text", text: "failed provider text" }] } },
+    { type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "recovered result" }] } },
+  ];
+  const replies = new ReplyAccumulator();
+  for (const event of events.slice(0, 2)) replies.record(event);
+  expect(replies.text()).toContain("failed draft");
+  replies.record(events[2]);
+  expect(replies.text()).toBe("valid prior work");
+  replies.record(events[3]);
+  expect(replies.text()).toBe("valid prior work\n\nrecovered result");
+  expect(assistantReplies(events)).toEqual(["valid prior work", "recovered result"]);
 });
