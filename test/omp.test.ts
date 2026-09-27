@@ -13,11 +13,13 @@ import { startConversation } from "../extensions/omp/transcript.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
 let tmp: string;
+const liveHarnesses: Array<{ handlers: Record<string, any>; ctx: any }> = [];
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-"));
   process.env.PI_CODING_AGENT_DIR = tmp;
 });
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all(liveHarnesses.splice(0).map(h => h.handlers.session_shutdown({}, h.ctx)));
   if (savedDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = savedDir;
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -64,7 +66,9 @@ function harness() {
     appendEntry: () => { throw new Error("/omp must not modify session state"); },
   };
   omp(pi);
-  return { ctx, commands, shortcuts, tools, handlers, notifications, sentMessages, selected, modelCalls, branch };
+  const h = { ctx, commands, shortcuts, tools, handlers, notifications, sentMessages, selected, modelCalls, branch };
+  liveHarnesses.push(h);
+  return h;
 }
 
 async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
@@ -658,8 +662,8 @@ test("delegation keeps its completed card fixed until the next user input", asyn
     await waitFor(() => fs.existsSync(capture));
     await waitFor(() => h.sentMessages.length === 1);
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
-    expect(recorded.prompt).toContain("请用中文处理这个任务");
-    expect(recorded.args.at(-1)).toBe("查看 src/index.ts");
+    expect(recorded.message).toContain("请用中文处理这个任务");
+    expect(recorded.message).toEndWith("Assigned task:\n查看 src/index.ts");
     expect(result.usage).toBeUndefined();
     expect(h.sentMessages[0].message.content).toContain("Specialist read the task");
     for (const isExpanded of [false, true]) {
@@ -1127,8 +1131,8 @@ test("council moves all reviewer statuses to the fixed card and clears it on com
     await waitFor(() => fs.existsSync(capture));
     await waitFor(() => h.sentMessages.length === 1);
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
-    expect(recorded.prompt).toContain("请用中文处理这个任务");
-    expect(result.details.progress.map((item: AgentProgress) => item.task)).toContain(recorded.args.at(-1));
+    expect(recorded.message).toContain("请用中文处理这个任务");
+    expect(result.details.progress.map((item: AgentProgress) => item.task).some((task: string) => recorded.message.endsWith(task))).toBe(true);
     expect(result.details.progress.every((item: AgentProgress) => item.task.includes("如何审查方案？"))).toBe(true);
     expect(result.usage).toBeUndefined();
     expect(h.sentMessages[0].message.content).toContain("3/3 reviewers responded");
@@ -1391,12 +1395,8 @@ test("live details reuse assistant previews and markdown components without disk
 test("activity updates still publish immediately after the history reaches its cap", async () => {
   const h = harness();
   const oldArgv = process.argv[1];
-  const script = path.join(tmp, "activities.mjs");
-  fs.writeFileSync(script, `
-    for (let i = 0; i < 35; i++) console.log(JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: "file-" + i } }));
-    console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } }));
-  `);
-  process.argv[1] = script;
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_ACTIVITIES = "1";
   const snapshots: AgentProgress[][] = [];
   try {
     await runAssignments(h.ctx, [{ agent: "explorer", task: "activities" }], undefined, snapshot => snapshots.push(snapshot));
@@ -1405,7 +1405,7 @@ test("activity updates still publish immediately after the history reaches its c
     expect(activities.at(-1)?.activities).toHaveLength(32);
     expect(activities[0].activities).toEqual(["read file-0"]);
     expect(snapshots.at(-1)?.[0].state).toBe("done");
-  } finally { process.argv[1] = oldArgv; }
+  } finally { process.argv[1] = oldArgv; delete process.env.OMP_TEST_ACTIVITIES; }
 });
 
 test("released history is retained without scans during dispatch, animation or rendering", async () => {
@@ -1473,4 +1473,73 @@ test("released history is retained without scans during dispatch, animation or r
     process.argv[1] = oldArgv;
     if (oldWait === undefined) delete process.env.OMP_TEST_WAIT_MS; else process.env.OMP_TEST_WAIT_MS = oldWait;
   }
+});
+
+test("fast results unblock the parent while a sibling remains running, without duplicate final delivery", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  try {
+    const dispatched = await h.tools.omp_delegate.execute("incremental", { tasks: [
+      { agent: "explorer", task: "[delay=0] fast map" },
+      { agent: "librarian", task: "[delay=400] slow research" },
+    ] }, undefined, undefined, h.ctx);
+    expect(dispatched.content[0].text).toContain("taskId=");
+    await waitFor(() => h.sentMessages.length >= 1);
+    expect(h.sentMessages[0].message.content).toContain("1/2 tasks completed; 1 OMP tasks still running");
+    expect(h.sentMessages[0].message.content).toContain("OK explorer");
+    expect(h.sentMessages[0].message.content).not.toContain("OK librarian");
+    await waitFor(() => h.sentMessages.length === 2);
+    expect(h.sentMessages[1].message.content).toContain("2/2 tasks completed; 0 OMP tasks still running");
+    expect(h.sentMessages[1].message.content).toContain("OK librarian");
+    expect(h.sentMessages[1].message.content).not.toContain("OK explorer");
+    await Bun.sleep(80);
+    expect(h.sentMessages).toHaveLength(2);
+  } finally { process.argv[1] = oldArgv; }
+});
+
+test("delegate taskId continues the same worker and rejects reuse after session replacement", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  const oldCapture = process.env.OMP_TEST_CAPTURE;
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.env.OMP_TEST_CAPTURE = path.join(tmp, "continue.json");
+  try {
+    const result = await h.tools.omp_delegate.execute("first", { agent: "fixer", task: "first edit" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    const taskId = result.details.progress[0].taskId;
+    const initial = JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE, "utf8"));
+    h.branch.push({ type: "message", message: { role: "user", content: "Please continue in English" } });
+    await h.tools.omp_delegate.execute("continued", { agent: "fixer", taskId, task: "follow-up" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 2);
+    const continued = JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE, "utf8"));
+    expect(continued.pid).toBe(initial.pid);
+    expect(continued.count).toBe(2);
+    expect(continued.message).toContain("Please continue in English");
+    expect(continued.prompt).not.toContain("请用中文处理这个任务");
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    await expect(h.tools.omp_delegate.execute("stale", { agent: "fixer", taskId, task: "stale" }, undefined, undefined, h.ctx)).rejects.toThrow("Unknown taskId");
+  } finally {
+    process.argv[1] = oldArgv;
+    if (oldCapture === undefined) delete process.env.OMP_TEST_CAPTURE; else process.env.OMP_TEST_CAPTURE = oldCapture;
+  }
+});
+
+test("notification retries reuse a completed result without starting new child work", async () => {
+  const h = harness();
+  const oldArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  let attempts = 0;
+  const originalPush = h.sentMessages.push.bind(h.sentMessages);
+  h.sentMessages.push = (...items: any[]) => {
+    if (++attempts === 1) throw new Error("temporary transport failure");
+    return originalPush(...items);
+  };
+  try {
+    await h.tools.omp_delegate.execute("retry-delivery", { agent: "fixer", task: "only one run" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(attempts).toBe(2);
+    expect(h.sentMessages[0].message.content.match(/OK fixer/g)).toHaveLength(1);
+    expect(fs.readdirSync(path.join(tmp, "omp", "conversations"))).toHaveLength(1);
+  } finally { process.argv[1] = oldArgv; }
 });

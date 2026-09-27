@@ -22,9 +22,26 @@ afterEach(() => {
 
 const message = (text: string) => ({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
 const fileFor = (id: string) => path.join(root, "omp", "conversations", `${id}.jsonl`);
-function fake(events: any[], exit = 0) {
+function fake(events: any[], exit = 0, wait = 0) {
   const file = path.join(root, "fake.mjs");
-  fs.writeFileSync(file, `for (const event of ${JSON.stringify(events)}) { console.log(JSON.stringify(event)); await new Promise(r => setTimeout(r, 30)); } process.exit(${exit});`);
+  fs.writeFileSync(file, `
+    import { createInterface } from "node:readline";
+    const emit = event => console.log(JSON.stringify(event));
+    const input = createInterface({ input: process.stdin });
+    let busy = false;
+    input.on("line", async line => {
+      const cmd = JSON.parse(line);
+      emit({ type: "response", id: cmd.id, command: cmd.type, success: true, data: { isStreaming: busy, isCompacting: false, pendingMessageCount: 0 } });
+      if (cmd.type !== "prompt") return;
+      busy = true;
+      for (const event of ${JSON.stringify(events)}) { emit(event); await new Promise(r => setTimeout(r, 30)); }
+      if (${exit}) process.exit(${exit});
+      await new Promise(r => setTimeout(r, ${wait}));
+      busy = false;
+      emit({ type: "agent_settled" });
+    });
+    input.on("close", () => process.exit(0));
+  `);
   process.argv[1] = file;
 }
 async function waitUntil(check: () => boolean) {
@@ -51,7 +68,7 @@ test("child JSON events and completion remain in one private recording", async (
   expect(conversation.meta.state).toBe("done");
   expect(conversation.meta.task).toBe("sample");
   expect(conversation.meta.finishedAt).toBeNumber();
-  expect(conversation.events).toEqual(events);
+  expect(conversation.events).toEqual([...events, { type: "agent_settled" }]);
   expect(fs.readFileSync(fileFor(id), "utf8")).toContain(long);
   expect(fs.readdirSync(path.dirname(fileFor(id)))).toEqual([`${id}.jsonl`]);
   if (process.platform !== "win32") {
@@ -131,9 +148,7 @@ test("timer write failures notify the owner and remain observable at finish", as
 });
 
 test("a background recording failure stops the child and reports failure", async () => {
-  const script = path.join(root, "slow.mjs");
-  fs.writeFileSync(script, `console.log(${JSON.stringify(JSON.stringify(message("partial")))}); await new Promise(r => setTimeout(r, 5000));`);
-  process.argv[1] = script;
+  fake([message("partial")], 0, 5000);
   const originalWrite = fs.writeSync;
   let writes = 0;
   const write = spyOn(fs, "writeSync").mockImplementation(((...args: any[]) => {

@@ -24,6 +24,6 @@ export function prepareAssignments(
     ? "Use the language of the latest user message below for your replies. It is a language reference only, not an additional task; follow the assigned task. Do not infer the reply language from these role instructions or Council perspective headings.\nLatest user message (JSON string): " + JSON.stringify(sample)
     : "Use the language of the assigned task for your replies.";
   return {
-    items: items.map((item) => ({ ...item, prompt: ROLES[item.agent].prompt + "\n\n" + guidance })),
+    items: items.map((item) => ({ ...item, prompt: ROLES[item.agent].prompt, instructions: guidance })),
   };
 }

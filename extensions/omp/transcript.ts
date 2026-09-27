@@ -106,14 +106,14 @@ export function startConversation(agent: Role, task: string, model: string, onEr
         timer.unref?.();
       }
     },
-    finish(state: "done" | "failed" | "cancelled", error?: string) {
+    finish(state: "done" | "failed" | "cancelled", error?: string, diagnostics?: Record<string, unknown>) {
       if (finished) return;
       finished = true;
       meta.state = state;
       meta.finishedAt = Date.now();
       if (error) meta.error = error;
       try {
-        enqueue({ type: "completion", state, finishedAt: meta.finishedAt, ...(error ? { error } : {}) });
+        enqueue({ type: "completion", state, finishedAt: meta.finishedAt, ...(error ? { error } : {}), ...diagnostics });
         flush();
       } finally { fs.closeSync(fd); }
     },

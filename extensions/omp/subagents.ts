@@ -1,5 +1,3 @@
-import { spawn } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,12 +9,17 @@ import { startConversation } from "./transcript.ts";
 import { ReplyAccumulator } from "./conversation-content.ts";
 import { supportsServiceTier, type ServiceTier } from "./service-tier.ts";
 import { availableChildModels } from "./models.ts";
+import { RpcWorker } from "./rpc-worker.ts";
+import { TaskSessions, resourceRevision, type TaskSession } from "./task-sessions.ts";
 
-export interface Assignment { agent: Role; task: string; prompt?: string }
-export interface Result { agent: Role; model: string; ok: boolean; output: string; usage: Usage; cancelled?: boolean }
+export interface Assignment { agent: Role; task: string; prompt?: string; instructions?: string; taskId?: string }
+export interface Timings { startupMs: number; firstEventMs?: number; generationMs: number; toolMs: number; totalMs: number; deliveryMs?: number }
+export interface Result { agent: Role; model: string; ok: boolean; output: string; usage: Usage; cancelled?: boolean; taskId?: string; runId?: string; timings?: Timings }
 export interface AgentProgress {
   agent: Role;
   task: string;
+  taskId?: string;
+  runId?: string;
   conversationId?: string;
   /** Incremental, bounded assistant-only preview; present even before the first reply. */
   replyText?: string;
@@ -32,8 +35,8 @@ export interface OmpDetails { progress: AgentProgress[]; results?: Result[]; job
 const MAX_OUTPUT = 20_000;
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
-  return items.map(({ agent, task }) => Object.freeze({
-    agent, task, state: "queued", activity: "Waiting to run", text: "", activities: Object.freeze([]),
+  return items.map(({ agent, task, taskId }) => Object.freeze({
+    agent, task, taskId, state: "queued", activity: "Waiting to run", text: "", activities: Object.freeze([]),
   }));
 }
 
@@ -102,17 +105,19 @@ function invocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-// Keep each specialist in a separate process/context. Allow trusted personal extensions
-// (including custom model providers), but suppress OMP recursively via PI_OMP_CHILD.
-// Never grant project trust that the parent did not already have.
+export const taskScope = (ctx: ExtensionContext) => JSON.stringify([path.resolve(ctx.cwd), ctx.isProjectTrusted()]);
+
+// Keep provider extensions and trust enforcement inside an isolated, reusable Pi RPC process.
 export async function runAgent(
   ctx: ExtensionContext, assignment: Assignment, signal?: AbortSignal,
   modelOverride?: string | AgentLaunch,
   onActivity?: (snapshot: AgentProgress) => void,
+  sessions?: TaskSessions,
 ): Promise<Result> {
   const { agent, task } = assignment;
   if (!isRole(agent) || !task.trim()) throw new Error("A valid agent and nonempty task are required");
   if (signal?.aborted) throw new Error("Specialist tasks cancelled");
+  const started = performance.now();
   const config = typeof modelOverride === "object" ? undefined : readConfig();
   const model = typeof modelOverride === "object" ? modelOverride.model : modelOverride ?? resolveModel(ctx, agent, {
     config: config!, available: ctx.modelRegistry.getAvailable(),
@@ -121,195 +126,183 @@ export async function runAgent(
     : agent === "council" ? ctx.thinkingLevel : config!.thinking[agent] ?? ctx.thinkingLevel;
   const tier = typeof modelOverride === "object" ? modelOverride.serviceTier : config?.serviceTier?.[agent];
   const serviceTier = agent !== "council" && supportsServiceTier(parseModel(model)?.provider) ? tier ?? "default" : undefined;
-  const cwd = ctx.cwd;
+  const mcpAdapter = typeof modelOverride === "object" && modelOverride.mcpAdapter;
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
-  const progress: AgentProgress = { agent, task, model, state: "running", activity: "Starting specialist", text: "", replyText: "", activities: Object.freeze([]) };
-  const publish = () => {
-    // A renderer or UI subscriber must never prevent the child process from settling.
-    try { onActivity?.(Object.freeze({ ...progress })); } catch { /* presentation is best-effort */ }
+  const ownedSessions = sessions ?? new TaskSessions(0, 0);
+  const signature = JSON.stringify([model, thinking, serviceTier, mcpAdapter, prompt, ROLES[agent].tools, resourceRevision(ctx.cwd)]);
+  const lease: TaskSession = ownedSessions.claim(assignment, taskScope(ctx), signature);
+  const { taskId, runId } = lease;
+  const progress: AgentProgress = {
+    agent, task, taskId, runId, model, state: "running",
+    activity: "Starting specialist", text: "", replyText: "", activities: Object.freeze([]),
   };
+  const publish = () => { try { onActivity?.(Object.freeze({ ...progress })); } catch { /* presentation is best-effort */ } };
   const report = (activity: string) => {
     progress.activity = activity;
     progress.activities = Object.freeze([...progress.activities.slice(-31), activity]);
     publish();
   };
   const replies = new ReplyAccumulator();
-  let failRecording: (() => void) | undefined;
-  const conversation = startConversation(agent, task, model, () => failRecording?.());
-  progress.conversationId = conversation.id;
-  publish();
-  let settled = false;
-  let tmpDir: string | undefined;
+  const usage = emptyUsage();
+  const timings: Timings = { startupMs: 0, generationMs: 0, toolMs: 0, totalMs: 0 };
+  let worker: RpcWorker | undefined;
+  let conversation: ReturnType<typeof startConversation> | undefined;
+  let recordingFailed = false;
+  let output = "";
+  let finalStop = "";
+  let streamingText = "";
+  let messageStartedAt: number | undefined;
+  let completedOutputTokens = 0;
+  const toolStarts = new Map<string, number>();
+  const updateThroughput = (partialOutput = 0, partialMs = 0) => {
+    const tokens = completedOutputTokens + partialOutput;
+    const duration = timings.generationMs + partialMs;
+    progress.tokensPerSecond = tokens > 0 && duration > 0 ? tokens * 1000 / duration : undefined;
+  };
   try {
-    tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-omp-"));
-    const promptPath = path.join(tmpDir, "role.md");
-    await fs.promises.writeFile(promptPath, agent === "librarian" ? `${prompt}\nOnly mcp__context7 and mcp__gh_grep are permitted MCP tools. If either namespace is missing, report that the pi-mcp-adapter must be loaded and its eager metadata initialized; do not use mcp or mcpScript.\n` : prompt, { mode: 0o600 });
-    let tools: string[] = [...ROLES[agent].tools];
-    // The adapter flag is unavailable in installations without pi-mcp-adapter.
-    const mcpPath = agent === "librarian" || (typeof modelOverride === "object" && modelOverride.mcpAdapter)
-      ? path.join(tmpDir, "mcp.json") : undefined;
-    if (mcpPath) {
-      const mcpConfig = librarianMcpConfig();
-      await fs.promises.writeFile(mcpPath, JSON.stringify(agent === "librarian" ? mcpConfig : { ...mcpConfig, mcpServers: {} }), { mode: 0o600, flag: "wx" });
-    }
-    if (agent === "librarian") {
-      // Pi ignores unknown --tools names. Require the adapter, and never fall back
-      // to the global mcp/mcpScript gateways if namespace metadata is unavailable.
-      tools = [...tools, "mcp__context7", "mcp__gh_grep"];
-    }
-    const args = [
-      "--mode", "json", "--print", "--no-session", "--no-themes", "--no-prompt-templates", projectTrusted ? "--approve" : "--no-approve",
-      "--model", model, ...(thinking ? ["--thinking", thinking] : []), "--tools", tools.join(","),
-      ...(mcpPath ? ["--mcp-config", mcpPath] : []),
-      // End flag parsing; a leading @ is treated as a file even after --, so add a newline.
-      "--append-system-prompt", promptPath, "--", task.startsWith("@") ? `\n${task}` : task,
-    ];
-    const child = invocation(args);
-    return await new Promise<Result>((resolve) => {
-      let output = "";
-      let error = "";
-      let buffer = "";
-      const decoder = new StringDecoder("utf8");
-      let aborted = false;
-      let exited = false;
-      const usage = emptyUsage();
-      let streamingText = "";
-      let messageStartedAt: number | undefined;
-      let completedOutputTokens = 0;
-      let completedGenerationMs = 0;
-      const updateThroughput = (partialOutput = 0, partialMs = 0) => {
-        const output = completedOutputTokens + partialOutput;
-        const duration = completedGenerationMs + partialMs;
-        progress.tokensPerSecond = output > 0 && duration > 0 ? output * 1000 / duration : undefined;
-      };
-      if (signal?.aborted) throw new Error("Specialist tasks cancelled");
-      const proc = spawn(child.command, child.args, {
-        cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PI_OMP_CHILD: "1", PI_OMP_SERVICE_TIER: serviceTier, PI_MCP_CONFIG_MODE: mcpPath ? "exclusive" : undefined, MCP_DIRECT_TOOLS: undefined },
-      });
-      const recordFailed = () => {
-        error = "Failed to save specialist conversation";
-        proc.kill();
-      };
-      failRecording = recordFailed;
-      const onAbort = () => {
-        aborted = true;
-        proc.kill();
-      };
-      if (signal?.aborted) onAbort();
-      else signal?.addEventListener("abort", onAbort, { once: true });
-      const consume = (line: string) => {
-        let event: any;
-        try { event = JSON.parse(line); } catch { return; }
-        try { conversation.record(event); }
-        catch {
-          recordFailed();
-          return;
+    conversation = startConversation(agent, task, model, () => { recordingFailed = true; void worker?.stop(); });
+    progress.conversationId = conversation.id;
+    publish();
+    worker = await ownedSessions.worker(lease, async (sessionDir, sessionFile) => {
+      const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-omp-"));
+      const cleanup = () => fs.promises.rm(tmpDir, { recursive: true, force: true });
+      try {
+        const promptPath = path.join(tmpDir, "role.md");
+        await fs.promises.writeFile(promptPath, agent === "librarian" ? `${prompt}\nOnly mcp__context7 and mcp__gh_grep are permitted MCP tools. If either namespace is missing, report that the pi-mcp-adapter must be loaded and its eager metadata initialized; do not use mcp or mcpScript.\n` : prompt, { mode: 0o600 });
+        const tools: string[] = [...ROLES[agent].tools];
+        const mcpPath = agent === "librarian" || mcpAdapter ? path.join(tmpDir, "mcp.json") : undefined;
+        if (mcpPath) {
+          const mcpConfig = librarianMcpConfig();
+          await fs.promises.writeFile(mcpPath, JSON.stringify(agent === "librarian" ? mcpConfig : { ...mcpConfig, mcpServers: {} }), { mode: 0o600, flag: "wx" });
         }
-        try {
-          replies.record(event);
-          progress.replyText = replies.text();
-          if (event.type === "message_start" && event.message?.role === "assistant") {
-            messageStartedAt = performance.now();
-            return;
-          }
-          if (event.type === "message_update") {
-            const update = event.assistantMessageEvent;
-            messageStartedAt ??= performance.now();
-            let changed = false;
-            const partialOutput = event.usage?.output ?? update?.partial?.usage?.output;
-            if (Number.isFinite(partialOutput) && partialOutput > 0) {
-              updateThroughput(partialOutput, Math.max(1, performance.now() - messageStartedAt));
-              changed = true;
-            }
-            if (update?.type === "text_delta" && typeof update.delta === "string") {
-              streamingText = (streamingText + update.delta).slice(-2000);
-              progress.text = streamingText;
-              changed = true;
-            } else if (update?.type === "text_end" && typeof update.content === "string") {
-              progress.text = update.content.slice(-2000);
-              changed = true;
-            }
-            if (changed) publish();
-            return;
-          }
-          if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
-            const tool = event.toolName.slice(0, 50);
-            const args = event.args && typeof event.args === "object" ? event.args : {};
-            const location = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : "";
-            // Shell commands can contain credentials; show tool use but never dump command arguments.
-            report(location ? `${tool} ${location.slice(0, 100)}` : `${tool} running`);
-            return;
-          }
-          if (event.type === "tool_execution_end" && typeof event.toolName === "string") {
-            report(`${event.toolName.slice(0, 50)} ${event.isError ? "failed" : "completed"}`);
-            return;
-          }
-          if (event.type !== "message_end" || event.message?.role !== "assistant") return;
-          const msg = event.message;
-          if (msg.stopReason === "error" || msg.stopReason === "aborted") error = msg.errorMessage || msg.stopReason;
-          const text = msg.content?.filter((part: { type: string }) => part.type === "text")
-            .map((part: { text: string }) => part.text).join("\n");
-          if (text) {
-            output = text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT)}\n[output truncated]` : text;
-            progress.text = text.slice(-2000);
-          }
-          streamingText = "";
-          const u = msg.usage;
-          if (u) {
-            for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) usage[key] += u[key] ?? 0;
-            for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) usage.cost[key] += u.cost?.[key] ?? 0;
-            if (Number.isFinite(u.output) && u.output > 0 && messageStartedAt !== undefined) {
-              completedOutputTokens += u.output;
-              completedGenerationMs += Math.max(1, performance.now() - messageStartedAt);
-              updateThroughput();
-            }
-          }
-          messageStartedAt = undefined;
-          publish();
-        } catch { /* Ignore non-JSON lines from unexpected provider output. */ }
-      };
-      proc.stdout?.on("data", (chunk: Buffer) => {
-        buffer += decoder.write(chunk);
-        let end: number;
-        while ((end = buffer.indexOf("\n")) !== -1) {
-          consume(buffer.slice(0, end));
-          buffer = buffer.slice(end + 1);
-        }
-      });
-      // Drain stderr but do not relay it: provider diagnostics can include credentials.
-      proc.stderr?.resume();
-      proc.on("error", () => { error = "Failed to launch specialist process"; });
-      proc.on("close", (code) => {
-        if (exited) return;
-        exited = true;
-        signal?.removeEventListener("abort", onAbort);
-        buffer += decoder.end();
-        if (buffer) consume(buffer);
-        let ok = !aborted && code === 0 && !error && !!output;
-        const failure = aborted ? "Specialist cancelled" : `Specialist run failed (exit code ${code ?? "unknown"})${agent === "librarian" ? "; if MCP namespaces are missing, load pi-mcp-adapter and initialize context7/gh_grep eager metadata (never enable the global gateway)" : ""}`;
-        progress.state = ok ? "done" : aborted ? "cancelled" : "failed";
-        // Raw stderr and provider errors may contain credentials. JSON events remain in the private recording.
-        try { conversation.finish(ok ? "done" : aborted ? "cancelled" : "failed", ok ? undefined : failure); }
-        catch { error = "Failed to save specialist conversation"; progress.state = aborted ? "cancelled" : "failed"; ok = false; }
-        settled = true;
-        report(ok ? "Work completed" : aborted ? "Cancelled" : "Run failed");
-        resolve({ agent, model, ok: ok && !error, cancelled: aborted, output: ok && !error ? output : (error === "Failed to save specialist conversation" ? error : failure), usage });
-      });
+        if (agent === "librarian") tools.push("mcp__context7", "mcp__gh_grep");
+        const args = [
+          "--mode", "rpc", "--session-dir", sessionDir,
+          ...(sessionFile ? ["--session", sessionFile] : ["--session-id", lease.taskId]),
+          "--no-themes", "--no-prompt-templates",
+          // Read-only scouting needs no skill catalog. Explicit task references can still be read.
+          ...(["explorer", "librarian"].includes(agent) ? ["--no-skills"] : []),
+          projectTrusted ? "--approve" : "--no-approve",
+          "--model", model, ...(thinking ? ["--thinking", thinking] : []), "--tools", tools.join(","),
+          ...(mcpPath ? ["--mcp-config", mcpPath] : []), "--append-system-prompt", promptPath,
+        ];
+        if (signal?.aborted) throw new Error("Specialist cancelled");
+        const child = invocation(args);
+        return new RpcWorker(child.command, child.args, ctx.cwd, {
+          ...process.env, PI_OMP_CHILD: "1", PI_OMP_SERVICE_TIER: serviceTier,
+          PI_MCP_CONFIG_MODE: mcpPath ? "exclusive" : undefined, MCP_DIRECT_TOOLS: undefined,
+        }, cleanup);
+      } catch (err) { await cleanup(); throw err; }
     });
+    const abortStartup = () => { void worker!.stop(); };
+    signal?.addEventListener("abort", abortStartup, { once: true });
+    try {
+      if (signal?.aborted) { abortStartup(); throw new Error("Specialist cancelled"); }
+      await worker.ready;
+    } finally { signal?.removeEventListener("abort", abortStartup); }
+    timings.startupMs = performance.now() - started;
+    // Dynamic task/language guidance stays outside the stable role system prompt.
+    // A leading slash in task text must not execute a Pi slash/skill command.
+    const message = `${assignment.instructions ? assignment.instructions + "\n\n" : ""}Assigned task:\n${task}`;
+    await worker.prompt(message, signal, (event) => {
+      try { conversation!.record(event); }
+      catch { recordingFailed = true; throw new Error("Failed to save specialist conversation"); }
+      replies.record(event);
+      progress.replyText = replies.text();
+      if (event.type === "message_start" && event.message?.role === "assistant") {
+        messageStartedAt = performance.now();
+        output = "";
+        finalStop = "";
+        return;
+      }
+      if (event.type === "message_update") {
+        timings.firstEventMs ??= performance.now() - started;
+        const update = event.assistantMessageEvent;
+        messageStartedAt ??= performance.now();
+        let changed = false;
+        const partialOutput = event.usage?.output ?? update?.partial?.usage?.output;
+        if (Number.isFinite(partialOutput) && partialOutput > 0) {
+          updateThroughput(partialOutput, Math.max(1, performance.now() - messageStartedAt));
+          changed = true;
+        }
+        if (update?.type === "text_delta" && typeof update.delta === "string") {
+          streamingText = (streamingText + update.delta).slice(-2000);
+          progress.text = streamingText;
+          changed = true;
+        } else if (update?.type === "text_end" && typeof update.content === "string") {
+          progress.text = update.content.slice(-2000);
+          changed = true;
+        }
+        if (changed) publish();
+        return;
+      }
+      if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+        toolStarts.set(event.toolCallId ?? event.toolName, performance.now());
+        const args = event.args && typeof event.args === "object" ? event.args : {};
+        const location = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : "";
+        report(location ? `${event.toolName.slice(0, 50)} ${location.slice(0, 100)}` : `${event.toolName.slice(0, 50)} running`);
+        return;
+      }
+      if (event.type === "tool_execution_end" && typeof event.toolName === "string") {
+        const key = event.toolCallId ?? event.toolName;
+        const start = toolStarts.get(key);
+        if (start !== undefined) { timings.toolMs += performance.now() - start; toolStarts.delete(key); }
+        report(`${event.toolName.slice(0, 50)} ${event.isError ? "failed" : "completed"}`);
+        return;
+      }
+      if (event.type !== "message_end" || event.message?.role !== "assistant") return;
+      const msg = event.message;
+      finalStop = msg.stopReason;
+      const text = msg.content?.filter((part: { type: string }) => part.type === "text").map((part: { text: string }) => part.text).join("\n") ?? "";
+      output = text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT)}\n[output truncated]` : text;
+      progress.text = text.slice(-2000);
+      streamingText = "";
+      const u = msg.usage;
+      if (u) {
+        for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) usage[key] += u[key] ?? 0;
+        for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) usage.cost[key] += u.cost?.[key] ?? 0;
+        if (Number.isFinite(u.output) && u.output > 0 && messageStartedAt !== undefined) {
+          completedOutputTokens += u.output;
+          timings.generationMs += Math.max(1, performance.now() - messageStartedAt);
+          updateThroughput();
+        }
+      }
+      messageStartedAt = undefined;
+      publish();
+    });
+    if (!output || !["stop", "length"].includes(finalStop)) throw new Error("Specialist run failed");
+    timings.totalMs = performance.now() - started;
+    conversation.finish("done", undefined, { taskId, runId, timings });
+    // Release ownership only after settlement and durable recording, before publishing done.
+    ownedSessions.release(lease);
+    progress.state = "done";
+    report("Work completed");
+    return { agent, model, ok: true, output, usage, taskId, runId, timings };
   } catch (err) {
-    if (!settled) conversation.finish(signal?.aborted ? "cancelled" : "failed", err instanceof Error ? err.message : String(err));
-    throw err;
+    await worker?.stop();
+    const cancelled = signal?.aborted;
+    const failure = cancelled ? "Specialist cancelled" : recordingFailed ? "Failed to save specialist conversation"
+      : err instanceof Error && err.message.includes("interactive input") ? err.message
+      : `Specialist run failed${agent === "librarian" ? "; check pi-mcp-adapter and context7/gh_grep eager metadata" : ""}`;
+    timings.totalMs = performance.now() - started;
+    try { conversation?.finish(cancelled ? "cancelled" : "failed", failure, { taskId, runId, timings }); }
+    catch { recordingFailed = true; }
+    ownedSessions.release(lease);
+    progress.state = cancelled ? "cancelled" : "failed";
+    report(cancelled ? "Cancelled" : "Run failed");
+    return { agent, model, ok: false, cancelled, output: recordingFailed ? "Failed to save specialist conversation" : failure, usage,
+      taskId, runId, timings };
   } finally {
-    if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true });
+    if (!sessions) await ownedSessions.clear();
   }
 }
-
 export async function runAssignments(
   ctx: ExtensionContext, items: Assignment[], signal?: AbortSignal,
   onProgress?: (snapshot: AgentProgress[]) => void,
   modelOverride?: string | ReadonlyMap<Role, AgentLaunch>,
+  sessions?: TaskSessions,
+  onComplete?: (result: Result, index: number) => void,
 ): Promise<Result[]> {
   const launches = typeof modelOverride === "object" ? modelOverride : undefined;
   const config = launches || signal?.aborted ? undefined : readConfig();
@@ -358,7 +351,7 @@ export async function runAssignments(
           const important = snapshot.activities !== progress[index].activities || snapshot.state !== progress[index].state;
           progress[index] = snapshot;
           publish(important);
-        });
+        }, sessions);
       } catch (err) {
         results[index] = {
           agent: item.agent, model: launches?.get(item.agent)?.model ?? resolved.get(item.agent)?.model ?? (typeof modelOverride === "string" ? modelOverride : "inherit"), ok: false, cancelled: signal?.aborted,
@@ -376,6 +369,7 @@ export async function runAssignments(
         progress[index] = Object.freeze(completed);
         publish(true);
       }
+      onComplete?.(results[index], index);
     }));
     return results;
   } finally {
@@ -384,5 +378,5 @@ export async function runAssignments(
 }
 
 export function formatResults(results: Result[]): string {
-  return results.map((result) => `${result.ok ? "OK" : result.cancelled ? "CANCELLED" : "FAILED"} ${result.agent} [${result.model}]\n${result.output}`).join("\n\n---\n\n");
+  return results.map((result) => `${result.ok ? "OK" : result.cancelled ? "CANCELLED" : "FAILED"} ${result.agent} [${result.model}]${result.taskId ? ` taskId=${result.taskId} runId=${result.runId}` : ""}\n${result.output}`).join("\n\n---\n\n");
 }

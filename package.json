@@ -9,11 +9,11 @@
   "homepage": "https://github.com/hyird/oh-my-pi-slim#readme",
   "files": ["extensions/", "docs/", "README.md", "LICENSE"],
   "pi": {
-    "extensions": ["./extensions/omp/index.ts"]
+    "extensions": ["./extensions/omp/entry.ts"]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
+    "@earendil-works/pi-tui": ">=0.87.1",
     "typebox": "*"
   },
   "devDependencies": {

@@ -42,15 +42,15 @@ describe("language guidance without translation", () => {
       expect(f.calls).toEqual([]);
       expect(prepared.items.map(item => item.task)).toEqual(items.map(item => item.task));
       expect(prepared.items[0].prompt).toContain(ROLES.fixer.prompt);
-      expect(prepared.items[0].prompt).toContain(JSON.stringify(latest));
-      expect(prepared.items[0].prompt).toContain("Use the language of the latest user message");
+      expect(prepared.items[0].instructions).toContain(JSON.stringify(latest));
+      expect(prepared.items[0].instructions).toContain("Use the language of the latest user message");
       expect(items[0].prompt).toBeUndefined();
     });
   }
   test("uses current branch user text, skips image-only messages, and bounds the reference", () => {
     const f = fixture("ignored");
     f.ctx.sessionManager.getBranch = () => [message("earlier"), message([{ type: "image" }, { type: "text", text: "x".repeat(5000) }]), message([{ type: "image" }]), { type: "custom_message", content: "English injected task" }];
-    const prompt = prepareAssignments(f.ctx, [{ agent: "explorer", task: "search" }]).items[0].prompt!;
+    const prompt = prepareAssignments(f.ctx, [{ agent: "explorer", task: "search" }]).items[0].instructions!;
     expect(prompt).toContain(JSON.stringify("x".repeat(4000)));
     expect(prompt).not.toContain("x".repeat(4001));
     expect(prompt).not.toContain("English injected task");
@@ -61,8 +61,8 @@ describe("language guidance without translation", () => {
     const prepared = prepareAssignments(f.ctx, items);
     expect(prepared.items.map(item => item.task)).toEqual(items.map(item => item.task));
     for (const item of prepared.items) {
-      expect(item.prompt).toContain("请审查方案");
-      expect(item.prompt).toContain("Council perspective headings");
+      expect(item.instructions).toContain("请审查方案");
+      expect(item.instructions).toContain("Council perspective headings");
     }
     expect(f.calls).toEqual([]);
   });
@@ -70,7 +70,7 @@ describe("language guidance without translation", () => {
     const f = fixture("");
     f.ctx.sessionManager.getBranch = () => [];
     f.ctx.model = undefined;
-    expect(prepareAssignments(f.ctx, [{ agent: "fixer", task: "修复错误" }]).items[0].prompt).toContain("Use the language of the assigned task");
+    expect(prepareAssignments(f.ctx, [{ agent: "fixer", task: "修复错误" }]).items[0].instructions).toContain("Use the language of the assigned task");
   });
   test("rejects invalid tasks and cancellation before dispatch", () => {
     const f = fixture("Fix this");
@@ -81,7 +81,7 @@ describe("language guidance without translation", () => {
     expect(f.calls).toEqual([]);
   });
 
-  test("CLI-safe task transport never interprets leading flags or file references", async () => {
+  test("RPC task transport never interprets leading flags or file references", async () => {
     const f = fixture("Please inspect");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-argv-test-"));
     const oldArgv = process.argv[1];
@@ -89,11 +89,11 @@ describe("language guidance without translation", () => {
     process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
     process.env.OMP_TEST_CAPTURE = path.join(dir, "capture.json");
     try {
-      for (const task of ["--help", "@private/file.txt"]) {
+      for (const task of ["--help", "@private/file.txt", "/reload"]) {
         expect((await runAgent(f.ctx, { agent: "explorer", task }, undefined, "test/model")).ok).toBe(true);
-        const argv: string[] = JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE, "utf8")).args;
-        expect(argv.at(-2)).toBe("--");
-        expect(argv.at(-1)).toBe(task.startsWith("@") ? `\n${task}` : task);
+        const recorded = JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE, "utf8"));
+        expect(recorded.args).not.toContain(task);
+        expect(recorded.message).toBe(`Assigned task:\n${task}`);
       }
     } finally {
       process.argv[1] = oldArgv;
@@ -103,7 +103,7 @@ describe("language guidance without translation", () => {
     }
   });
 
-  test("the prepared prompt and task reach the child CLI unchanged", async () => {
+  test("the prepared prompt and task reach the child without changing the task", async () => {
     const f = fixture("Please review");
     const items: Assignment[] = [{ agent: "explorer", task: "Find files" }];
     const prepared = await prepareAssignments(f.ctx, items);
@@ -117,7 +117,7 @@ describe("language guidance without translation", () => {
       expect(result.ok).toBe(true);
       const recorded = JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE, "utf8"));
       expect(recorded.prompt).toBe(prepared.items[0].prompt);
-      expect(recorded.args.at(-1)).toBe(prepared.items[0].task);
+      expect(recorded.message).toBe(`${prepared.items[0].instructions}\n\nAssigned task:\n${prepared.items[0].task}`);
     } finally {
       process.argv[1] = oldArgv;
       if (oldCapture === undefined) delete process.env.OMP_TEST_CAPTURE;
