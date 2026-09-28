@@ -20,11 +20,16 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-const message = (text: string) => ({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+const message = (text: string) => ({
+  type: "message_end",
+  message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+});
 const fileFor = (id: string) => path.join(root, "omp", "conversations", `${id}.jsonl`);
 function fake(events: any[], exit = 0, wait = 0) {
   const file = path.join(root, "fake.mjs");
-  fs.writeFileSync(file, `
+  fs.writeFileSync(
+    file,
+    `
     import { createInterface } from "node:readline";
     const emit = event => console.log(JSON.stringify(event));
     const input = createInterface({ input: process.stdin });
@@ -41,7 +46,8 @@ function fake(events: any[], exit = 0, wait = 0) {
       emit({ type: "agent_settled" });
     });
     input.on("close", () => process.exit(0));
-  `);
+  `,
+  );
   process.argv[1] = file;
 }
 async function waitUntil(check: () => boolean) {
@@ -52,14 +58,35 @@ async function waitUntil(check: () => boolean) {
 test("child JSON events and completion remain in one private recording", async () => {
   const long = "long output ".repeat(25_000);
   const events = [
-    { type: "message_update", seq: 7, assistantMessageEvent: { type: "text_delta", delta: "first", contentIndex: 0 } },
-    { type: "message_update", seq: 7, assistantMessageEvent: { type: "text_delta", delta: "second", contentIndex: 0 } },
-    { type: "tool_execution_end", toolCallId: "t", toolName: "bash", result: { content: [{ type: "text", text: long }] } },
+    {
+      type: "message_update",
+      seq: 7,
+      assistantMessageEvent: { type: "text_delta", delta: "first", contentIndex: 0 },
+    },
+    {
+      type: "message_update",
+      seq: 7,
+      assistantMessageEvent: { type: "text_delta", delta: "second", contentIndex: 0 },
+    },
+    {
+      type: "tool_execution_end",
+      toolCallId: "t",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: long }] },
+    },
     message(long),
   ];
   fake(events);
   let id = "";
-  const pending = runAgent(ctx, { agent: "explorer", task: "sample" }, undefined, "test/model", (progress) => { id = progress.conversationId ?? id; });
+  const pending = runAgent(
+    ctx,
+    { agent: "explorer", task: "sample" },
+    undefined,
+    "test/model",
+    (progress) => {
+      id = progress.conversationId ?? id;
+    },
+  );
   await waitUntil(() => !!id && !!getConversation(id)?.events.length);
   const result = await pending;
   expect(result.ok).toBe(true);
@@ -98,7 +125,10 @@ test("cache invalidates after append and completion without exposing caller muta
     run.finish("done");
     expect(getConversation(run.id)?.meta.state).toBe("done");
     expect(reads).toBe(3);
-  } finally { read.mockRestore(); run.finish("done"); }
+  } finally {
+    read.mockRestore();
+    run.finish("done");
+  }
 });
 
 test("small events share writes and finish flushes every event in order", () => {
@@ -110,13 +140,20 @@ test("small events share writes and finish flushes every event in order", () => 
     expect(write).toHaveBeenCalledTimes(1); // metadata only before the deadline/size limit
     run.finish("done");
     expect(write).toHaveBeenCalledTimes(2);
-    const lines = fs.readFileSync(fileFor(run.id), "utf8").trimEnd().split("\n").map(line => JSON.parse(line));
-    expect(lines.slice(1, -1).map(line => line.event)).toEqual(events);
+    const lines = fs
+      .readFileSync(fileFor(run.id), "utf8")
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(lines.slice(1, -1).map((line) => line.event)).toEqual(events);
     expect(lines.at(-1).state).toBe("done");
     run.finish("done");
     run.record({ type: "late" });
     expect(write).toHaveBeenCalledTimes(2);
-  } finally { write.mockRestore(); run.finish("done"); }
+  } finally {
+    write.mockRestore();
+    run.finish("done");
+  }
 });
 
 test("live recordings flush on the deadline and UTF-8 byte limit", async () => {
@@ -128,13 +165,19 @@ test("live recordings flush on the deadline and UTF-8 byte limit", async () => {
     const large = message("测试".repeat(12_000));
     run.record(large);
     expect(getConversation(run.id)?.events).toEqual([message("live"), large]);
-  } finally { run.finish("done"); }
+  } finally {
+    run.finish("done");
+  }
 });
 
 test("timer write failures notify the owner and remain observable at finish", async () => {
   let failures = 0;
-  const run = startConversation("explorer", "disk failure", "test/model", () => { failures++; });
-  const write = spyOn(fs, "writeSync").mockImplementation(() => { throw new Error("disk full"); });
+  const run = startConversation("explorer", "disk failure", "test/model", () => {
+    failures++;
+  });
+  const write = spyOn(fs, "writeSync").mockImplementation(() => {
+    throw new Error("disk full");
+  });
   const close = spyOn(fs, "closeSync");
   try {
     run.record(message("pending"));
@@ -144,7 +187,11 @@ test("timer write failures notify the owner and remain observable at finish", as
     expect(close).toHaveBeenCalledTimes(1);
     run.finish("failed");
     expect(close).toHaveBeenCalledTimes(1);
-  } finally { write.mockRestore(); close.mockRestore(); run.finish("failed"); }
+  } finally {
+    write.mockRestore();
+    close.mockRestore();
+    run.finish("failed");
+  }
 });
 
 test("a background recording failure stops the child and reports failure", async () => {
@@ -157,13 +204,23 @@ test("a background recording failure stops the child and reports failure", async
   }) as any);
   const controller = new AbortController();
   let result: Awaited<ReturnType<typeof runAgent>> | undefined;
-  const pending = runAgent(ctx, { agent: "explorer", task: "record" }, controller.signal, "test/model").then(value => { result = value; });
+  const pending = runAgent(
+    ctx,
+    { agent: "explorer", task: "record" },
+    controller.signal,
+    "test/model",
+  ).then((value) => {
+    result = value;
+  });
   try {
-    for (let i = 0; i < 300 && !result; i++) await Bun.sleep(10);
-    expect(result).toBeDefined();
+    await waitUntil(() => !!result);
     expect(result?.ok).toBe(false);
     expect(result?.output).toBe("Failed to save specialist conversation");
-  } finally { controller.abort(); await pending; write.mockRestore(); }
+  } finally {
+    controller.abort();
+    await pending;
+    write.mockRestore();
+  }
 });
 
 test("a final recording flush failure is reported as a recording failure", async () => {
@@ -175,21 +232,37 @@ test("a final recording flush failure is reported as a recording failure", async
     return (originalWrite as any)(...args);
   }) as any);
   try {
-    const result = await runAgent(ctx, { agent: "explorer", task: "final flush" }, undefined, "test/model");
+    const result = await runAgent(
+      ctx,
+      { agent: "explorer", task: "final flush" },
+      undefined,
+      "test/model",
+    );
     expect(result.ok).toBe(false);
     expect(result.output).toBe("Failed to save specialist conversation");
-  } finally { write.mockRestore(); }
+  } finally {
+    write.mockRestore();
+  }
 });
 
 test("cancellation flushes events still inside the buffer", async () => {
-  const event = { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "partial" } };
+  const event = {
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", delta: "partial" },
+  };
   fake([event, message("should not finish")]);
   const controller = new AbortController();
   let id = "";
-  const result = await runAgent(ctx, { agent: "fixer", task: "cancel" }, controller.signal, "test/model", progress => {
-    id = progress.conversationId ?? id;
-    if (progress.text === "partial") controller.abort();
-  });
+  const result = await runAgent(
+    ctx,
+    { agent: "fixer", task: "cancel" },
+    controller.signal,
+    "test/model",
+    (progress) => {
+      id = progress.conversationId ?? id;
+      if (progress.text === "partial") controller.abort();
+    },
+  );
   expect(result.cancelled).toBe(true);
   expect(getConversation(id)?.events).toEqual([event]);
   expect(getConversation(id)?.meta.state).toBe("cancelled");
@@ -198,20 +271,45 @@ test("cancellation flushes events still inside the buffer", async () => {
 test("each text/usage event emits one immutable snapshot with shared activity history", async () => {
   fake([
     { type: "message_start", message: { role: "assistant" } },
-    { type: "message_update", usage: { output: 10 }, assistantMessageEvent: { type: "text_delta", delta: "first" } },
-    { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: " second", partial: { usage: { output: 20 } } } },
+    {
+      type: "message_update",
+      usage: { output: 10 },
+      assistantMessageEvent: { type: "text_delta", delta: "first" },
+    },
+    {
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: " second",
+        partial: { usage: { output: 20 } },
+      },
+    },
     { ...message("finished"), message: { ...message("finished").message, usage: { output: 30 } } },
   ]);
   const snapshots: any[] = [];
-  const result = await runAgent(ctx, { agent: "explorer", task: "snapshots" }, undefined, "test/model", row => snapshots.push(row));
+  const result = await runAgent(
+    ctx,
+    { agent: "explorer", task: "snapshots" },
+    undefined,
+    "test/model",
+    (row) => snapshots.push(row),
+  );
   expect(result.ok).toBe(true);
-  expect(snapshots.map(row => row.text)).toEqual(["", "first", "first second", "finished", "finished"]);
+  expect(snapshots.map((row) => row.text)).toEqual([
+    "",
+    "first",
+    "first second",
+    "finished",
+    "finished",
+  ]);
   expect(snapshots[1].tokensPerSecond).toBeGreaterThan(0);
   expect(snapshots[2].tokensPerSecond).toBeGreaterThan(0);
   expect(snapshots[1].activities).toBe(snapshots[2].activities);
   expect(snapshots[2].activities).toEqual([]);
   expect(snapshots.at(-1).activities).toEqual(["Work completed"]);
-  expect(snapshots.every(row => Object.isFrozen(row) && Object.isFrozen(row.activities))).toBe(true);
+  expect(snapshots.every((row) => Object.isFrozen(row) && Object.isFrozen(row.activities))).toBe(
+    true,
+  );
 });
 
 test("incomplete live lines become readable once finished", () => {
@@ -228,20 +326,30 @@ test("incomplete live lines become readable once finished", () => {
 test("a completion is not accepted before its JSONL line is terminated", () => {
   const run = startConversation("explorer", "partial completion", "test/model");
   try {
-    fs.appendFileSync(fileFor(run.id), JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }));
+    fs.appendFileSync(
+      fileFor(run.id),
+      JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }),
+    );
     expect(getConversation(run.id)?.meta.state).toBe("running");
     fs.appendFileSync(fileFor(run.id), "\n");
     expect(getConversation(run.id)?.meta.state).toBe("done");
-  } finally { run.finish("failed"); }
+  } finally {
+    run.finish("failed");
+  }
 });
 
 test("a corrupt middle line cannot turn an incomplete recording into a completed one", () => {
   const run = startConversation("explorer", "corrupt", "test/model");
   try {
     fs.appendFileSync(fileFor(run.id), '{"type":"event","event":\n');
-    fs.appendFileSync(fileFor(run.id), JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }) + "\n");
+    fs.appendFileSync(
+      fileFor(run.id),
+      JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }) + "\n",
+    );
     expect(getConversation(run.id)).toBeUndefined();
-  } finally { run.finish("failed"); }
+  } finally {
+    run.finish("failed");
+  }
 });
 
 test("a completion must be the final JSONL record", () => {
@@ -280,21 +388,45 @@ test("invalid IDs and symlinked recordings are rejected even after caching", () 
   try {
     fs.symlinkSync(outside, fileFor(run.id));
     expect(getConversation(run.id)).toBeUndefined();
-  } catch (err: any) { if (err.code !== "EPERM") throw err; }
+  } catch (err: any) {
+    if (err.code !== "EPERM") throw err;
+  }
 });
 
 test("failed and cancelled children finalize their recordings", async () => {
   fake([message("partial")], 2);
   let failedId = "";
-  const failed = await runAgent(ctx, { agent: "fixer", task: "failure" }, undefined, "test/model", (progress) => { failedId = progress.conversationId ?? failedId; });
+  const failed = await runAgent(
+    ctx,
+    { agent: "fixer", task: "failure" },
+    undefined,
+    "test/model",
+    (progress) => {
+      failedId = progress.conversationId ?? failedId;
+    },
+  );
   expect(failed.ok).toBe(false);
   expect(getConversation(failedId)?.meta.state).toBe("failed");
   expect(getConversation(failedId)?.events).toEqual([message("partial")]);
 
-  fake(Array.from({ length: 30 }, (_, i) => ({ type: "message_update", seq: i, assistantMessageEvent: { type: "text_delta", delta: "x" } })));
+  fake(
+    Array.from({ length: 30 }, (_, i) => ({
+      type: "message_update",
+      seq: i,
+      assistantMessageEvent: { type: "text_delta", delta: "x" },
+    })),
+  );
   const controller = new AbortController();
   let cancelledId = "";
-  const pending = runAgent(ctx, { agent: "fixer", task: "cancel" }, controller.signal, "test/model", (progress) => { cancelledId = progress.conversationId ?? cancelledId; });
+  const pending = runAgent(
+    ctx,
+    { agent: "fixer", task: "cancel" },
+    controller.signal,
+    "test/model",
+    (progress) => {
+      cancelledId = progress.conversationId ?? cancelledId;
+    },
+  );
   await waitUntil(() => !!cancelledId && !!getConversation(cancelledId)?.events.length);
   controller.abort();
   expect((await pending).cancelled).toBe(true);

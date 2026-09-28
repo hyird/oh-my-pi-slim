@@ -2,7 +2,8 @@
 // allowing escape sequences or terminal controls into the task card.
 export function safeText(value: unknown): string {
   if (typeof value !== "string") return "";
-  return value.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
+  return value
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x1b[P^_][\s\S]*?(?:\x1b\\|$)/g, "")
     .replace(/\x1b\[[0-?]*[ -/]*(?:[@-~]|$)/g, "")
     .replace(/\x1b[@-_]/g, "")
@@ -23,9 +24,14 @@ export function assistantReplies(events: readonly any[]): string[] {
       const update = event.assistantMessageEvent;
       if (update?.type === "text_delta" || update?.type === "text_end") {
         const index = typeof update.contentIndex === "number" ? update.contentIndex : -1;
-        live.set(index, update.type === "text_end"
-          ? (typeof update.content === "string" ? update.content : "")
-          : (live.get(index) ?? "") + (typeof update.delta === "string" ? update.delta : ""));
+        live.set(
+          index,
+          update.type === "text_end"
+            ? typeof update.content === "string"
+              ? update.content
+              : ""
+            : (live.get(index) ?? "") + (typeof update.delta === "string" ? update.delta : ""),
+        );
       }
     } else if (event?.type === "message_end" && event.message?.role === "assistant") {
       live.clear();
@@ -55,12 +61,18 @@ export class ReplyAccumulator {
       const previous = this.live.get(index) ?? "";
       // Keep a bounded raw prefix so escape sequences split across deltas can
       // be removed after they are complete, without retaining the whole stream.
-      const room = Math.max(0, this.limit * 2 - this.completed.length - this.liveRawSize + previous.length);
+      const room = Math.max(
+        0,
+        this.limit * 2 - this.completed.length - this.liveRawSize + previous.length,
+      );
       // Bound malformed streams with unbounded content indices as well as text.
       if (!this.live.has(index) && this.live.size >= 256) return;
-      const text = update.type === "text_end"
-        ? (typeof update.content === "string" ? update.content : "")
-        : previous + (typeof update.delta === "string" ? update.delta : "");
+      const text =
+        update.type === "text_end"
+          ? typeof update.content === "string"
+            ? update.content
+            : ""
+          : previous + (typeof update.delta === "string" ? update.delta : "");
       const next = text.slice(0, room);
       this.liveRawSize += next.length - previous.length;
       this.live.set(index, next);
@@ -71,7 +83,11 @@ export class ReplyAccumulator {
         for (const part of event.message.content ?? []) {
           if (part?.type !== "text") continue;
           const text = safeText(part.text);
-          if (text) this.completed = (this.completed + (this.completed ? "\n\n" : "") + text).slice(0, this.limit);
+          if (text)
+            this.completed = (this.completed + (this.completed ? "\n\n" : "") + text).slice(
+              0,
+              this.limit,
+            );
         }
       }
     } else return;
@@ -80,7 +96,10 @@ export class ReplyAccumulator {
 
   text(): string {
     if (this.dirty) {
-      this.cached = [this.completed, ...Array.from(this.live.values(), safeText)].filter(Boolean).join("\n\n").slice(0, this.limit);
+      this.cached = [this.completed, ...Array.from(this.live.values(), safeText)]
+        .filter(Boolean)
+        .join("\n\n")
+        .slice(0, this.limit);
       this.dirty = false;
     }
     return this.cached;

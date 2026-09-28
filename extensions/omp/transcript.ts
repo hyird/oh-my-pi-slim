@@ -14,7 +14,10 @@ export interface ConversationMeta {
   finishedAt?: number;
   error?: string;
 }
-export interface Conversation { meta: ConversationMeta; events: any[] }
+export interface Conversation {
+  meta: ConversationMeta;
+  events: any[];
+}
 
 function directory(): string {
   return path.join(getAgentDir(), "omp", "conversations");
@@ -23,32 +26,49 @@ function ensureDirectory(): string {
   const dir = directory();
   const parent = path.dirname(dir);
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
-  if (!fs.lstatSync(parent).isDirectory()) throw new Error("Conversation parent is not a directory");
-  try { fs.mkdirSync(dir, { mode: 0o700 }); }
-  catch (err) { if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err; }
-  if (!fs.lstatSync(dir).isDirectory()) throw new Error("Conversation directory is not a directory");
+  if (!fs.lstatSync(parent).isDirectory())
+    throw new Error("Conversation parent is not a directory");
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  if (!fs.lstatSync(dir).isDirectory())
+    throw new Error("Conversation directory is not a directory");
   fs.chmodSync(dir, 0o700);
   return dir;
 }
-const validId = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
+const validId = (id: string) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id);
 
 // Bound both the number of recordings and their estimated parsed size. Oversized logs
 // remain readable, but are not retained by the task-card cache.
 const cacheLimit = 8;
 const cacheBudget = 64 * 1024 * 1024;
-const conversationCache = new Map<string, { revision: fs.BigIntStats; value: Conversation; cost: number }>();
+const conversationCache = new Map<
+  string,
+  { revision: fs.BigIntStats; value: Conversation; cost: number }
+>();
 let cacheSize = 0;
 function sameRevision(a: fs.BigIntStats, b: fs.BigIntStats): boolean {
-  return a.dev === b.dev && a.ino === b.ino && a.size === b.size &&
-    a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+  return (
+    a.dev === b.dev &&
+    a.ino === b.ino &&
+    a.size === b.size &&
+    a.mtimeNs === b.mtimeNs &&
+    a.ctimeNs === b.ctimeNs
+  );
 }
 function evict(file: string) {
   const old = conversationCache.get(file);
-  if (old) { cacheSize -= old.cost; conversationCache.delete(file); }
+  if (old) {
+    cacheSize -= old.cost;
+    conversationCache.delete(file);
+  }
 }
 
 function append(fd: number, bytes: Buffer) {
-  for (let offset = 0; offset < bytes.length;) {
+  for (let offset = 0; offset < bytes.length; ) {
     const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
     if (!written) throw new Error("Conversation write made no progress");
     offset += written;
@@ -57,12 +77,28 @@ function append(fd: number, bytes: Buffer) {
 
 /** Record only parsed, child-visible JSON events; never copy the child environment or stderr. */
 export function startConversation(agent: Role, task: string, model: string, onError?: () => void) {
-  const meta: ConversationMeta = { id: randomUUID(), agent, task, model, state: "running", startedAt: Date.now() };
+  const meta: ConversationMeta = {
+    id: randomUUID(),
+    agent,
+    task,
+    model,
+    state: "running",
+    startedAt: Date.now(),
+  };
   const dir = ensureDirectory();
   const file = path.join(dir, `${meta.id}.jsonl`);
-  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
-  try { append(fd, Buffer.from(JSON.stringify({ type: "meta", meta }) + "\n")); }
-  catch (err) { fs.closeSync(fd); fs.unlinkSync(file); throw err; }
+  const fd = fs.openSync(
+    file,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    0o600,
+  );
+  try {
+    append(fd, Buffer.from(JSON.stringify({ type: "meta", meta }) + "\n"));
+  } catch (err) {
+    fs.closeSync(fd);
+    fs.unlinkSync(file);
+    throw err;
+  }
   let finished = false;
   let pending: string[] = [];
   let pendingBytes = 0;
@@ -76,8 +112,12 @@ export function startConversation(agent: Role, task: string, model: string, onEr
     const bytes = Buffer.from(pending.join(""));
     pending = [];
     pendingBytes = 0;
-    try { append(fd, bytes); }
-    catch (err) { failure = err; throw err; }
+    try {
+      append(fd, bytes);
+    } catch (err) {
+      failure = err;
+      throw err;
+    }
   };
   const enqueue = (value: unknown) => {
     const line = JSON.stringify(value) + "\n";
@@ -96,26 +136,43 @@ export function startConversation(agent: Role, task: string, model: string, onEr
       if (pendingBytes >= 64 * 1024) flush();
       else {
         timer ??= setTimeout(() => {
-          try { flush(); }
-          catch {
+          try {
+            flush();
+          } catch {
             // Surface timer failures to the process supervisor, never as an
             // uncaught timer exception. record/finish also retain the failure.
-            try { onError?.(); } catch { /* finish still reports the write failure */ }
+            try {
+              onError?.();
+            } catch {
+              /* finish still reports the write failure */
+            }
           }
         }, 100);
         timer.unref?.();
       }
     },
-    finish(state: "done" | "failed" | "cancelled", error?: string, diagnostics?: Record<string, unknown>) {
+    finish(
+      state: "done" | "failed" | "cancelled",
+      error?: string,
+      diagnostics?: Record<string, unknown>,
+    ) {
       if (finished) return;
       finished = true;
       meta.state = state;
       meta.finishedAt = Date.now();
       if (error) meta.error = error;
       try {
-        enqueue({ type: "completion", state, finishedAt: meta.finishedAt, ...(error ? { error } : {}), ...diagnostics });
+        enqueue({
+          type: "completion",
+          state,
+          finishedAt: meta.finishedAt,
+          ...(error ? { error } : {}),
+          ...diagnostics,
+        });
         flush();
-      } finally { fs.closeSync(fd); }
+      } finally {
+        fs.closeSync(fd);
+      }
     },
   };
 }
@@ -127,17 +184,26 @@ export function getConversation(id: string): Conversation | undefined {
     // Open and verify even on a hit: neither a replaced file nor a symlink may
     // inherit a previous recording's cached value.
     const before = fs.lstatSync(file, { bigint: true });
-    if (!before.isFile()) { evict(file); return undefined; }
+    if (!before.isFile()) {
+      evict(file);
+      return undefined;
+    }
     const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
     let body: string;
     let revision: fs.BigIntStats;
     let stable: boolean;
     try {
       revision = fs.fstatSync(fd, { bigint: true });
-      if (!revision.isFile() || !sameRevision(before, revision)) { evict(file); return undefined; }
+      if (!revision.isFile() || !sameRevision(before, revision)) {
+        evict(file);
+        return undefined;
+      }
       const cached = conversationCache.get(file);
-      if (cached && sameRevision(cached.revision, revision) &&
-          sameRevision(revision, fs.lstatSync(file, { bigint: true }))) {
+      if (
+        cached &&
+        sameRevision(cached.revision, revision) &&
+        sameRevision(revision, fs.lstatSync(file, { bigint: true }))
+      ) {
         conversationCache.delete(file);
         conversationCache.set(file, cached); // LRU touch
         return structuredClone(cached.value);
@@ -145,15 +211,18 @@ export function getConversation(id: string): Conversation | undefined {
       evict(file);
       body = fs.readFileSync(fd, "utf8");
       stable = sameRevision(revision, fs.fstatSync(fd, { bigint: true }));
-    } finally { fs.closeSync(fd); }
+    } finally {
+      fs.closeSync(fd);
+    }
     // A rename or append during the read must never seed the cache.
     stable = stable && sameRevision(revision, fs.lstatSync(file, { bigint: true }));
     const lines = body.split("\n");
     // Only newline-terminated JSONL records are complete. A partial write can
     // contain valid JSON but still lack the final delimiter.
-    const trailing = body.endsWith("\n") ? "" : lines.pop() ?? "";
+    const trailing = body.endsWith("\n") ? "" : (lines.pop() ?? "");
     const first = JSON.parse(lines.shift() ?? "");
-    if (first.type !== "meta" || first.meta?.id !== id || !isRole(first.meta.agent)) return undefined;
+    if (first.type !== "meta" || first.meta?.id !== id || !isRole(first.meta.agent))
+      return undefined;
     // The header precedes execution; only a terminal completion record may
     // establish the final state, even when metadata was modified on disk.
     const meta = { ...first.meta, state: "running" } as ConversationMeta;
@@ -165,10 +234,17 @@ export function getConversation(id: string): Conversation | undefined {
       if (!line) continue;
       if (completed) return undefined;
       let event: any;
-      try { event = JSON.parse(line); }
-      catch { return undefined; }
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return undefined;
+      }
       if (event.type === "completion") {
-        if (!["done", "failed", "cancelled"].includes(event.state) || !Number.isSafeInteger(event.finishedAt)) return undefined;
+        if (
+          !["done", "failed", "cancelled"].includes(event.state) ||
+          !Number.isSafeInteger(event.finishedAt)
+        )
+          return undefined;
         completed = true;
         meta.state = event.state;
         meta.finishedAt = event.finishedAt;
@@ -186,5 +262,8 @@ export function getConversation(id: string): Conversation | undefined {
       cacheSize += cost;
     }
     return result;
-  } catch { evict(file); return undefined; }
+  } catch {
+    evict(file);
+    return undefined;
+  }
 }

@@ -2,8 +2,17 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 
-type State = { isStreaming?: boolean; isCompacting?: boolean; pendingMessageCount?: number; sessionFile?: string };
-type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type State = {
+  isStreaming: boolean;
+  isCompacting: boolean;
+  pendingMessageCount: number;
+  sessionFile?: string;
+};
+type Pending = {
+  resolve: (value: any) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 const MAX_RPC_LINE_CHARS = 16 * 1024 * 1024;
 
 /** One isolated Pi runtime. Only one prompt may own its event stream at a time. */
@@ -22,21 +31,53 @@ export class RpcWorker {
   readonly ready: Promise<State>;
   sessionFile?: string;
 
-  constructor(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv,
-    cleanup: () => Promise<void>, private readonly timeoutMs = 30_000,
-    private readonly settleTimeoutMs = 5 * 60_000) {
-    this.proc = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env });
+  constructor(
+    command: string,
+    args: string[],
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    cleanup: () => Promise<void>,
+    private readonly timeoutMs = 30_000,
+    private readonly settleTimeoutMs = 5 * 60_000,
+  ) {
+    this.proc = spawn(command, args, {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env,
+    });
     let fragments: string[] = [];
     let fragmentChars = 0;
     const decoder = new StringDecoder("utf8");
     const consume = (line: string) => {
       let event: any;
-      try { event = JSON.parse(line); } catch { return; }
-      if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string") return;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (
+        !event ||
+        typeof event !== "object" ||
+        Array.isArray(event) ||
+        typeof event.type !== "string"
+      )
+        return;
+      // Closing still needs the abort reply before sending EOF. Ignore late
+      // task events without discarding the shutdown handshake.
+      if (
+        this.closing &&
+        !(event.type === "response" && this.shutdownId && event.id === this.shutdownId)
+      )
+        return;
       if (event.type === "response") {
         if (this.shutdownId && event.id === this.shutdownId) {
-          try { this.proc.stdin.end(); }
-          catch { this.forceClose(); }
+          try {
+            this.proc.stdin.end();
+          } catch {
+            this.forceClose();
+          }
           return;
         }
         const pending = this.pending.get(event.id);
@@ -46,16 +87,27 @@ export class RpcWorker {
         // Provider errors may contain credentials; never expose their raw text.
         if (event.success) pending.resolve(event.data);
         else pending.reject(new Error(`Specialist RPC ${event.command} failed`));
-      } else if (event.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(event.method)) {
-        this.fail(new Error("Specialist requires interactive input; resolve it in the parent before retrying"));
+      } else if (
+        event.type === "extension_ui_request" &&
+        ["select", "confirm", "input", "editor"].includes(event.method)
+      ) {
+        this.fail(
+          new Error(
+            "Specialist requires interactive input; resolve it in the parent before retrying",
+          ),
+        );
         void this.stop();
       } else {
-        try { this.listener?.(event); }
-        catch { this.fail(new Error("Failed to process specialist events")); void this.stop(); }
+        try {
+          this.listener?.(event);
+        } catch {
+          this.fail(new Error("Failed to process specialist events"));
+          void this.stop();
+        }
       }
     };
     const feed = (text: string) => {
-      if (this.closing) return;
+      if (this.proc.stdout.destroyed) return;
       const overflow = () => {
         fragments = [];
         fragmentChars = 0;
@@ -66,18 +118,24 @@ export class RpcWorker {
       let end: number;
       while ((end = text.indexOf("\n", start)) !== -1) {
         const part = text.slice(start, end);
-        if (fragmentChars + part.length > MAX_RPC_LINE_CHARS) { overflow(); return; }
+        if (fragmentChars + part.length > MAX_RPC_LINE_CHARS) {
+          overflow();
+          return;
+        }
         if (fragments.length) fragments.push(part);
         const line = fragments.length ? fragments.join("") : part;
         fragments = [];
         fragmentChars = 0;
         consume(line);
-        if (this.closing) return;
+        if (this.proc.stdout.destroyed) return;
         start = end + 1;
       }
       if (start < text.length) {
         const part = text.slice(start);
-        if (fragmentChars + part.length > MAX_RPC_LINE_CHARS) { overflow(); return; }
+        if (fragmentChars + part.length > MAX_RPC_LINE_CHARS) {
+          overflow();
+          return;
+        }
         fragments.push(part);
         fragmentChars += part.length;
       }
@@ -89,7 +147,13 @@ export class RpcWorker {
       if (this.closing || this.exited) return;
       this.outputEndTimer = setTimeout(() => {
         this.outputEndTimer = undefined;
-        if (this.closing || this.exited || this.proc.exitCode !== null || this.proc.signalCode !== null) return;
+        if (
+          this.closing ||
+          this.exited ||
+          this.proc.exitCode !== null ||
+          this.proc.signalCode !== null
+        )
+          return;
         this.fail(new Error("Specialist RPC output closed"));
         this.forceClose();
       }, 100);
@@ -116,21 +180,30 @@ export class RpcWorker {
         // JSONL messages require a newline; a final fragment was not committed.
         fragments = [];
         this.fail(new Error("Specialist process closed before settlement"));
-        void cleanup().catch(() => {}).finally(resolve);
+        void cleanup()
+          .catch(() => {})
+          .finally(resolve);
       });
     });
-    this.ready = this.request("get_state").then((state: State) => {
+    this.ready = this.readState().then((state) => {
       this.sessionFile = state.sessionFile;
       return state;
     });
     // A cancelled launch may close before the caller starts awaiting readiness.
-    void this.ready.catch(() => {});
+    void this.ready.catch(() => {
+      void this.stop();
+    });
   }
 
-  get alive(): boolean { return !this.closing && !this.exited; }
+  get alive(): boolean {
+    return !this.closing && !this.exited;
+  }
 
   private fail(error: Error): void {
-    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
     this.failure?.(error);
   }
@@ -155,8 +228,9 @@ export class RpcWorker {
         void this.stop();
       }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      try { this.proc.stdin.write(JSON.stringify({ id, type, ...fields }) + "\n"); }
-      catch {
+      try {
+        this.proc.stdin.write(JSON.stringify({ id, type, ...fields }) + "\n");
+      } catch {
         // A synchronous pipe failure must not leave this request and its timer pending.
         this.fail(new Error("Specialist RPC input closed"));
         void this.stop();
@@ -164,16 +238,45 @@ export class RpcWorker {
     });
   }
 
-  async prompt(message: string, signal: AbortSignal | undefined, onEvent: (event: any) => void): Promise<void> {
+  private async readState(): Promise<State> {
+    const state = await this.request("get_state");
+    // Missing fields are not proof of idleness. Validate before accepting a
+    // completed run or retaining a process for another task.
+    if (
+      !state ||
+      typeof state !== "object" ||
+      Array.isArray(state) ||
+      typeof state.isStreaming !== "boolean" ||
+      typeof state.isCompacting !== "boolean" ||
+      !Number.isSafeInteger(state.pendingMessageCount) ||
+      state.pendingMessageCount < 0 ||
+      (state.sessionFile !== undefined && typeof state.sessionFile !== "string")
+    ) {
+      throw new Error("Specialist RPC returned invalid state");
+    }
+    return state;
+  }
+
+  async prompt(
+    message: string,
+    signal: AbortSignal | undefined,
+    onEvent: (event: any) => void,
+  ): Promise<void> {
     if (this.prompting) throw new Error("Specialist already has active work");
     this.prompting = true;
     let startTimer: ReturnType<typeof setTimeout> | undefined;
     let stateTimer: ReturnType<typeof setTimeout> | undefined;
     let settleTimer: ReturnType<typeof setTimeout> | undefined;
-    const onAbort = () => { this.fail(new Error("Specialist cancelled")); void this.stop(); };
+    const onAbort = () => {
+      this.fail(new Error("Specialist cancelled"));
+      void this.stop();
+    };
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      if (signal?.aborted) { onAbort(); throw new Error("Specialist cancelled"); }
+      if (signal?.aborted) {
+        onAbort();
+        throw new Error("Specialist cancelled");
+      }
       await this.ready;
       await new Promise<void>((resolve, reject) => {
         let accepted = false;
@@ -184,35 +287,60 @@ export class RpcWorker {
         let stateDelayMs = 100;
         const check = () => {
           if (!accepted || !started || !settled || checking) return;
-          if (stateTimer) { clearTimeout(stateTimer); stateTimer = undefined; }
+          if (stateTimer) {
+            clearTimeout(stateTimer);
+            stateTimer = undefined;
+          }
           checking = true;
           const observed = revision;
-          void this.request("get_state").then((state: State) => {
-            checking = false;
-            this.sessionFile = state.sessionFile;
-            if (observed !== revision) { check(); return; }
-            if (settled && !state.isStreaming && !state.isCompacting && !state.pendingMessageCount) resolve();
-            else if (settled && !stateTimer) {
-              // The settle event can race a new queued action or compaction.
-              // Recheck without requiring a second settle event, backing off
-              // while a longer compaction is still active.
-              stateTimer = setTimeout(() => { stateTimer = undefined; check(); }, stateDelayMs);
-              stateTimer.unref?.();
-              stateDelayMs = Math.min(stateDelayMs * 2, 1000);
-            }
-          }, reject);
+          void this.readState()
+            .then((state) => {
+              checking = false;
+              this.sessionFile = state.sessionFile;
+              if (observed !== revision) {
+                check();
+                return;
+              }
+              if (
+                settled &&
+                !state.isStreaming &&
+                !state.isCompacting &&
+                !state.pendingMessageCount
+              )
+                resolve();
+              else if (settled && !stateTimer) {
+                // The settle event can race a new queued action or compaction.
+                // Recheck without requiring a second settle event, backing off
+                // while a longer compaction is still active.
+                stateTimer = setTimeout(() => {
+                  stateTimer = undefined;
+                  check();
+                }, stateDelayMs);
+                stateTimer.unref?.();
+                stateDelayMs = Math.min(stateDelayMs * 2, 1000);
+              }
+            })
+            .catch(reject);
         };
         this.failure = reject;
         this.listener = (event) => {
           onEvent(event);
-          if (event.type === "agent_start" || event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
+          if (
+            event.type === "agent_start" ||
+            event.type === "message_start" ||
+            event.type === "message_update" ||
+            event.type === "message_end"
+          ) {
             started = true;
             if (startTimer) clearTimeout(startTimer);
           }
           if (event.type === "agent_start") {
             revision++;
             settled = false;
-            if (settleTimer) { clearTimeout(settleTimer); settleTimer = undefined; }
+            if (settleTimer) {
+              clearTimeout(settleTimer);
+              settleTimer = undefined;
+            }
           }
           if (event.type === "agent_settled") {
             revision++;
@@ -220,13 +348,20 @@ export class RpcWorker {
             stateDelayMs = 100;
             // A responsive but permanently busy get_state must not hold the
             // parent task forever. Normal model work has no such deadline.
-            settleTimer ??= setTimeout(() => reject(new Error("Specialist did not become idle after settlement")), this.settleTimeoutMs);
+            settleTimer ??= setTimeout(
+              () => reject(new Error("Specialist did not become idle after settlement")),
+              this.settleTimeoutMs,
+            );
             check();
           }
         };
         void this.request("prompt", { message }).then(() => {
           accepted = true;
-          if (!started) startTimer = setTimeout(() => reject(new Error("Specialist prompt did not start an agent run")), this.timeoutMs);
+          if (!started)
+            startTimer = setTimeout(
+              () => reject(new Error("Specialist prompt did not start an agent run")),
+              this.timeoutMs,
+            );
           check();
         }, reject);
       });
@@ -255,8 +390,11 @@ export class RpcWorker {
       this.shutdownId = randomUUID();
       this.killTimer = setTimeout(() => this.forceClose(), 1000);
       this.killTimer.unref?.();
-      try { this.proc.stdin.write(JSON.stringify({ id: this.shutdownId, type: "abort" }) + "\n"); }
-      catch { this.forceClose(); }
+      try {
+        this.proc.stdin.write(JSON.stringify({ id: this.shutdownId, type: "abort" }) + "\n");
+      } catch {
+        this.forceClose();
+      }
     }
     return this.closed;
   }

@@ -1,2 +1,5 @@
 node_modules/
 *.tsbuildinfo
+
+# Bun owns dependency versions; Pi installation may generate this file.
+/package-lock.json

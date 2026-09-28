@@ -25,6 +25,7 @@
     "typescript": "^5.9.2"
   },
   "scripts": {
+    "check": "bun run typecheck && bun run test",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   }

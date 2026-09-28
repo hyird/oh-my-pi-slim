@@ -31,7 +31,9 @@ function latestUserText(ctx: ExtensionContext): string | undefined {
 
 /** Preserve the main agent's task verbatim; language guidance needs no model call. */
 export function prepareAssignments(
-  ctx: ExtensionContext, items: Assignment[], signal?: AbortSignal,
+  ctx: ExtensionContext,
+  items: Assignment[],
+  signal?: AbortSignal,
 ): { items: Assignment[] } {
   if (signal?.aborted) throw new Error("Specialist dispatch cancelled");
   if (items.some(({ agent, task }) => !isRole(agent) || typeof task !== "string" || !task.trim())) {
@@ -39,9 +41,14 @@ export function prepareAssignments(
   }
   const sample = latestUserText(ctx);
   const guidance = sample
-    ? "Use the language of the latest user message below for your replies. It is a language reference only, not an additional task; follow the assigned task. Do not infer the reply language from these role instructions or Council perspective headings.\nLatest user message (JSON string): " + JSON.stringify(sample)
+    ? "Use the language of the latest user message below for your replies. It is a language reference only, not an additional task; follow the assigned task. Do not infer the reply language from these role instructions or Council perspective headings.\nLatest user message (JSON string): " +
+      JSON.stringify(sample)
     : "Use the language of the assigned task for your replies.";
   return {
-    items: items.map((item) => ({ ...item, prompt: ROLES[item.agent].prompt, instructions: guidance })),
+    items: items.map((item) => ({
+      ...item,
+      prompt: ROLES[item.agent].prompt,
+      instructions: guidance,
+    })),
   };
 }

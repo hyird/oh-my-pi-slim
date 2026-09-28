@@ -28,26 +28,41 @@ export function parseModel(value: string): { provider: string; id: string } | un
 }
 
 export function parseConfig(raw: unknown): OmpConfig {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Config must be a JSON object");
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error("Config must be a JSON object");
   const value = raw as Record<string, unknown>;
   const requestedDefault = value.defaultAgent ?? "orchestrator";
   if (typeof requestedDefault !== "string") throw new Error("Invalid defaultAgent");
   if (!isMainAgent(requestedDefault)) throw new Error("defaultAgent must be a main agent");
   const defaultAgent: MainAgent = requestedDefault;
   const models = value.models ?? {};
-  if (!models || typeof models !== "object" || Array.isArray(models)) throw new Error("models must be an object");
+  if (!models || typeof models !== "object" || Array.isArray(models))
+    throw new Error("models must be an object");
   const validated: OmpConfig["models"] = {};
   for (const [role, model] of Object.entries(models)) {
-    if (!isRole(role) || role === "council" || role === "orchestrator" || typeof model !== "string" || !parseModel(model)) {
+    if (
+      !isRole(role) ||
+      role === "council" ||
+      role === "orchestrator" ||
+      typeof model !== "string" ||
+      !parseModel(model)
+    ) {
       throw new Error(`Invalid models.${role}: expected provider/model-id`);
     }
     validated[role] = model;
   }
   const thinking = value.thinking ?? {};
-  if (!thinking || typeof thinking !== "object" || Array.isArray(thinking)) throw new Error("thinking must be an object");
+  if (!thinking || typeof thinking !== "object" || Array.isArray(thinking))
+    throw new Error("thinking must be an object");
   const validatedThinking: OmpConfig["thinking"] = {};
   for (const [role, level] of Object.entries(thinking)) {
-    if (!isRole(role) || role === "council" || role === "orchestrator" || typeof level !== "string" || !isThinkingLevel(level)) {
+    if (
+      !isRole(role) ||
+      role === "council" ||
+      role === "orchestrator" ||
+      typeof level !== "string" ||
+      !isThinkingLevel(level)
+    ) {
       throw new Error(`Invalid thinking.${role}: expected ${THINKING_LEVELS.join("/")}`);
     }
     validatedThinking[role] = level;
@@ -55,15 +70,26 @@ export function parseConfig(raw: unknown): OmpConfig {
   const tiers = value.serviceTier;
   const serviceTier: NonNullable<OmpConfig["serviceTier"]> = {};
   if (tiers !== undefined) {
-    if (!tiers || typeof tiers !== "object" || Array.isArray(tiers)) throw new Error("serviceTier must be an object");
+    if (!tiers || typeof tiers !== "object" || Array.isArray(tiers))
+      throw new Error("serviceTier must be an object");
     for (const [role, tier] of Object.entries(tiers)) {
-      if (!isRole(role) || role === "council" || role === "orchestrator" || (tier !== "default" && tier !== "priority")) {
+      if (
+        !isRole(role) ||
+        role === "council" ||
+        role === "orchestrator" ||
+        (tier !== "default" && tier !== "priority")
+      ) {
         throw new Error(`Invalid serviceTier.${role}: expected default/priority for a specialist`);
       }
       serviceTier[role] = tier;
     }
   }
-  return { defaultAgent, models: validated, thinking: validatedThinking, ...(Object.keys(serviceTier).length ? { serviceTier } : {}) };
+  return {
+    defaultAgent,
+    models: validated,
+    thinking: validatedThinking,
+    ...(Object.keys(serviceTier).length ? { serviceTier } : {}),
+  };
 }
 
 export function readConfig(file = configPath()): OmpConfig {
@@ -72,7 +98,11 @@ export function readConfig(file = configPath()): OmpConfig {
 }
 
 // The mutation queue serializes concurrent command writes; rename avoids partial JSON on crash.
-export async function updateConfig(change: (current: OmpConfig) => OmpConfig, file = configPath(), canCommit: () => boolean = () => true): Promise<OmpConfig> {
+export async function updateConfig(
+  change: (current: OmpConfig) => OmpConfig,
+  file = configPath(),
+  canCommit: () => boolean = () => true,
+): Promise<OmpConfig> {
   return withFileMutationQueue(file, async () => {
     const current = readConfig(file);
     if (!canCommit()) return current;
@@ -81,7 +111,10 @@ export async function updateConfig(change: (current: OmpConfig) => OmpConfig, fi
     await fs.promises.mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     try {
-      await fs.promises.writeFile(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      await fs.promises.writeFile(tmp, JSON.stringify(next, null, 2) + "\n", {
+        mode: 0o600,
+        flag: "wx",
+      });
       if (!canCommit()) return current;
       await fs.promises.rename(tmp, file);
     } finally {

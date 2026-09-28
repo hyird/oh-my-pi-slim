@@ -21,13 +21,24 @@ export interface TaskSession {
 }
 
 function statRevision(file: string): string {
-  try { const stat = fs.statSync(file, { bigint: true }); return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`; }
-  catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw err; }
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw err;
+  }
 }
 function stableJson(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
-    : item);
+  return JSON.stringify(value, (_key, item) =>
+    item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.keys(item)
+            .sort()
+            .map((key) => [key, item[key]]),
+        )
+      : item,
+  );
 }
 
 // Pi reads the first context file in this order from the agent directory and
@@ -39,7 +50,9 @@ function contextRevision(dir: string): string {
     try {
       const stat = fs.statSync(file, { bigint: true });
       if (stat.isFile()) return `${name}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-    } catch { /* Pi skips unreadable context candidates and tries the next name. */ }
+    } catch {
+      /* Pi skips unreadable context candidates and tries the next name. */
+    }
   }
   return "missing";
 }
@@ -60,14 +73,20 @@ let cachedAuth: { path: string; stamp: string; revision: string; readAt: number 
 function authRevision(file: string): string {
   const stamp = statRevision(file);
   if (stamp === "missing") return stamp;
-  if (cachedAuth?.path === file && cachedAuth.stamp === stamp && performance.now() - cachedAuth.readAt < 60_000)
+  if (
+    cachedAuth?.path === file &&
+    cachedAuth.stamp === stamp &&
+    performance.now() - cachedAuth.readAt < 60_000
+  )
     return cachedAuth.revision;
   let revision = stamp;
   try {
     const data: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
     if (data && typeof data === "object" && !Array.isArray(data))
       revision = createHash("sha256").update(stableJson(data)).digest("hex");
-  } catch { /* Unreadable or invalid auth must restart the child. */ }
+  } catch {
+    /* Unreadable or invalid auth must restart the child. */
+  }
   cachedAuth = { path: file, stamp, revision, readAt: performance.now() };
   return revision;
 }
@@ -76,31 +95,54 @@ let cachedAccounts: { path: string; stamp: string; revision: string; readAt: num
 function accountsRevision(file: string): string {
   const stamp = statRevision(file);
   if (stamp === "missing") return stamp;
-  if (cachedAccounts?.path === file && cachedAccounts.stamp === stamp && performance.now() - cachedAccounts.readAt < 60_000)
+  if (
+    cachedAccounts?.path === file &&
+    cachedAccounts.stamp === stamp &&
+    performance.now() - cachedAccounts.readAt < 60_000
+  )
     return cachedAccounts.revision;
   let raw: string;
-  try { raw = fs.readFileSync(file, "utf8"); }
-  catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing"; throw err; }
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw err;
+  }
   let revision = stamp;
   try {
     const data: unknown = JSON.parse(raw);
-    if (data && typeof data === "object" && !Array.isArray(data) &&
-      (data as { version?: unknown }).version === 1 && Array.isArray((data as { accounts?: unknown }).accounts)) {
+    if (
+      data &&
+      typeof data === "object" &&
+      !Array.isArray(data) &&
+      (data as { version?: unknown }).version === 1 &&
+      Array.isArray((data as { accounts?: unknown }).accounts)
+    ) {
       const pool = data as { accounts: unknown[] };
-      const accounts = pool.accounts.map(account => {
-        if (!account || typeof account !== "object" || Array.isArray(account)) throw new Error("Invalid account");
+      const accounts = pool.accounts.map((account) => {
+        if (!account || typeof account !== "object" || Array.isArray(account))
+          throw new Error("Invalid account");
         const item = account as Record<string, unknown>;
-        if (typeof item.provider !== "string" || typeof item.name !== "string" ||
-          !item.credential || typeof item.credential !== "object" || Array.isArray(item.credential))
+        if (
+          typeof item.provider !== "string" ||
+          typeof item.name !== "string" ||
+          !item.credential ||
+          typeof item.credential !== "object" ||
+          Array.isArray(item.credential)
+        )
           throw new Error("Invalid account");
         const { email: _email, name: _name, ...relevant } = item;
         return relevant;
       });
       // Display metadata and JSON key order do not change child authentication.
       // Restart only for semantic credential or account-pool changes.
-      revision = createHash("sha256").update(stableJson({ ...data, accounts })).digest("hex");
+      revision = createHash("sha256")
+        .update(stableJson({ ...data, accounts }))
+        .digest("hex");
     }
-  } catch { /* Invalid pools use the file stamp so every replacement restarts the worker. */ }
+  } catch {
+    /* Invalid pools use the file stamp so every replacement restarts the worker. */
+  }
   cachedAccounts = { path: file, stamp, revision, readAt: performance.now() };
   return revision;
 }
@@ -111,7 +153,7 @@ export function resourceRevision(cwd: string): string {
   const accountsPath = path.join(agentDir, "accounts.json");
   return [
     authRevision(path.join(agentDir, "auth.json")),
-    ...["models.json", "settings.json"].map(file => statRevision(path.join(agentDir, file))),
+    ...["models.json", "settings.json"].map((file) => statRevision(path.join(agentDir, file))),
     statRevision(path.join(cwd, ".pi", "settings.json")),
     accountsRevision(accountsPath),
     projectContextRevision(cwd, agentDir),
@@ -124,7 +166,10 @@ export class TaskSessions {
   private idle = new Set<TaskSession>();
   private operations = new Set<Promise<unknown>>();
   private epoch = 0;
-  constructor(private readonly idleMs = 120_000, private readonly maxIdle = 4) {}
+  constructor(
+    private readonly idleMs = 120_000,
+    private readonly maxIdle = 4,
+  ) {}
 
   private track<T>(operation: Promise<T>): Promise<T> {
     this.operations.add(operation);
@@ -136,15 +181,20 @@ export class TaskSessions {
     const seen = new Set<string>();
     for (const item of items) {
       if (item.taskId === undefined) continue;
-      if (typeof item.taskId !== "string" || !item.taskId) throw new Error("Unknown taskId; provide a returned task ID or omit it");
+      if (typeof item.taskId !== "string" || !item.taskId)
+        throw new Error("Unknown taskId; provide a returned task ID or omit it");
       if (seen.has(item.taskId)) throw new Error("A task can only appear once in a batch");
       seen.add(item.taskId);
       const task = this.tasks.get(item.taskId);
       if (!task) throw new Error("Unknown taskId; use a task ID returned by this parent session");
-      if (task.agent !== item.agent || task.scope !== scope) throw new Error("Task role, directory or trust scope changed; start a new task");
-      if (task.busy) throw new Error("Task is still running; wait for its completion before continuing it");
+      if (task.agent !== item.agent || task.scope !== scope)
+        throw new Error("Task role, directory or trust scope changed; start a new task");
+      if (task.busy)
+        throw new Error("Task is still running; wait for its completion before continuing it");
       if (!task.worker?.alive && (!task.sessionFile || !fs.existsSync(task.sessionFile))) {
-        throw new Error("Task has no saved session to resume; inspect partial work before starting a new task");
+        throw new Error(
+          "Task has no saved session to resume; inspect partial work before starting a new task",
+        );
       }
     }
   }
@@ -165,23 +215,33 @@ export class TaskSessions {
     task.signature = signature;
     task.runId = randomUUID();
     task.busy = true;
-    this.track(new Promise<void>(resolve => { task!.finish = resolve; }));
+    this.track(
+      new Promise<void>((resolve) => {
+        task!.finish = resolve;
+      }),
+    );
     return task;
   }
 
-  async worker(task: TaskSession, create: (sessionDir: string, sessionFile?: string) => Promise<RpcWorker>): Promise<RpcWorker> {
+  async worker(
+    task: TaskSession,
+    create: (sessionDir: string, sessionFile?: string) => Promise<RpcWorker>,
+  ): Promise<RpcWorker> {
     const epoch = this.epoch;
     if (task.closing) await task.closing;
-    if (epoch !== this.epoch || this.tasks.get(task.taskId) !== task) throw new Error("Specialist tasks cancelled");
+    if (epoch !== this.epoch || this.tasks.get(task.taskId) !== task)
+      throw new Error("Specialist tasks cancelled");
     if (task.worker?.alive) return task.worker;
-    return this.track(create(task.sessionDir, task.sessionFile).then(async worker => {
-      if (epoch !== this.epoch || this.tasks.get(task.taskId) !== task) {
-        await worker.stop();
-        throw new Error("Specialist tasks cancelled");
-      }
-      task.worker = worker;
-      return worker;
-    }));
+    return this.track(
+      create(task.sessionDir, task.sessionFile).then(async (worker) => {
+        if (epoch !== this.epoch || this.tasks.get(task.taskId) !== task) {
+          await worker.stop();
+          throw new Error("Specialist tasks cancelled");
+        }
+        task.worker = worker;
+        return worker;
+      }),
+    );
   }
 
   release(task: TaskSession): void {
@@ -191,7 +251,10 @@ export class TaskSessions {
     if (task.worker?.sessionFile) task.sessionFile = task.worker.sessionFile;
     if (this.tasks.get(task.taskId) !== task || !task.worker?.alive) return;
     // Council is a one-shot review group; its reviewers have no continuation tool.
-    if (task.agent === "council") { this.retire(task); return; }
+    if (task.agent === "council") {
+      this.retire(task);
+      return;
+    }
     this.idle.add(task);
     task.idleTimer = setTimeout(() => this.retire(task), this.idleMs);
     task.idleTimer.unref?.();

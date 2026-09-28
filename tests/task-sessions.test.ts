@@ -6,21 +6,36 @@ import { runAgent, taskScope, type AgentProgress } from "../extensions/omp/subag
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
 import { RpcWorker } from "../extensions/omp/rpc-worker.ts";
 
-const keys = ["PI_CODING_AGENT_DIR", "OMP_TEST_CAPTURE", "OMP_TEST_WAIT_MS", "OMP_TEST_SETTLE_WAIT_MS", "OMP_TEST_EXIT_WAIT_MS", "OMP_TEST_RETRY", "OMP_TEST_DUPLICATE", "OMP_TEST_FAIL", "OMP_TEST_LENGTH"] as const;
+const keys = [
+  "PI_CODING_AGENT_DIR",
+  "OMP_TEST_CAPTURE",
+  "OMP_TEST_WAIT_MS",
+  "OMP_TEST_SETTLE_WAIT_MS",
+  "OMP_TEST_EXIT_WAIT_MS",
+  "OMP_TEST_RETRY",
+  "OMP_TEST_DUPLICATE",
+  "OMP_TEST_FAIL",
+  "OMP_TEST_LENGTH",
+] as const;
 let saved: Array<string | undefined>;
 let argv: string;
 let root: string;
 let ctx: any;
 let sessions: TaskSessions;
 const capture = () => JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE!, "utf8"));
-const run = (task: string, taskId?: string, signal?: AbortSignal, activity?: (row: AgentProgress) => void, launch = { model: "test/model", thinking: "low" as const }) =>
-  runAgent(ctx, { agent: "fixer", task, taskId }, signal, launch, activity, sessions);
+const run = (
+  task: string,
+  taskId?: string,
+  signal?: AbortSignal,
+  activity?: (row: AgentProgress) => void,
+  launch = { model: "test/model", thinking: "low" as const },
+) => runAgent(ctx, { agent: "fixer", task, taskId }, signal, launch, activity, sessions);
 
 beforeEach(() => {
-  saved = keys.map(key => process.env[key]);
-  keys.forEach(key => delete process.env[key]);
+  saved = keys.map((key) => process.env[key]);
+  keys.forEach((key) => delete process.env[key]);
   argv = process.argv[1];
-  process.argv[1] = path.resolve(import.meta.dir, "fake-pi.mjs");
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
   root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-test-"));
   process.env.PI_CODING_AGENT_DIR = root;
   process.env.OMP_TEST_CAPTURE = path.join(root, "capture.json");
@@ -30,7 +45,10 @@ beforeEach(() => {
 afterEach(async () => {
   await sessions.clear();
   process.argv[1] = argv;
-  keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+  keys.forEach((key, i) => {
+    if (saved[i] === undefined) delete process.env[key];
+    else process.env[key] = saved[i];
+  });
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -65,20 +83,28 @@ test("message_end and retries do not complete a task before settlement", async (
   process.env.OMP_TEST_DUPLICATE = "1";
   const snapshots: AgentProgress[] = [];
   let complete = false;
-  const pending = run("retry", undefined, undefined, row => snapshots.push(row)).then(result => { complete = true; return result; });
-  for (let i = 0; i < 100 && !snapshots.some(row => row.text === "Specialist read the task"); i++) await Bun.sleep(5);
+  const pending = run("retry", undefined, undefined, (row) => snapshots.push(row)).then(
+    (result) => {
+      complete = true;
+      return result;
+    },
+  );
+  for (let i = 0; i < 100 && !snapshots.some((row) => row.text === "Specialist read the task"); i++)
+    await Bun.sleep(5);
   expect(complete).toBe(false);
-  expect(snapshots.some(row => row.state === "done")).toBe(false);
+  expect(snapshots.some((row) => row.state === "done")).toBe(false);
   const result = await pending;
   expect(result.ok).toBe(true);
   expect(result.output).not.toContain("secret");
-  expect(snapshots.some(row => row.activity === "Retrying model request 1/3 after 40ms")).toBe(true);
-  expect(snapshots.some(row => row.activity === "Model request recovered")).toBe(true);
-  expect(snapshots.every(row => !row.activity.includes("secret"))).toBe(true);
-  expect(snapshots.every(row => !row.replyText?.includes("failed provider draft"))).toBe(true);
-  expect(snapshots.every(row => !row.text.includes("failed provider draft"))).toBe(true);
+  expect(snapshots.some((row) => row.activity === "Retrying model request 1/3 after 40ms")).toBe(
+    true,
+  );
+  expect(snapshots.some((row) => row.activity === "Model request recovered")).toBe(true);
+  expect(snapshots.every((row) => !row.activity.includes("secret"))).toBe(true);
+  expect(snapshots.every((row) => !row.replyText?.includes("failed provider draft"))).toBe(true);
+  expect(snapshots.every((row) => !row.text.includes("failed provider draft"))).toBe(true);
   expect(result.usage.cost.total).toBeCloseTo(0.6);
-  expect(snapshots.filter(row => row.state === "done")).toHaveLength(1);
+  expect(snapshots.filter((row) => row.state === "done")).toHaveLength(1);
 });
 
 test("a final output-limit stop is not reported as completed work", async () => {
@@ -119,36 +145,72 @@ test("idle expiry retires the worker and leaves a resumable session", async () =
 test("model and account revisions rebuild a worker while retaining its task context", async () => {
   const first = await run("first");
   let pid = capture().pid;
-  await run("new model", first.taskId, undefined, undefined, { model: "test/other", thinking: "low" });
+  await run("new model", first.taskId, undefined, undefined, {
+    model: "test/other",
+    thinking: "low",
+  });
   expect(capture().pid).not.toBe(pid);
   expect(capture().count).toBe(2);
   pid = capture().pid;
   fs.writeFileSync(path.join(root, "accounts.json"), "{}");
-  await run("new account", first.taskId, undefined, undefined, { model: "test/other", thinking: "low" });
+  await run("new account", first.taskId, undefined, undefined, {
+    model: "test/other",
+    thinking: "low",
+  });
   expect(capture().pid).not.toBe(pid);
   expect(capture().count).toBe(3);
 });
 
 test("account display metadata keeps a warm worker while credential changes restart it", async () => {
   const accountsPath = path.join(root, "accounts.json");
-  const account = { provider: "test", name: "saved", credential: { type: "api_key", key: "first" }, email: "first@example.com" };
+  const account = {
+    provider: "test",
+    name: "saved",
+    credential: { type: "api_key", key: "first" },
+    email: "first@example.com",
+  };
   fs.writeFileSync(accountsPath, JSON.stringify({ version: 1, accounts: [account] }));
   const first = await run("first");
   const pid = capture().pid;
-  fs.writeFileSync(accountsPath, JSON.stringify({ version: 1, accounts: [{ ...account, email: "second@example.com" }] }));
+  fs.writeFileSync(
+    accountsPath,
+    JSON.stringify({ version: 1, accounts: [{ ...account, email: "second@example.com" }] }),
+  );
   const continued = await run("after email update", first.taskId);
   expect(continued.ok).toBe(true);
   expect(capture().pid).toBe(pid);
-  fs.writeFileSync(accountsPath, JSON.stringify({ version: 1, accounts: [{ ...account, name: "renamed", email: "second@example.com" }] }));
+  fs.writeFileSync(
+    accountsPath,
+    JSON.stringify({
+      version: 1,
+      accounts: [{ ...account, name: "renamed", email: "second@example.com" }],
+    }),
+  );
   await run("after label update", first.taskId);
   expect(capture().pid).toBe(pid);
-  fs.writeFileSync(accountsPath, JSON.stringify({ accounts: [{
-    email: "second@example.com", credential: { key: "first", type: "api_key" },
-    name: "renamed", provider: "test",
-  }], version: 1 }));
+  fs.writeFileSync(
+    accountsPath,
+    JSON.stringify({
+      accounts: [
+        {
+          email: "second@example.com",
+          credential: { key: "first", type: "api_key" },
+          name: "renamed",
+          provider: "test",
+        },
+      ],
+      version: 1,
+    }),
+  );
   await run("after field reorder", first.taskId);
   expect(capture().pid).toBe(pid);
-  fs.writeFileSync(accountsPath, JSON.stringify({ version: 1, accounts: [{ ...account, credential: { type: "api_key", key: "second" } }] }));
+  fs.writeFileSync(
+    accountsPath,
+    JSON.stringify({
+      version: 1,
+      accounts: [{ ...account, credential: { type: "api_key", key: "second" } }],
+    }),
+  );
   const refreshed = await run("after credential update", first.taskId);
   expect(refreshed.ok).toBe(true);
   expect(capture().pid).not.toBe(pid);
@@ -156,13 +218,22 @@ test("account display metadata keeps a warm worker while credential changes rest
 
 test("equivalent auth rewrites keep a warm worker while token changes restart it", async () => {
   const authPath = path.join(root, "auth.json");
-  fs.writeFileSync(authPath, JSON.stringify({ test: { type: "api_key", key: "first", env: { A: "1", B: "2" } } }));
+  fs.writeFileSync(
+    authPath,
+    JSON.stringify({ test: { type: "api_key", key: "first", env: { A: "1", B: "2" } } }),
+  );
   const first = await run("first");
   const pid = capture().pid;
-  fs.writeFileSync(authPath, JSON.stringify({ test: { env: { B: "2", A: "1" }, key: "first", type: "api_key" } }));
+  fs.writeFileSync(
+    authPath,
+    JSON.stringify({ test: { env: { B: "2", A: "1" }, key: "first", type: "api_key" } }),
+  );
   await run("after field reorder", first.taskId);
   expect(capture().pid).toBe(pid);
-  fs.writeFileSync(authPath, JSON.stringify({ test: { env: { B: "2", A: "1" }, key: "second", type: "api_key" } }));
+  fs.writeFileSync(
+    authPath,
+    JSON.stringify({ test: { env: { B: "2", A: "1" }, key: "second", type: "api_key" } }),
+  );
   await run("after token change", first.taskId);
   expect(capture().pid).not.toBe(pid);
 });
@@ -192,14 +263,22 @@ test("project instruction changes restart a worker while unrelated files do not"
 test("running, duplicate, unknown and cross-scope continuations are rejected", async () => {
   process.env.OMP_TEST_WAIT_MS = "180";
   let id = "";
-  const pending = run("first", undefined, undefined, row => { id = row.taskId!; });
-  expect(() => sessions.validate([{ agent: "fixer", task: "duplicate", taskId: id }], taskScope(ctx))).toThrow("still running");
+  const pending = run("first", undefined, undefined, (row) => {
+    id = row.taskId!;
+  });
+  expect(() =>
+    sessions.validate([{ agent: "fixer", task: "duplicate", taskId: id }], taskScope(ctx)),
+  ).toThrow("still running");
   const result = await pending;
   expect(result.ok).toBe(true);
   const item = { agent: "fixer" as const, task: "resume", taskId: id };
   expect(() => sessions.validate([item, item], taskScope(ctx))).toThrow("once");
-  expect(() => sessions.validate([{ ...item, taskId: "unknown" }], taskScope(ctx))).toThrow("Unknown");
-  expect(() => sessions.validate([{ ...item, agent: "explorer" }], taskScope(ctx))).toThrow("scope changed");
+  expect(() => sessions.validate([{ ...item, taskId: "unknown" }], taskScope(ctx))).toThrow(
+    "Unknown",
+  );
+  expect(() => sessions.validate([{ ...item, agent: "explorer" }], taskScope(ctx))).toThrow(
+    "scope changed",
+  );
   ctx.isProjectTrusted = () => true;
   expect(() => sessions.validate([item], taskScope(ctx))).toThrow("scope changed");
 });
@@ -207,8 +286,11 @@ test("running, duplicate, unknown and cross-scope continuations are rejected", a
 test("cancellation waits for process exit and allows explicit recovery of partial context", async () => {
   const controller = new AbortController();
   let cancelled = false;
-  const result = await run("[delay=1000] partial", undefined, controller.signal, row => {
-    if (!cancelled && row.text) { cancelled = true; controller.abort(); }
+  const result = await run("[delay=1000] partial", undefined, controller.signal, (row) => {
+    if (!cancelled && row.text) {
+      cancelled = true;
+      controller.abort();
+    }
   });
   expect(result.cancelled).toBe(true);
   const pid = capture().pid;
@@ -229,28 +311,80 @@ test("shutdown covers in-flight launches and repeated cleanup calls", async () =
   expect(next.ok).toBe(true);
 });
 
+test("graceful shutdown consumes the abort acknowledgement and lets the child flush before exit", async () => {
+  const script = path.join(root, "graceful.mjs");
+  const marker = path.join(root, "flushed.txt");
+  fs.writeFileSync(
+    script,
+    `
+    import { createInterface } from "node:readline";
+    import { writeFileSync } from "node:fs";
+    const input = createInterface({ input: process.stdin });
+    input.on("line", line => {
+      const command = JSON.parse(line);
+      const reply = JSON.stringify({ type: "response", id: command.id, success: true, data: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }) + "\\n";
+      if (command.type === "abort") {
+        process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n" + reply.slice(0, 12));
+        setTimeout(() => process.stdout.write(reply.slice(12)), 10);
+      } else process.stdout.write(reply);
+    });
+    input.on("close", () => { writeFileSync(${JSON.stringify(marker)}, "flushed"); process.exit(0); });
+  `,
+  );
+  let cleanups = 0;
+  const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {
+    cleanups++;
+  });
+  try {
+    await worker.ready;
+    await Promise.all([worker.stop(), worker.stop()]);
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(fs.readFileSync(marker, "utf8")).toBe("flushed");
+    expect((worker as any).proc.exitCode).toBe(0);
+    expect(cleanups).toBe(1);
+  } finally {
+    await worker.stop();
+  }
+});
+
 test("unresponsive startup is bounded and interactive requests cannot be auto-approved", async () => {
   const quiet = path.join(root, "quiet.mjs");
-  fs.writeFileSync(quiet, 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0));');
+  fs.writeFileSync(
+    quiet,
+    'process.stdin.resume(); process.stdin.on("end", () => process.exit(0));',
+  );
   const worker = new RpcWorker(process.execPath, [quiet], root, process.env, async () => {}, 40);
   await expect(worker.ready).rejects.toThrow("timed out");
   await worker.stop();
   const ask = path.join(root, "ask.mjs");
-  fs.writeFileSync(ask, 'console.log(JSON.stringify({type:"extension_ui_request",id:"permission",method:"confirm"})); process.stdin.resume();');
+  fs.writeFileSync(
+    ask,
+    'console.log(JSON.stringify({type:"extension_ui_request",id:"permission",method:"confirm"})); process.stdin.resume();',
+  );
   const asking = new RpcWorker(process.execPath, [ask], root, process.env, async () => {}, 500);
   await expect(asking.ready).rejects.toThrow("interactive input");
   await asking.stop();
 });
 
 test("a synchronous RPC input failure rejects promptly and retires the worker", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   await worker.ready;
   const input = (worker as any).proc.stdin;
-  input.write = () => { throw new Error("secret transport error"); };
+  input.write = () => {
+    throw new Error("secret transport error");
+  };
   const started = performance.now();
-  await expect(worker.prompt("work", undefined, () => {})).rejects.toThrow("Specialist RPC input closed");
+  await expect(worker.prompt("work", undefined, () => {})).rejects.toThrow(
+    "Specialist RPC input closed",
+  );
   await worker.closed;
   expect(performance.now() - started).toBeLessThan(1000);
   expect((worker as any).pending.size).toBe(0);
@@ -258,9 +392,15 @@ test("a synchronous RPC input failure rejects promptly and retires the worker", 
 });
 
 test("an asynchronous RPC input error retires an idle worker", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   await worker.ready;
   const started = performance.now();
   (worker as any).proc.stdin.destroy(new Error("secret transport error"));
@@ -271,65 +411,110 @@ test("an asynchronous RPC input error retires an idle worker", async () => {
 });
 
 test("RPC output pipe failure retires the worker without an uncaught stream error", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   try {
     await worker.ready;
     let started!: () => void;
-    const running = new Promise<void>(resolve => { started = resolve; });
-    const pending = worker.prompt("[delay=1000] work", undefined, event => {
+    const running = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const pending = worker.prompt("[delay=1000] work", undefined, (event) => {
       if (event.type === "agent_start") started();
     });
     await running;
-    expect(() => (worker as any).proc.stdout.emit("error", new Error("secret output error"))).not.toThrow();
+    expect(() =>
+      (worker as any).proc.stdout.emit("error", new Error("secret output error")),
+    ).not.toThrow();
     await expect(pending).rejects.toThrow("Specialist RPC output closed");
     await worker.closed;
     expect(worker.alive).toBe(false);
     expect((worker as any).pending.size).toBe(0);
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("an ended RPC output stream retires the worker before the next request times out", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   try {
     await worker.ready;
     (worker as any).proc.stdout.emit("end");
-    const closed = await Promise.race([worker.closed.then(() => true), Bun.sleep(500).then(() => false)]);
+    const closed = await Promise.race([
+      worker.closed.then(() => true),
+      Bun.sleep(500).then(() => false),
+    ]);
     expect(closed).toBe(true);
     expect(worker.alive).toBe(false);
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("RPC diagnostic pipe failure cannot crash or stop healthy model work", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   try {
     await worker.ready;
-    expect(() => (worker as any).proc.stderr.emit("error", new Error("secret diagnostic error"))).not.toThrow();
+    expect(() =>
+      (worker as any).proc.stderr.emit("error", new Error("secret diagnostic error")),
+    ).not.toThrow();
     expect(worker.alive).toBe(true);
     await worker.prompt("work", undefined, () => {});
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("malformed but valid JSON on child stdout cannot crash or close a healthy RPC worker", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   try {
     await worker.ready;
-    expect(() => (worker as any).proc.stdout.emit("data", Buffer.from('null\n[]\n{"type":"response"}\n'))).not.toThrow();
+    expect(() =>
+      (worker as any).proc.stdout.emit("data", Buffer.from('null\n[]\n{"type":"response"}\n')),
+    ).not.toThrow();
     expect(worker.alive).toBe(true);
     await worker.prompt("work", undefined, () => {});
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("an unterminated RPC response cannot satisfy readiness after the child exits", async () => {
   const script = path.join(root, "unterminated-rpc.mjs");
-  fs.writeFileSync(script, `
+  fs.writeFileSync(
+    script,
+    `
     import { createInterface } from "node:readline";
     const input = createInterface({ input: process.stdin });
     input.on("line", line => {
@@ -338,7 +523,8 @@ test("an unterminated RPC response cannot satisfy readiness after the child exit
         command: command.type, success: true, data: { sessionFile: "uncommitted" } }));
       process.exit(0);
     });
-  `);
+  `,
+  );
   const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {}, 500);
   await expect(worker.ready).rejects.toThrow("Specialist process closed before settlement");
   await worker.closed;
@@ -346,39 +532,61 @@ test("an unterminated RPC response cannot satisfy readiness after the child exit
 });
 
 test("an oversized unterminated RPC line fails promptly without retaining the worker", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   try {
     await worker.ready;
     let started!: () => void;
-    const running = new Promise<void>(resolve => { started = resolve; });
-    const pending = worker.prompt("[delay=1000] work", undefined, event => {
+    const running = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const pending = worker.prompt("[delay=1000] work", undefined, (event) => {
       if (event.type === "agent_start") started();
     });
     await running;
     const oversized = Buffer.alloc(16 * 1024 * 1024 + 1, 0x61);
     (worker as any).proc.stdout.emit("data", oversized);
-    await expect(Promise.race([
-      pending,
-      Bun.sleep(1500).then(() => { throw new Error("RPC line was not rejected"); }),
-    ])).rejects.toThrow("Specialist RPC output exceeded the line limit");
+    await expect(
+      Promise.race([
+        pending,
+        Bun.sleep(1500).then(() => {
+          throw new Error("RPC line was not rejected");
+        }),
+      ]),
+    ).rejects.toThrow("Specialist RPC output exceeded the line limit");
     await worker.closed;
     expect(worker.alive).toBe(false);
     expect((worker as any).pending.size).toBe(0);
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("fragmented UTF-8 RPC events reach the active task once", async () => {
-  const script = path.resolve(import.meta.dir, "fake-pi.mjs");
-  const worker = new RpcWorker(process.execPath, [script, "--session-dir", root], root,
-    { ...process.env, OMP_TEST_CAPTURE: undefined }, async () => {}, 5000);
+  const script = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const worker = new RpcWorker(
+    process.execPath,
+    [script, "--session-dir", root],
+    root,
+    { ...process.env, OMP_TEST_CAPTURE: undefined },
+    async () => {},
+    5000,
+  );
   try {
     await worker.ready;
     let started!: () => void;
-    const running = new Promise<void>(resolve => { started = resolve; });
+    const running = new Promise<void>((resolve) => {
+      started = resolve;
+    });
     const markers: string[] = [];
-    const pending = worker.prompt("[delay=80] work", undefined, event => {
+    const pending = worker.prompt("[delay=80] work", undefined, (event) => {
       if (event.type === "agent_start") started();
       if (event.marker) markers.push(event.marker);
     });
@@ -390,12 +598,16 @@ test("fragmented UTF-8 RPC events reach the active task once", async () => {
     (worker as any).proc.stdout.emit("data", frame.subarray(split + 1));
     await pending;
     expect(markers).toEqual(["🌕"]);
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("a later settlement is rechecked when it races an earlier busy-state response", async () => {
   const script = path.join(root, "racing-state.mjs");
-  fs.writeFileSync(script, `
+  fs.writeFileSync(
+    script,
+    `
     import { createInterface } from "node:readline";
     const input = createInterface({ input: process.stdin });
     const emit = event => console.log(JSON.stringify(event));
@@ -405,7 +617,7 @@ test("a later settlement is rechecked when it races an earlier busy-state respon
       if (cmd.type === "get_state") {
         checks++;
         if (checks === 2) emit({ type: "agent_settled" });
-        emit({type:"response", id:cmd.id, command:cmd.type, success:true, data:{isStreaming:checks === 2,pendingMessageCount:0}});
+        emit({type:"response", id:cmd.id, command:cmd.type, success:true, data:{isStreaming:checks === 2,isCompacting:false,pendingMessageCount:0}});
       } else {
         emit({type:"response", id:cmd.id, command:cmd.type, success:true});
         if (cmd.type === "prompt") {
@@ -415,15 +627,67 @@ test("a later settlement is rechecked when it races an earlier busy-state respon
       }
     });
     input.on("close", () => process.exit(0));
-  `);
+  `,
+  );
   const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {}, 300);
-  try { await worker.prompt("work", undefined, () => {}); }
-  finally { await worker.stop(); }
+  try {
+    await worker.prompt("work", undefined, () => {});
+  } finally {
+    await worker.stop();
+  }
+});
+
+test.each(["startup", "settlement"])("invalid RPC state fails safely during %s", async (phase) => {
+  for (const invalid of [
+    null,
+    {},
+    { isStreaming: false, isCompacting: false, pendingMessageCount: "0" },
+  ]) {
+    const script = path.join(root, "invalid-state.mjs");
+    fs.writeFileSync(
+      script,
+      `
+      import { createInterface } from "node:readline";
+      const input = createInterface({ input: process.stdin });
+      const emit = event => console.log(JSON.stringify(event));
+      let checks = 0;
+      input.on("line", line => {
+        const cmd = JSON.parse(line);
+        const invalid = ${JSON.stringify(invalid)};
+        const data = cmd.type === "get_state" && (++checks > 1 || ${JSON.stringify(phase)} === "startup")
+          ? invalid : { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+        emit({ type: "response", id: cmd.id, command: cmd.type, success: true, data });
+        if (cmd.type === "prompt") { emit({ type: "agent_start" }); emit({ type: "agent_settled" }); }
+      });
+      input.on("close", () => process.exit(0));
+    `,
+    );
+    const worker = new RpcWorker(
+      process.execPath,
+      [script],
+      root,
+      process.env,
+      async () => {},
+      500,
+      150,
+    );
+    try {
+      await expect(
+        phase === "startup" ? worker.ready : worker.prompt("work", undefined, () => {}),
+      ).rejects.toThrow("invalid state");
+      await worker.closed;
+      expect(worker.alive).toBe(false);
+    } finally {
+      await worker.stop();
+    }
+  }
 });
 
 test("settlement rechecks a transient busy state without another event", async () => {
   const script = path.join(root, "transient-state.mjs");
-  fs.writeFileSync(script, `
+  fs.writeFileSync(
+    script,
+    `
     import { createInterface } from "node:readline";
     const input = createInterface({ input: process.stdin });
     const emit = event => console.log(JSON.stringify(event));
@@ -433,7 +697,7 @@ test("settlement rechecks a transient busy state without another event", async (
       if (cmd.type === "get_state") {
         checks++;
         emit({ type:"response", id:cmd.id, command:cmd.type, success:true,
-          data:{isStreaming:checks === 2, pendingMessageCount:0} });
+          data:{isStreaming:checks === 2, isCompacting:false, pendingMessageCount:0} });
       } else {
         emit({ type:"response", id:cmd.id, command:cmd.type, success:true });
         if (cmd.type === "prompt") {
@@ -443,15 +707,21 @@ test("settlement rechecks a transient busy state without another event", async (
       }
     });
     input.on("close", () => process.exit(0));
-  `);
+  `,
+  );
   const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {}, 300);
-  try { await worker.prompt("work", undefined, () => {}); }
-  finally { await worker.stop(); }
+  try {
+    await worker.prompt("work", undefined, () => {});
+  } finally {
+    await worker.stop();
+  }
 });
 
 test("a permanently busy state after settlement has a bounded wait", async () => {
   const script = path.join(root, "stuck-state.mjs");
-  fs.writeFileSync(script, `
+  fs.writeFileSync(
+    script,
+    `
     import { createInterface } from "node:readline";
     const input = createInterface({ input: process.stdin });
     const emit = event => console.log(JSON.stringify(event));
@@ -461,7 +731,7 @@ test("a permanently busy state after settlement has a bounded wait", async () =>
       if (cmd.type === "get_state") {
         checks++;
         emit({ type:"response", id:cmd.id, command:cmd.type, success:true,
-          data:{isStreaming:checks > 1, pendingMessageCount:0} });
+          data:{isStreaming:checks > 1, isCompacting:false, pendingMessageCount:0} });
       } else {
         emit({ type:"response", id:cmd.id, command:cmd.type, success:true });
         if (cmd.type === "prompt") {
@@ -471,10 +741,21 @@ test("a permanently busy state after settlement has a bounded wait", async () =>
       }
     });
     input.on("close", () => process.exit(0));
-  `);
-  const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {}, 500, 150);
+  `,
+  );
+  const worker = new RpcWorker(
+    process.execPath,
+    [script],
+    root,
+    process.env,
+    async () => {},
+    500,
+    150,
+  );
   try {
     await expect(worker.prompt("work", undefined, () => {})).rejects.toThrow("did not become idle");
     expect(worker.alive).toBe(false);
-  } finally { await worker.stop(); }
+  } finally {
+    await worker.stop();
+  }
 });

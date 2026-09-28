@@ -1,6 +1,15 @@
-import { truncateToWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import {
+  truncateToWidth,
+  type Component,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
+} from "@earendil-works/pi-tui";
 
-export interface PinnedScrollState { listTop: number; detailTop: number; focusedListRow?: number }
+export interface PinnedScrollState {
+  listTop: number;
+  detailTop: number;
+  focusedListRow?: number;
+}
 
 /** Bound the fixed widget while inserting a scrollable detail below its task row. */
 export function scrollablePinnedCard(
@@ -35,7 +44,9 @@ export function scrollablePinnedCard(
     return {
       lines: [
         ...lines.slice(position, position + contentRows),
-        ...(showFooter ? [hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width))] : []),
+        ...(showFooter
+          ? [hint(truncateToWidth(`  ↕ ${first}–${last}/${lines.length} · scroll`, width))]
+          : []),
       ],
       top: position,
       contentRows,
@@ -50,8 +61,11 @@ export function scrollablePinnedCard(
       detailHeight = detailLines.length;
       // Keep all task rows visible when they fit, even if the detail gets only
       // one or two rows. Long lists share the viewport with a scrollable detail.
-      const listBudget = !detail ? maxRows : listHeight < maxRows ? listHeight
-        : Math.max(1, maxRows - Math.min(4, detailHeight));
+      const listBudget = !detail
+        ? maxRows
+        : listHeight < maxRows
+          ? listHeight
+          : Math.max(1, maxRows - Math.min(4, detailHeight));
       const listVisibleContent = listHeight > listBudget ? Math.max(1, listBudget - 1) : listHeight;
       if (state.focusedListRow !== undefined && listVisibleContent > 0) {
         if (state.focusedListRow < state.listTop) state.listTop = state.focusedListRow;
@@ -64,14 +78,23 @@ export function scrollablePinnedCard(
       state.focusedListRow = undefined;
       listContentRows = visibleList.contentRows;
       listScreenRows = visibleList.lines.length;
-      const visibleDetail = region(detailLines, maxRows - listScreenRows, state.detailTop, width, false);
+      const visibleDetail = region(
+        detailLines,
+        maxRows - listScreenRows,
+        state.detailTop,
+        width,
+        false,
+      );
       state.detailTop = visibleDetail.top;
       detailContentRows = visibleDetail.contentRows;
       detailScreenRows = visibleDetail.lines.length;
-      detailStart = detail ? Math.max(0, Math.min(listContentRows, (insertAfterRow ?? listHeight) - state.listTop)) : listScreenRows;
-      const range = detail && detailHeight > detailContentRows && detailContentRows > 0
-        ? ` ↕ ${state.detailTop + 1}–${Math.min(detailHeight, state.detailTop + detailContentRows)}/${detailHeight}`
-        : undefined;
+      detailStart = detail
+        ? Math.max(0, Math.min(listContentRows, (insertAfterRow ?? listHeight) - state.listTop))
+        : listScreenRows;
+      const range =
+        detail && detailHeight > detailContentRows && detailContentRows > 0
+          ? ` ↕ ${state.detailTop + 1}–${Math.min(detailHeight, state.detailTop + detailContentRows)}/${detailHeight}`
+          : undefined;
       if (setInlineRange?.(range)) {
         // The range belongs to the task row itself, so its hover and card
         // background are rendered by the same components as the task name.
@@ -83,9 +106,13 @@ export function scrollablePinnedCard(
         ...visibleList.lines.slice(detailStart),
       ];
     },
-    invalidate() { list.invalidate(); detail?.invalidate(); },
+    invalidate() {
+      list.invalidate();
+      detail?.invalidate();
+    },
     handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-      const inDetail = !!detail && event.y >= detailStart && event.y < detailStart + detailScreenRows;
+      const inDetail =
+        !!detail && event.y >= detailStart && event.y < detailStart + detailScreenRows;
       const inList = !inDetail;
       const regionTop = inList ? state.listTop : state.detailTop;
       const regionHeight = inList ? listHeight : detailHeight;
@@ -115,7 +142,8 @@ export function scrollablePinnedCard(
         width: viewportWidth || event.width,
         height: regionHeight,
       });
-      if (inList && event.type === "click" && result?.handled) state.focusedListRow = localY + regionTop;
+      if (inList && event.type === "click" && result?.handled)
+        state.focusedListRow = localY + regionTop;
       return result;
     },
   };
