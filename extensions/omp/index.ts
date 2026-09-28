@@ -6,7 +6,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Box, Container, Spacer } from "@earendil-works/pi-tui";
+import { Box, Container } from "@earendil-works/pi-tui";
 import { configPath, isThinkingLevel, parseModel, readConfig, updateConfig } from "./config.ts";
 import { ROLES, ROLE_NAMES, isMainAgent, isRole, type MainAgent, type Role } from "./roles.ts";
 import { showSettingsUi, INHERIT, INHERIT_THINKING, parseRoleSettingValue } from "./settings-ui.ts";
@@ -27,12 +27,12 @@ import { TaskSessions } from "./task-sessions.ts";
 import {
   formatTokenRate,
   OMP_SPINNER_FRAMES,
-  renderPinnedOmpCall,
-  renderPinnedOmpCard,
+  renderPinnedOmpOverview,
   renderPinnedOmpDetail,
   renderOmpToolCall,
   renderOmpToolResult,
   type OmpRenderState,
+  type PinnedOmpBatch,
 } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { installChildServiceTier, supportsServiceTier } from "./service-tier.ts";
@@ -62,12 +62,13 @@ type BackgroundJob = {
   controller: AbortController;
   invalidators: Map<string, () => void>;
   pinnedState: OmpRenderState;
+  displayOrder: number;
   released: boolean;
   animationFrame: number;
   deliveryTimer?: ReturnType<typeof setTimeout>;
 };
 
-type PendingCall = { tasks: Assignment[]; state: OmpRenderState };
+type PendingCall = { tasks: Assignment[]; state: OmpRenderState; displayOrder: number };
 type PendingDelivery = {
   session: number;
   content: string;
@@ -92,6 +93,7 @@ type OmpRuntime = {
   requestPinnedRender?: () => void;
   pinnedUiAvailable: boolean;
   dirtyJobs: Set<BackgroundJob>;
+  nextDisplayOrder: number;
 };
 
 export default function omp(pi: ExtensionAPI) {
@@ -115,6 +117,7 @@ export default function omp(pi: ExtensionAPI) {
     calls: new Map(),
     pending: [],
     dirtyJobs: new Set(),
+    nextDisplayOrder: 0,
     scroll: { listTop: 0, detailTop: 0 },
     pinnedUiAvailable: false,
   };
@@ -250,12 +253,24 @@ export default function omp(pi: ExtensionAPI) {
         ? (tui, theme) => {
             runtime.requestPinnedRender = () => tui.requestRender();
             const list = new Container();
-            const cardStarts = new Map<OmpRenderState, number>();
-            let rowOffset = 0;
-            const states = [
-              ...pending.map((call) => call.state),
-              ...pinned.map((job) => job.pinnedState),
-            ];
+            const batches: Array<PinnedOmpBatch & { displayOrder: number }> = [
+              ...pending.map((call) => ({
+                kind: "call" as const,
+                tasks: call.tasks,
+                state: call.state,
+                displayOrder: call.displayOrder,
+              })),
+              ...pinned.map((job) => ({
+                kind: "job" as const,
+                progress: job.progress,
+                results: job.results,
+                isPartial: job.state === "running",
+                frame: () => job.animationFrame,
+                state: job.pinnedState,
+                displayOrder: job.displayOrder,
+              })),
+            ].sort((a, b) => a.displayOrder - b.displayOrder);
+            const states = batches.map((batch) => batch.state);
             const toggle = (state: OmpRenderState, taskIndex: number) => {
               const wasExpanded = state.expanded?.has(taskIndex) ?? false;
               for (const other of states) other.expanded?.clear();
@@ -263,82 +278,35 @@ export default function omp(pi: ExtensionAPI) {
               runtime.scroll.detailTop = 0;
               refreshPinned();
             };
-            for (const [index, call] of pending.entries()) {
-              if (index) {
-                list.addChild(new Spacer(1));
-                rowOffset++;
-              }
-              cardStarts.set(call.state, rowOffset);
-              const card = new Box(1, 1, (text) => theme.bg("toolPendingBg", text));
-              card.addChild(
-                renderPinnedOmpCall(call.tasks, theme, call.state, refreshPinned, (taskIndex) =>
-                  toggle(call.state, taskIndex),
-                ),
-              );
-              list.addChild(card);
-              rowOffset += call.tasks.length + 3;
-            }
-            for (const [index, job] of pinned.entries()) {
-              if (index || pending.length) {
-                list.addChild(new Spacer(1));
-                rowOffset++;
-              }
-              cardStarts.set(job.pinnedState, rowOffset);
-              const card = new Box(1, 1, (text) => theme.bg("toolSuccessBg", text));
-              card.addChild(
-                renderPinnedOmpCard(
-                  job.progress,
-                  job.results,
-                  job.animationFrame,
-                  theme,
-                  job.pinnedState,
-                  refreshPinned,
-                  job.state === "running",
-                  (taskIndex) => toggle(job.pinnedState, taskIndex),
-                  () => job.animationFrame,
-                ),
-              );
-              list.addChild(card);
-              rowOffset += Math.max(job.progress.length, job.results?.length ?? 0) + 3;
-            }
+            const overview = new Box(1, 1, (text) =>
+              theme.bg(batches.some((batch) => batch.kind === "job")
+                ? "toolSuccessBg" : "toolPendingBg", text),
+            );
+            overview.addChild(renderPinnedOmpOverview(batches, theme, refreshPinned, toggle));
+            list.addChild(overview);
             let detail: Box | undefined;
             let insertAfterRow: number | undefined;
             let expandedState: OmpRenderState | undefined;
-            for (const call of pending) {
-              const index = call.state.expanded?.values().next().value;
-              if (index === undefined || !call.tasks[index]) continue;
-              detail = new Box(1, 0, (text) => theme.bg("toolPendingBg", text));
-              detail.addChild(
-                renderPinnedOmpDetail(
-                  call.tasks[index].task,
-                  undefined,
-                  undefined,
-                  theme,
-                  call.state,
-                ),
-              );
-              insertAfterRow = cardStarts.get(call.state)! + 3 + index;
-              expandedState = call.state;
-              break;
-            }
-            if (!detail)
-              for (const job of pinned) {
-                const index = job.pinnedState.expanded?.values().next().value;
-                if (index === undefined || !job.progress[index]) continue;
-                detail = new Box(1, 0, (text) => theme.bg("toolSuccessBg", text));
-                detail.addChild(
-                  renderPinnedOmpDetail(
-                    job.progress[index].task,
-                    job.progress[index],
-                    job.results?.[index],
-                    theme,
-                    job.pinnedState,
-                  ),
-                );
-                insertAfterRow = cardStarts.get(job.pinnedState)! + 3 + index;
-                expandedState = job.pinnedState;
+            let rowOffset = 0;
+            for (const batch of batches) {
+              const index = batch.state.expanded?.values().next().value;
+              const count = batch.kind === "call"
+                ? batch.tasks.length
+                : Math.max(batch.progress.length, batch.results?.length ?? 0);
+              if (index !== undefined && index >= 0 && index < count) {
+                const item = batch.kind === "job" ? batch.progress[index] : undefined;
+                const final = batch.kind === "job" ? batch.results?.[index] : undefined;
+                const task = batch.kind === "call" ? batch.tasks[index].task : item?.task ?? "";
+                detail = new Box(1, 0, (text) => theme.bg(
+                  batch.kind === "call" ? "toolPendingBg" : "toolSuccessBg", text,
+                ));
+                detail.addChild(renderPinnedOmpDetail(task, item, final, theme, batch.state));
+                insertAfterRow = 3 + rowOffset + index;
+                expandedState = batch.state;
                 break;
               }
+              rowOffset += count;
+            }
             return scrollablePinnedCard(
               list,
               detail,
@@ -384,7 +352,7 @@ export default function omp(pi: ExtensionAPI) {
     // A new dispatch closes previous finished batches in the fixed area. Their
     // original tool cards become visible in the conversation again.
     releaseFinished();
-    calls.set(callId, { tasks, state: {} });
+    calls.set(callId, { tasks, state: {}, displayOrder: runtime.nextDisplayOrder++ });
     flushPaint();
   };
   const renderChatCall = (
@@ -607,6 +575,7 @@ export default function omp(pi: ExtensionAPI) {
       controller,
       invalidators: new Map(),
       pinnedState: calls.get(callId)?.state ?? {},
+      displayOrder: calls.get(callId)?.displayOrder ?? runtime.nextDisplayOrder++,
       released: false,
       animationFrame: 0,
     };

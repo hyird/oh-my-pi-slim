@@ -78,10 +78,21 @@ export interface OmpRenderState {
     view: Component;
   };
 }
+export type PinnedOmpBatch =
+  | { kind: "call"; tasks: readonly Assignment[]; state: OmpRenderState }
+  | {
+      kind: "job";
+      progress: readonly AgentProgress[];
+      results?: readonly Result[];
+      isPartial: boolean;
+      frame: () => number;
+      state: OmpRenderState;
+    };
 interface Interaction {
   state: OmpRenderState;
   invalidate: () => void;
   toggle?: (index: number) => void;
+  hover?: (index: number) => void;
 }
 
 function taskRow(
@@ -132,7 +143,8 @@ function taskRow(
   };
   return new MouseRegion(highlighted, (event) => {
     if (event.type === "move" || event.type === "press") {
-      if (interaction.state.hovered !== index) {
+      if (interaction.hover) interaction.hover(index);
+      else if (interaction.state.hovered !== index) {
         interaction.state.hovered = index;
         interaction.invalidate();
       }
@@ -158,15 +170,113 @@ function taskRow(
 }
 
 function clearHoverOutsideRows(component: Component, interaction: Interaction): Component {
+  return clearHoverOutsideTasks(component, [interaction.state], interaction.invalidate);
+}
+
+function clearHoverOutsideTasks(
+  component: Component,
+  states: readonly OmpRenderState[],
+  invalidate: () => void,
+): Component {
   return new MouseRegion(component, (event) => {
-    if (event.type === "move" && interaction.state.hovered !== undefined) {
-      interaction.state.hovered = undefined;
-      interaction.invalidate();
+    if (event.type === "move" && states.some((state) => state.hovered !== undefined)) {
+      for (const state of states) state.hovered = undefined;
+      invalidate();
       return { handled: true };
     }
     if (event.type === "press" || event.type === "click") return { handled: true };
     return undefined;
   });
+}
+
+/** One heading and one ordered row list for all calls still fixed above the editor. */
+export function renderPinnedOmpOverview(
+  batches: readonly PinnedOmpBatch[],
+  theme: Theme,
+  invalidate: () => void,
+  toggle: (state: OmpRenderState, index: number) => void,
+): Component {
+  const view = new Container();
+  const states = batches.map((batch) => batch.state);
+  const rows = batches.flatMap((batch) => {
+    if (batch.kind === "call")
+      return batch.tasks.map((task, index) => ({
+        agent: task.agent,
+        index,
+        count: batch.tasks.length,
+        status: "queued" as const,
+        state: batch.state,
+        frame: () => 0,
+        throughput: undefined as number | undefined,
+      }));
+    const count = Math.max(batch.progress.length, batch.results?.length ?? 0);
+    return Array.from({ length: count }, (_, index) => {
+      const item = batch.progress[index];
+      const final = batch.results?.[index];
+      const status = !batch.isPartial && final
+        ? final.ok ? "done" : final.cancelled ? "cancelled" : "failed"
+        : (item?.state ?? "queued");
+      return {
+        agent: item?.agent ?? final?.agent ?? "agent",
+        index,
+        count,
+        status,
+        state: batch.state,
+        frame: batch.frame,
+        throughput: item?.tokensPerSecond,
+      };
+    });
+  });
+  const done = rows.filter((row) => row.status === "done").length;
+  const failed = rows.filter((row) => row.status === "failed").length;
+  const cancelled = rows.filter((row) => row.status === "cancelled").length;
+  const queued = rows.filter((row) => row.status === "queued").length;
+  const active = batches.some((batch) => batch.kind === "call" || batch.isPartial);
+  const status = active
+    ? queued === rows.length ? "queued" : "running"
+    : failed ? "failed" : cancelled ? "cancelled" : "done";
+  const color = failed ? "error" : cancelled ? "warning" : status === "queued"
+    ? "muted" : status === "running" ? "warning" : "success";
+  const runningBatch = batches.find((batch): batch is Extract<PinnedOmpBatch, { kind: "job" }> =>
+    batch.kind === "job" && batch.isPartial);
+  const frame = () => runningBatch?.frame() ?? 0;
+  let heading = new TruncatedText("");
+  let headingText = "";
+  view.addChild({
+    render(width) {
+      const icon = status === "running" ? OMP_SPINNER_FRAMES[frame() % OMP_SPINNER_FRAMES.length]
+        : status === "queued" ? "○" : status === "failed" ? "✗"
+        : status === "cancelled" ? "■" : "✓";
+      const next = theme.fg(color, `${icon} `) + theme.fg("toolTitle", theme.bold("OMP")) +
+        theme.fg("muted", ` · ${status} · ${done + failed + cancelled}/${rows.length}`);
+      if (next !== headingText) {
+        heading = new TruncatedText(next);
+        headingText = next;
+      }
+      return heading.render(width);
+    },
+    invalidate() { heading.invalidate(); },
+  });
+  for (const row of rows) {
+    const interaction: Interaction = {
+      state: row.state,
+      invalidate,
+      toggle: (index) => toggle(row.state, index),
+      hover: (index) => {
+        if (row.state.hovered === index && states.every((state) => state === row.state || state.hovered === undefined)) return;
+        for (const state of states) state.hovered = state === row.state ? index : undefined;
+        invalidate();
+      },
+    };
+    view.addChild(taskRow(() => {
+      const { icon, name, color } = stateInfo(row.status, row.frame());
+      const expanded = row.state.expanded?.has(row.index) ?? false;
+      return theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") +
+        theme.fg("accent", taskName(row.agent, row.index, row.count)) +
+        theme.fg("muted", expanded ? " ▾" : " ▸");
+    }, row.index, theme, interaction, row.throughput));
+  }
+  return clearHoverOutsideTasks(view, states, invalidate);
 }
 
 function taskDetails(task: string, reply: string | undefined, theme: Theme): Component {
@@ -269,40 +379,6 @@ export function renderOmpToolResult(
   state.card.clear();
   state.card.addChild(clearHoverOutsideRows(updated, interaction));
   return new Container();
-}
-
-export function renderPinnedOmpCall(
-  tasks: readonly Assignment[],
-  theme: Theme,
-  state: OmpRenderState,
-  invalidate: () => void,
-  toggle?: (index: number) => void,
-): Component {
-  const interaction = { state, invalidate, toggle };
-  return clearHoverOutsideRows(renderOmpCall("OMP", tasks, theme, interaction, false), interaction);
-}
-
-/** Status rows for the fixed editor area; the selected detail renders separately. */
-export function renderPinnedOmpCard(
-  progress: AgentProgress[],
-  results: Result[] | undefined,
-  animationFrame: number,
-  theme: Theme,
-  state: OmpRenderState,
-  invalidate: () => void,
-  isPartial = true,
-  toggle?: (index: number) => void,
-  frame?: () => number,
-): Component {
-  const interaction = { state, invalidate, toggle };
-  const result: AgentToolResult<OmpDetails> = {
-    content: [],
-    details: { progress, results, animationFrame },
-  };
-  return clearHoverOutsideRows(
-    renderOmpResult(result, { expanded: false, isPartial }, theme, interaction, false, frame),
-    interaction,
-  );
 }
 
 export function renderPinnedOmpDetail(

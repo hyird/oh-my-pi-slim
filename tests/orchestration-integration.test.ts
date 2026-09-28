@@ -32,7 +32,7 @@ import {
   renderOmpCall,
   renderOmpResult,
   renderOmpToolCall,
-  renderPinnedOmpCard,
+  renderPinnedOmpOverview,
   renderPinnedOmpDetail,
 } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
@@ -996,12 +996,16 @@ test("the fixed OMP list marks the selected task without inlining its detail", (
     alt: false,
     ctrl: false,
   });
-  let card = renderPinnedOmpCard(progress, undefined, 0, theme, state, () => {});
+  const batch = { kind: "job" as const, progress, isPartial: true, frame: () => 0, state };
+  const toggle = (target: any, index: number) => {
+    target.expanded = new Set([index]);
+  };
+  let card = renderPinnedOmpOverview([batch], theme, () => {}, toggle);
   expect(card.render(80).join("\n")).not.toContain("inspect private task");
   card.handleMouse?.(mouse("press"));
   card.handleMouse?.(mouse("release"));
   card.handleMouse?.(mouse("click"));
-  card = renderPinnedOmpCard(progress, undefined, 1, theme, state, () => {});
+  card = renderPinnedOmpOverview([batch], theme, () => {}, toggle);
   expect(state.expanded.has(0)).toBe(true);
   expect(card.render(80).join("\n")).toContain("Explorer task ▾");
   expect(card.render(80).join("\n")).not.toContain("inspect private task");
@@ -1024,7 +1028,10 @@ test("OMP task rows show measured output token speed without clipping the task n
       tokensPerSecond: 42.3,
     },
   ];
-  const card = renderPinnedOmpCard(progress, undefined, 0, theme, {}, () => {});
+  const card = renderPinnedOmpOverview(
+    [{ kind: "job", progress, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
   expect(card.render(80).join("\n")).toContain("Explorer task ▸ · 42 token/s");
   expect(card.render(34).join("\n")).toContain("Explorer task ▸");
   expect(card.render(34).join("\n")).not.toContain("token/s");
@@ -1549,7 +1556,8 @@ test("a new dispatch leaves an unfinished earlier batch fixed", async () => {
     const fixed = widgetText(pinned);
     expect(fixed).toContain("running · Explorer task");
     expect(fixed).toContain("queued · Fixer task");
-    expect((fixed.match(/OMP/g) ?? []).length).toBe(2);
+    expect((fixed.match(/OMP/g) ?? []).length).toBe(1);
+    expect(fixed.indexOf("Explorer task")).toBeLessThan(fixed.indexOf("Fixer task"));
     h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
   } finally {
     process.argv[1] = originalArgv;
@@ -1557,7 +1565,7 @@ test("a new dispatch leaves an unfinished earlier batch fixed", async () => {
   }
 });
 
-test("separate fixed batches scroll together within half the terminal", () => {
+test("combined fixed batches scroll together within half the terminal", () => {
   const h = harness();
   let pinned: any;
   h.ctx.ui.setWidget = (_key: string, content: any) => {
@@ -1756,7 +1764,80 @@ test("five fixed tasks keep their order around the expanded second task", () => 
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
 
-test("only one task can stay expanded across separate fixed OMP cards", () => {
+test("separate dispatches share one OMP heading and expand in launch order", () => {
+  initTheme();
+  const h = harness();
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  const batches = [
+    { id: "council", name: "omp_council", args: { question: "second review detail" } },
+    { id: "fixer", name: "omp_delegate", args: { agent: "fixer", task: "fixer detail" } },
+    { id: "explorer", name: "omp_delegate", args: { agent: "explorer", task: "explorer detail" } },
+  ];
+  for (const batch of batches)
+    h.handlers.tool_execution_start(
+      { toolCallId: batch.id, toolName: batch.name, args: batch.args }, h.ctx,
+    );
+  const theme: any = {
+    fg: (_color: string, value: string) => value,
+    bg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  };
+  const tui: any = { terminal: { rows: 24 }, requestRender: () => {} };
+  const taskNames = [
+    "Council review 1", "Council review 2", "Council review 3", "Fixer task", "Explorer task",
+  ];
+  const positions = (lines: string[]) => taskNames.map((name) =>
+    lines.findIndex((line) => line.includes(name)));
+  let card = pinned(tui, theme);
+  const collapsed = card.render(100);
+  expect((collapsed.join("\n").match(/OMP/g) ?? []).length).toBe(1);
+  expect(collapsed[1]).toContain("0/5");
+  expect(positions(collapsed)).toEqual([2, 3, 4, 5, 6]);
+  card.handleMouse?.({
+    type: "click", button: "left", x: 10, y: 3, screenX: 10, screenY: 3,
+    width: 100, height: 12, shift: false, alt: false, ctrl: false,
+  });
+  card = pinned(tui, theme);
+  const expanded = card.render(100);
+  const rows = positions(expanded);
+  const detail = expanded.findIndex((line: string) => line.includes("second review detail"));
+  expect(rows[0]).toBeLessThan(rows[1]);
+  expect(rows[1]).toBeLessThan(detail);
+  expect(detail).toBeLessThan(rows[2]);
+  expect(rows.slice(2)).toEqual([rows[2], rows[2] + 1, rows[2] + 2]);
+  h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+});
+
+test("fixed task order survives a later dispatch starting first", async () => {
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  process.env.OMP_TEST_WAIT_MS = "300";
+  let pinned: any;
+  h.ctx.ui.setWidget = (_key: string, content: any) => { pinned = content; };
+  try {
+    await h.handlers.session_start({ reason: "new" }, h.ctx);
+    const first = { agent: "explorer", task: "first" };
+    const second = { agent: "fixer", task: "second" };
+    h.handlers.tool_execution_start(
+      { toolCallId: "started-first", toolName: "omp_delegate", args: first }, h.ctx,
+    );
+    h.handlers.tool_execution_start(
+      { toolCallId: "started-second", toolName: "omp_delegate", args: second }, h.ctx,
+    );
+    await h.tools.omp_delegate.execute("started-second", second, undefined, undefined, h.ctx);
+    const fixed = widgetText(pinned);
+    expect(fixed.indexOf("Explorer task")).toBeLessThan(fixed.indexOf("Fixer task"));
+    expect((fixed.match(/OMP/g) ?? []).length).toBe(1);
+    h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+  } finally {
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_WAIT_MS;
+  }
+});
+
+test("only one task can stay expanded across dispatches in the fixed OMP overview", () => {
   initTheme();
   const h = harness();
   let pinned: any;
