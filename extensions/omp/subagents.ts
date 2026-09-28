@@ -6,7 +6,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readConfig, parseModel, type OmpConfig, type ThinkingLevel } from "./config.ts";
 import { ROLES, isRole, type Role } from "./roles.ts";
 import { startConversation } from "./transcript.ts";
-import { ReplyAccumulator } from "./conversation-content.ts";
+import { ReplyAccumulator, safeText } from "./conversation-content.ts";
 import { supportsServiceTier, type ServiceTier } from "./service-tier.ts";
 import { availableChildModels } from "./models.ts";
 import { RpcWorker } from "./rpc-worker.ts";
@@ -51,8 +51,17 @@ export interface AgentProgress {
   activity: string;
   text: string;
   activities: readonly string[];
+  /** Bounded tool-call summaries; arguments and result bodies are never retained here. */
+  operations?: readonly ToolOperation[];
   /** Confirmed output token throughput across assistant messages; tool time is excluded. */
   tokensPerSecond?: number;
+}
+export interface ToolOperation {
+  id: string;
+  name: string;
+  state: "running" | "done" | "failed";
+  added?: number;
+  removed?: number;
 }
 export interface OmpDetails {
   progress: AgentProgress[];
@@ -72,8 +81,35 @@ export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
       activity: "Waiting to run",
       text: "",
       activities: Object.freeze([]),
+      operations: Object.freeze([]),
     }),
   );
+}
+
+/** Count changed lines from Pi's edit metadata without retaining the diff text. */
+export function editLineCounts(result: unknown): { added: number; removed: number } | undefined {
+  const details = result && typeof result === "object"
+    ? (result as { details?: unknown }).details
+    : undefined;
+  if (!details || typeof details !== "object") return undefined;
+  const { diff, patch } = details as { diff?: unknown; patch?: unknown };
+  const displayDiff = typeof diff === "string";
+  const source = displayDiff ? diff : typeof patch === "string" ? patch : undefined;
+  if (source === undefined) return undefined;
+  let added = 0;
+  let removed = 0;
+  let inHunk = false;
+  for (const line of source.split("\n")) {
+    if (displayDiff) {
+      if (/^\+\s*\d+ /.test(line)) added++;
+      else if (/^-\s*\d+ /.test(line)) removed++;
+    } else {
+      if (line.startsWith("@@")) inHunk = true;
+      else if (inHunk && line.startsWith("+")) added++;
+      else if (inHunk && line.startsWith("-")) removed++;
+    }
+  }
+  return { added, removed };
 }
 
 /** Only the two public upstream endpoints; no inherited imports or credentials. */
@@ -237,6 +273,7 @@ export async function runAgent(
     text: "",
     replyText: "",
     activities: Object.freeze([]),
+    operations: Object.freeze([]),
   };
   const publish = () => {
     try {
@@ -249,6 +286,31 @@ export async function runAgent(
     progress.activity = activity;
     progress.activities = Object.freeze([...progress.activities.slice(-31), activity]);
     publish();
+  };
+  const recordOperation = (operation: ToolOperation) => {
+    progress.operations = Object.freeze([
+      ...(progress.operations ?? []).slice(-31),
+      Object.freeze(operation),
+    ]);
+  };
+  const finishOperation = (id: string, name: string, failed: boolean, result: unknown) => {
+    const operations = [...(progress.operations ?? [])];
+    let index = -1;
+    for (let i = operations.length - 1; i >= 0; i--)
+      if (operations[i].id === id && operations[i].state === "running") {
+        index = i;
+        break;
+      }
+    const counts = !failed && name === "edit" ? editLineCounts(result) : undefined;
+    const finished = Object.freeze({
+      id,
+      name,
+      state: failed ? "failed" as const : "done" as const,
+      ...counts,
+    });
+    if (index < 0) operations.push(finished);
+    else operations[index] = finished;
+    progress.operations = Object.freeze(operations.slice(-32));
   };
   const replies = new ReplyAccumulator();
   const usage = emptyUsage();
@@ -416,6 +478,11 @@ export async function runAgent(
       }
       if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
         toolStarts.set(event.toolCallId ?? event.toolName, performance.now());
+        recordOperation({
+          id: event.toolCallId ?? event.toolName,
+          name: safeText(event.toolName).slice(0, 50) || "tool",
+          state: "running",
+        });
         const args = event.args && typeof event.args === "object" ? event.args : {};
         const location =
           typeof args.path === "string"
@@ -437,6 +504,12 @@ export async function runAgent(
           timings.toolMs += performance.now() - start;
           toolStarts.delete(key);
         }
+        finishOperation(
+          key,
+          safeText(event.toolName).slice(0, 50) || "tool",
+          !!event.isError,
+          event.result,
+        );
         report(`${event.toolName.slice(0, 50)} ${event.isError ? "failed" : "completed"}`);
         return;
       }
@@ -575,8 +648,8 @@ export async function runAssignments(
     if (timer) clearTimeout(timer);
     timer = undefined;
     lastPublished = now;
-    // Rows and activity lists are immutable snapshots. Copy only the outer
-    // ordering array; unchanged agents retain their existing row identities.
+    // Rows, activity lists, and operation summaries are immutable snapshots.
+    // Copy only the outer ordering array; unchanged rows keep their identities.
     try {
       onProgress(progress.slice());
     } catch {

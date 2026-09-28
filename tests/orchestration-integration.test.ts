@@ -12,6 +12,7 @@ import {
   updateConfig,
 } from "../extensions/omp/config.ts";
 import {
+  editLineCounts,
   formatResults,
   queuedProgress,
   resolveModel,
@@ -714,7 +715,7 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
     expect(snapshots[1]).not.toBe(snapshots[0]);
     expect(
       snapshots.every((rows) =>
-        rows.every((row) => Object.isFrozen(row) && Object.isFrozen(row.activities)),
+        rows.every((row) => Object.isFrozen(row) && Object.isFrozen(row.activities) && Object.isFrozen(row.operations)),
       ),
     ).toBe(true);
     expect(
@@ -738,6 +739,60 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_WAIT_MS;
   }
+});
+
+test("expanded OMP details show tool names and edit line counts without tool content", async () => {
+  initTheme();
+  const h = harness();
+  const originalArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  process.env.OMP_TEST_TOOL_SUMMARY = "1";
+  try {
+    const snapshots: AgentProgress[][] = [];
+    const results = await runAssignments(
+      h.ctx,
+      [{ agent: "fixer", task: "keep task description" }],
+      undefined,
+      (snapshot) => snapshots.push(snapshot),
+    );
+    expect(results[0].ok).toBe(true);
+    const progress = snapshots.at(-1)?.[0];
+    expect(progress?.operations?.map(({ name, state, added, removed }) =>
+      ({ name, state, added, removed }))).toEqual([
+      { name: "read", state: "done", added: undefined, removed: undefined },
+      { name: "edit", state: "done", added: 2, removed: 1 },
+      { name: "edit", state: "done", added: 1, removed: 2 },
+    ]);
+    expect(progress?.operations?.every(Object.isFrozen)).toBe(true);
+    expect(snapshots.some((rows) => rows[0].operations?.some((item) =>
+      item.name === "edit" && item.state === "running"))).toBe(true);
+    const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+    const rendered = renderPinnedOmpDetail(
+      "keep task description", progress, results[0], theme,
+    ).render(100).join("\n");
+    expect(rendered).toContain("keep task description");
+    expect(rendered).toContain("Specialist read the task");
+    expect(rendered).toContain("read");
+    expect(rendered).toContain("edit +2 -1");
+    expect(rendered).toContain("edit +1 -2");
+    expect(rendered.indexOf("  read")).toBeLessThan(rendered.indexOf("edit +2 -1"));
+    expect(rendered.indexOf("edit +2 -1")).toBeLessThan(rendered.indexOf("edit +1 -2"));
+    expect(rendered).not.toMatch(/SECRET_|private\/file\.ts/);
+  } finally {
+    process.argv[1] = originalArgv;
+    delete process.env.OMP_TEST_TOOL_SUMMARY;
+  }
+});
+
+test("edit line counts ignore diff context and unified patch headers", () => {
+  expect(editLineCounts({ details: { diff: " 1 context\n-2 old\n+2 new\n+3 new" } }))
+    .toEqual({ added: 2, removed: 1 });
+  expect(editLineCounts({ details: { patch: "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new" } }))
+    .toEqual({ added: 1, removed: 1 });
+  expect(editLineCounts({ details: { patch: "--- a/file\n+++ b/file\n@@ -1 +1 @@\n--- old\n+++ new" } }))
+    .toEqual({ added: 1, removed: 1 });
+  expect(editLineCounts({ content: [{ type: "text", text: "+ SECRET_BODY" }] }))
+    .toBeUndefined();
 });
 
 test("a completion callback failure does not abandon the remaining specialists", async () => {
@@ -2667,7 +2722,12 @@ test("live details reuse assistant previews and markdown components without disk
       expect(renderPinnedOmpDetail("inspect", progress, undefined, theme, state)).toBe(first);
     expect(read).not.toHaveBeenCalled();
     progress.replyText = "updated reply";
-    expect(renderPinnedOmpDetail("inspect", progress, undefined, theme, state)).not.toBe(first);
+    const updatedReply = renderPinnedOmpDetail("inspect", progress, undefined, theme, state);
+    expect(updatedReply).not.toBe(first);
+    progress.operations = Object.freeze([
+      Object.freeze({ id: "tool", name: "read", state: "done" as const }),
+    ]);
+    expect(renderPinnedOmpDetail("inspect", progress, undefined, theme, state)).not.toBe(updatedReply);
   } finally {
     read.mockRestore();
   }

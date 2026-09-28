@@ -11,7 +11,7 @@ import {
   visibleWidth,
   type Component,
 } from "@earendil-works/pi-tui";
-import type { AgentProgress, Assignment, OmpDetails, Result } from "./subagents.ts";
+import type { AgentProgress, Assignment, OmpDetails, Result, ToolOperation } from "./subagents.ts";
 import { getConversation } from "./transcript.ts";
 import { ReplyAccumulator, safeText } from "./conversation-content.ts";
 
@@ -73,6 +73,7 @@ export interface OmpRenderState {
   detail?: {
     task: string;
     reply: string | undefined;
+    operations: readonly ToolOperation[] | undefined;
     theme: Theme;
     palette: string;
     view: Component;
@@ -279,10 +280,29 @@ export function renderPinnedOmpOverview(
   return clearHoverOutsideTasks(view, states, invalidate);
 }
 
-function taskDetails(task: string, reply: string | undefined, theme: Theme): Component {
+function taskDetails(
+  task: string,
+  reply: string | undefined,
+  theme: Theme,
+  operations: readonly ToolOperation[] = [],
+): Component {
   const view = new Container();
   view.addChild(new TruncatedText(theme.fg("muted", "  Task")));
   view.addChild(new Markdown(safeText(task), 2, 0, getMarkdownTheme()));
+  if (operations.length) {
+    view.addChild(new TruncatedText(theme.fg("muted", "  Tools")));
+    for (const operation of operations) {
+      const counts = operation.added !== undefined && operation.removed !== undefined
+        ? ` +${operation.added} -${operation.removed}`
+        : "";
+      const status = operation.state === "running" ? " …"
+        : operation.state === "failed" ? " failed" : "";
+      view.addChild(new TruncatedText(theme.fg(
+        operation.state === "failed" ? "error" : "muted",
+        `  ${safeText(operation.name)}${counts}${status}`,
+      )));
+    }
+  }
   if (reply) {
     view.addChild(new TruncatedText(theme.fg("muted", "  Assistant")));
     view.addChild(new Markdown(boundedOutput(reply), 2, 0, getMarkdownTheme()));
@@ -389,18 +409,21 @@ export function renderPinnedOmpDetail(
   state?: OmpRenderState,
 ): Component {
   const reply = assistantReply(item, final);
-  const palette = theme.fg("muted", "Task") + theme.fg("text", "Assistant");
+  const operations = item?.operations;
+  const palette = theme.fg("muted", "TaskTools") + theme.fg("text", "Assistant") +
+    theme.fg("error", "failed");
   const cached = state?.detail;
   if (
     cached &&
     cached.task === task &&
     cached.reply === reply &&
+    cached.operations === operations &&
     cached.theme === theme &&
     cached.palette === palette
   )
     return cached.view;
-  const view = taskDetails(task, reply, theme);
-  if (state) state.detail = { task, reply, theme, palette, view };
+  const view = taskDetails(task, reply, theme, operations);
+  if (state) state.detail = { task, reply, operations, theme, palette, view };
   return view;
 }
 
@@ -505,7 +528,7 @@ export function renderOmpResult(
       ),
     );
     if (expanded && showDetails)
-      view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme));
+      view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme, item?.operations));
     // Only completed, successful final output. Progress text may be an interim
     // explanation; failed output may contain stderr or provider secrets.
     if (!interaction && !options.isPartial && state === "done" && final?.ok) {

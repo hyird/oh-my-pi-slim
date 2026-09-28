@@ -80,20 +80,36 @@ input.on("line", async (line) => {
     type: "message_update",
     assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Inspecting the code" },
   });
-  for (let i = 0; i < (process.env.OMP_TEST_ACTIVITIES ? 35 : 1); i++) {
-    emit({
-      type: "tool_execution_start",
-      toolCallId: "tool-" + i,
-      toolName: "read",
-      args: { path: process.env.OMP_TEST_ACTIVITIES ? "file-" + i : "src/index.ts" },
-    });
-    if (!process.env.OMP_TEST_ACTIVITIES)
+  if (process.env.OMP_TEST_TOOL_SUMMARY) {
+    emit({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "private/file.ts" } });
+    emit({ type: "tool_execution_end", toolCallId: "read-1", toolName: "read", isError: false,
+      result: { content: [{ type: "text", text: "SECRET_READ_BODY" }] } });
+    emit({ type: "tool_execution_start", toolCallId: "edit-1", toolName: "edit",
+      args: { path: "private/file.ts", edits: [{ oldText: "SECRET_OLD", newText: "SECRET_NEW" }] } });
+    emit({ type: "tool_execution_end", toolCallId: "edit-1", toolName: "edit", isError: false,
+      result: { content: [{ type: "text", text: "SECRET_EDIT_BODY" }],
+        details: { diff: "-1 SECRET_OLD\n+1 SECRET_NEW\n+2 extra", patch: "SECRET_PATCH_BODY" } } });
+    emit({ type: "tool_execution_start", toolCallId: "edit-2", toolName: "edit",
+      args: { path: "private/file.ts", edits: [{ oldText: "SECRET_OLD_2", newText: "SECRET_NEW_2" }] } });
+    emit({ type: "tool_execution_end", toolCallId: "edit-2", toolName: "edit", isError: false,
+      result: { content: [{ type: "text", text: "SECRET_EDIT_BODY_2" }],
+        details: { diff: "-3 old\n-4 old\n+3 new" } } });
+  } else {
+    for (let i = 0; i < (process.env.OMP_TEST_ACTIVITIES ? 35 : 1); i++) {
       emit({
-        type: "tool_execution_end",
+        type: "tool_execution_start",
         toolCallId: "tool-" + i,
         toolName: "read",
-        isError: false,
+        args: { path: process.env.OMP_TEST_ACTIVITIES ? "file-" + i : "src/index.ts" },
       });
+      if (!process.env.OMP_TEST_ACTIVITIES)
+        emit({
+          type: "tool_execution_end",
+          toolCallId: "tool-" + i,
+          toolName: "read",
+          isError: false,
+        });
+    }
   }
   const delay = /\[delay=(\d+)\]/.exec(message)?.[1] ?? process.env.OMP_TEST_WAIT_MS ?? 0;
   await sleep(Number(delay));
