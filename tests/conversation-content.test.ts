@@ -1,9 +1,5 @@
 import { expect, test } from "bun:test";
-import {
-  assistantReplies,
-  safeText,
-  ReplyAccumulator,
-} from "../extensions/omp/conversation-content.ts";
+import { safeText, ReplyAccumulator } from "../extensions/omp/conversation-content.ts";
 
 test("task cards show only assistant replies and replace streamed drafts", () => {
   const events = [
@@ -40,26 +36,26 @@ test("task cards show only assistant replies and replace streamed drafts", () =>
       assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "next reply" },
     },
   ];
-  expect(assistantReplies(events)).toEqual(["final reply", "next reply"]);
-  expect(JSON.stringify(assistantReplies(events))).not.toMatch(/private|hidden|draft/);
+  const replies = new ReplyAccumulator();
+  for (const event of events) replies.record(event);
+  expect(replies.text()).toBe("final reply\n\nnext reply");
+  expect(replies.text()).not.toMatch(/private|hidden|draft/);
 });
 
 test("child output cannot inject terminal controls into cards", () => {
   expect(safeText("hello\x1b[2J\x1b]0;bad\x07\tworld\x00")).toBe("hello    world");
-  expect(
-    assistantReplies([
-      {
-        type: "message_end",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "hidden" },
-            { type: "text", text: "safe\x1b[1G reply" },
-          ],
-        },
-      },
-    ]),
-  ).toEqual(["safe reply"]);
+  const replies = new ReplyAccumulator();
+  replies.record({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "hidden" },
+        { type: "text", text: "safe\x1b[1G reply" },
+      ],
+    },
+  });
+  expect(replies.text()).toBe("safe reply");
 });
 
 test("streamed escape sequences split across deltas never leak their fragments", () => {
@@ -78,7 +74,6 @@ test("streamed escape sequences split across deltas never leak their fragments",
   expect(replies.text()).toBe("hello ");
   replies.record(events[1]);
   expect(replies.text()).toBe("hello world");
-  expect(assistantReplies(events)).toEqual(["hello world"]);
 });
 
 test("incremental replies replace drafts, exclude tool data, and remain bounded", () => {
@@ -153,5 +148,4 @@ test("failed model attempts do not remain in task-card or recorded reply preview
   expect(replies.text()).toBe("valid prior work");
   replies.record(events[3]);
   expect(replies.text()).toBe("valid prior work\n\nrecovered result");
-  expect(assistantReplies(events)).toEqual(["valid prior work", "recovered result"]);
 });

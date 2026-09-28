@@ -882,7 +882,11 @@ test("OMP cards show only safe progress until final outputs, regardless of expan
     details: {
       progress,
       results: [
-        { agent: "explorer", ok: true, output: "**Final answer**\n\nSafe conclusion." },
+        {
+          agent: "explorer",
+          ok: true,
+          output: "**Final answer**\n\nSafe conclusion.\x9d\x1b]0;SECRET_TITLE",
+        },
         { agent: "fixer", ok: false, output: "SECRET_STDERR /private/path" },
       ],
     },

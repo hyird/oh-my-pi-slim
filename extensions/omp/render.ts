@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { AgentProgress, Assignment, OmpDetails, Result } from "./subagents.ts";
 import { getConversation } from "./transcript.ts";
-import { assistantReplies, safeText } from "./conversation-content.ts";
+import { ReplyAccumulator, safeText } from "./conversation-content.ts";
 
 const OUTPUT_LIMIT = 12_000;
 const OUTPUT_LINES = 180;
@@ -24,17 +24,8 @@ export function formatTokenRate(rate: number): string {
   return `${rate < 10 ? rate.toFixed(1) : Math.round(rate)} token/s`;
 }
 
-// Progress is presentation data, not a terminal escape stream. Never render raw tool
-// result content: it can contain arbitrarily long output, arguments, or credentials.
-function clean(value: string): string {
-  return value
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/g, "")
-    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
-}
-
 function boundedOutput(value: string): string {
-  const lines = clean(value).trim().split("\n");
+  const lines = safeText(value).trim().split("\n");
   const shown = lines.slice(0, OUTPUT_LINES).join("\n");
   const chars = Array.from(shown);
   if (chars.length > OUTPUT_LIMIT)
@@ -184,7 +175,7 @@ function taskDetails(task: string, reply: string | undefined, theme: Theme): Com
   view.addChild(new Markdown(safeText(task), 2, 0, getMarkdownTheme()));
   if (reply) {
     view.addChild(new TruncatedText(theme.fg("muted", "  Assistant")));
-    view.addChild(new Markdown(boundedOutput(safeText(reply)), 2, 0, getMarkdownTheme()));
+    view.addChild(new Markdown(boundedOutput(reply), 2, 0, getMarkdownTheme()));
   }
   return view;
 }
@@ -198,8 +189,12 @@ function assistantReply(
   if (item?.conversationId) {
     try {
       const conversation = getConversation(item.conversationId);
-      const replies = conversation && assistantReplies(conversation.events);
-      if (replies?.length) return replies.join("\n\n");
+      if (conversation) {
+        const replies = new ReplyAccumulator();
+        for (const event of conversation.events) replies.record(event);
+        const text = replies.text();
+        if (text) return text;
+      }
     } catch {
       /* A missing recording should not break the tool card. */
     }

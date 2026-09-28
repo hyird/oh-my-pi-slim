@@ -15,36 +15,7 @@ function failedAssistantMessage(message: any): boolean {
   return message?.stopReason === "error" || message?.stopReason === "aborted";
 }
 
-/** Return only assistant text. A completed message replaces its streamed deltas. */
-export function assistantReplies(events: readonly any[]): string[] {
-  const replies: string[] = [];
-  const live = new Map<number, string>();
-  for (const event of events) {
-    if (event?.type === "message_update") {
-      const update = event.assistantMessageEvent;
-      if (update?.type === "text_delta" || update?.type === "text_end") {
-        const index = typeof update.contentIndex === "number" ? update.contentIndex : -1;
-        live.set(
-          index,
-          update.type === "text_end"
-            ? typeof update.content === "string"
-              ? update.content
-              : ""
-            : (live.get(index) ?? "") + (typeof update.delta === "string" ? update.delta : ""),
-        );
-      }
-    } else if (event?.type === "message_end" && event.message?.role === "assistant") {
-      live.clear();
-      if (failedAssistantMessage(event.message)) continue;
-      for (const part of event.message.content ?? []) {
-        if (part?.type === "text") replies.push(safeText(part.text));
-      }
-    }
-  }
-  return [...replies, ...Array.from(live.values(), safeText)].filter(Boolean);
-}
-
-/** Bounded live preview; full events remain in the private JSONL recording. */
+/** Bounded assistant reply preview; full events remain in the private JSONL recording. */
 export class ReplyAccumulator {
   private completed = "";
   private live = new Map<number, string>();
