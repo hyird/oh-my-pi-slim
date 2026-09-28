@@ -51,7 +51,7 @@ export interface AgentProgress {
   activity: string;
   text: string;
   activities: readonly string[];
-  /** Bounded tool-call summaries; arguments and result bodies are never retained here. */
+  /** Bounded tool-call summaries; only command/path arguments are retained, never result bodies. */
   operations?: readonly ToolOperation[];
   /** Confirmed output token throughput across assistant messages; tool time is excluded. */
   tokensPerSecond?: number;
@@ -59,9 +59,24 @@ export interface AgentProgress {
 export interface ToolOperation {
   id: string;
   name: string;
+  invocation?: string;
   state: "running" | "done" | "failed";
   added?: number;
   removed?: number;
+}
+
+/** Keep only locating arguments: edits may also carry complete file contents. */
+function toolInvocation(name: string, args: Record<string, unknown>): string {
+  const text = (key: string) => typeof args[key] === "string" ? safeText(args[key]) : "";
+  const command = text("command") || text("cmd") || text("script");
+  if (command) return `${name} ${command}`;
+  const target = text("path") || text("file_path");
+  if (name === "grep" || name === "find") {
+    const pattern = text("pattern");
+    const glob = name === "grep" ? text("glob") : "";
+    return [name, pattern, target, glob].filter(Boolean).join(" ");
+  }
+  return [name, target].filter(Boolean).join(" ");
 }
 export interface OmpDetails {
   progress: AgentProgress[];
@@ -303,6 +318,7 @@ export async function runAgent(
       }
     const counts = !failed && name === "edit" ? editLineCounts(result) : undefined;
     const finished = Object.freeze({
+      ...(index >= 0 ? operations[index] : {}),
       id,
       name,
       state: failed ? "failed" as const : "done" as const,
@@ -478,12 +494,14 @@ export async function runAgent(
       }
       if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
         toolStarts.set(event.toolCallId ?? event.toolName, performance.now());
+        const name = safeText(event.toolName).slice(0, 50) || "tool";
+        const args = event.args && typeof event.args === "object" ? event.args : {};
         recordOperation({
           id: event.toolCallId ?? event.toolName,
-          name: safeText(event.toolName).slice(0, 50) || "tool",
+          name,
+          invocation: toolInvocation(name, args),
           state: "running",
         });
-        const args = event.args && typeof event.args === "object" ? event.args : {};
         const location =
           typeof args.path === "string"
             ? args.path

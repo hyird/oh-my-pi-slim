@@ -273,7 +273,10 @@ export default function omp(pi: ExtensionAPI) {
             const states = batches.map((batch) => batch.state);
             const toggle = (state: OmpRenderState, taskIndex: number) => {
               const wasExpanded = state.expanded?.has(taskIndex) ?? false;
-              for (const other of states) other.expanded?.clear();
+              for (const other of states) {
+                other.expanded?.clear();
+                other.expandedOperation = undefined;
+              }
               if (!wasExpanded) state.expanded = new Set([taskIndex]);
               runtime.scroll.detailTop = 0;
               refreshPinned();
@@ -300,7 +303,7 @@ export default function omp(pi: ExtensionAPI) {
                 detail = new Box(1, 0, (text) => theme.bg(
                   batch.kind === "call" ? "toolPendingBg" : "toolSuccessBg", text,
                 ));
-                detail.addChild(renderPinnedOmpDetail(task, item, final, theme, batch.state));
+                detail.addChild(renderPinnedOmpDetail(task, item, final, theme, batch.state, refreshPinned, index));
                 insertAfterRow = 3 + rowOffset + index;
                 expandedState = batch.state;
                 break;

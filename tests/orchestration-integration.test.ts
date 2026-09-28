@@ -741,7 +741,7 @@ test("specialist text deltas and tool activity reach ordered live snapshots befo
   }
 });
 
-test("expanded OMP details show tool names and edit line counts without tool content", async () => {
+test("expanded OMP details show commands and file paths with click-to-wrap, without tool output", async () => {
   initTheme();
   const h = harness();
   const originalArgv = process.argv[1];
@@ -757,27 +757,51 @@ test("expanded OMP details show tool names and edit line counts without tool con
     );
     expect(results[0].ok).toBe(true);
     const progress = snapshots.at(-1)?.[0];
-    expect(progress?.operations?.map(({ name, state, added, removed }) =>
-      ({ name, state, added, removed }))).toEqual([
-      { name: "read", state: "done", added: undefined, removed: undefined },
-      { name: "edit", state: "done", added: 2, removed: 1 },
-      { name: "edit", state: "done", added: 1, removed: 2 },
+    const file = "src/core/tasks/event-loop/RootTask/WorkerHandle/internal/deeply-nested-source-file.ts";
+    const command = "rg -n 'resolveRootTask|WorkerHandle|PMR' src/core/tasks/event-loop.ts src/core/tasks/root-task.ts";
+    expect(progress?.operations?.map(({ name, invocation, state, added, removed }) =>
+      ({ name, invocation, state, added, removed }))).toEqual([
+      { name: "bash", invocation: `bash ${command}`, state: "done", added: undefined, removed: undefined },
+      { name: "read", invocation: `read ${file}`, state: "done", added: undefined, removed: undefined },
+      { name: "edit", invocation: `edit ${file}`, state: "done", added: 2, removed: 1 },
+      { name: "edit", invocation: `edit ${file}`, state: "done", added: 1, removed: 2 },
     ]);
     expect(progress?.operations?.every(Object.isFrozen)).toBe(true);
     expect(snapshots.some((rows) => rows[0].operations?.some((item) =>
       item.name === "edit" && item.state === "running"))).toBe(true);
     const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
-    const rendered = renderPinnedOmpDetail(
-      "keep task description", progress, results[0], theme,
-    ).render(100).join("\n");
+    const state = {};
+    const detail = renderPinnedOmpDetail("keep task description", progress, results[0], theme, state);
+    const rendered = detail.render(50).join("\n");
     expect(rendered).toContain("keep task description");
     expect(rendered).toContain("Specialist read the task");
-    expect(rendered).toContain("read");
-    expect(rendered).toContain("edit +2 -1");
-    expect(rendered).toContain("edit +1 -2");
-    expect(rendered.indexOf("  read")).toBeLessThan(rendered.indexOf("edit +2 -1"));
-    expect(rendered.indexOf("edit +2 -1")).toBeLessThan(rendered.indexOf("edit +1 -2"));
-    expect(rendered).not.toMatch(/SECRET_|private\/file\.ts/);
+    expect(rendered).toContain("▸ bash rg -n");
+    expect(rendered).toContain("▸ read src/core/tasks");
+    expect(rendered).toContain("▸ edit +2 -1");
+    expect(rendered).toContain("▸ edit +1 -2");
+    expect(rendered.match(/▸ /g)).toHaveLength(4);
+    expect(rendered).toContain("...");
+    expect(rendered).not.toMatch(/SECRET_|root-task\.ts|deeply-nested-source-file\.ts/);
+    const click = (y: number): any => ({ type: "click", button: "left", x: 10, y,
+      screenX: 10, screenY: y, width: 50, height: detail.render(50).length });
+    const bashRow = detail.render(50).findIndex((line) => line.includes("▸ bash"));
+    expect(detail.handleMouse?.(click(bashRow))?.handled).toBe(true);
+    const bashExpanded = detail.render(50).join("\n");
+    expect(bashExpanded).toContain("▾ bash rg -n");
+    expect(bashExpanded).toContain("root-task.ts");
+    expect(bashExpanded.replace(/\s/g, "")).toContain(command.replace(/\s/g, ""));
+    expect(detail.render(50).length).toBeGreaterThan(rendered.split("\n").length);
+    const readRow = detail.render(50).findIndex((line) => line.includes("▸ read"));
+    expect(detail.handleMouse?.(click(readRow))?.handled).toBe(true);
+    const readExpanded = detail.render(50).map((line) => stripTerminalSequences(line).trim()).join("");
+    expect(readExpanded).toContain(file);
+    expect(readExpanded).not.toContain("root-task.ts");
+    const editRow = detail.render(50).findIndex((line) => line.includes("▸ edit"));
+    expect(detail.handleMouse?.(click(editRow))?.handled).toBe(true);
+    const editExpanded = detail.render(50).map((line) => stripTerminalSequences(line).trim()).join("");
+    expect(editExpanded).toContain(file);
+    expect(editExpanded).toContain("+2 -1");
+    expect(editExpanded).not.toMatch(/SECRET_/);
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_TOOL_SUMMARY;

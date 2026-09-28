@@ -7,6 +7,7 @@ import {
   Container,
   Markdown,
   MouseRegion,
+  Text,
   TruncatedText,
   visibleWidth,
   type Component,
@@ -68,10 +69,12 @@ function taskName(agent: string, index: number, count: number): string {
 export interface OmpRenderState {
   card?: Container;
   expanded?: Set<number>;
+  expandedOperation?: string;
   hovered?: number;
   inlineRange?: string;
   detail?: {
     task: string;
+    taskIndex: number;
     reply: string | undefined;
     operations: readonly ToolOperation[] | undefined;
     theme: Theme;
@@ -163,6 +166,7 @@ function taskRow(
         expanded.clear();
         expanded.add(index);
       }
+      interaction.state.expandedOperation = undefined;
       interaction.invalidate();
       return { handled: true };
     }
@@ -285,23 +289,44 @@ function taskDetails(
   reply: string | undefined,
   theme: Theme,
   operations: readonly ToolOperation[] = [],
+  interaction?: Interaction,
+  taskIndex = 0,
 ): Component {
   const view = new Container();
   view.addChild(new TruncatedText(theme.fg("muted", "  Task")));
   view.addChild(new Markdown(safeText(task), 2, 0, getMarkdownTheme()));
   if (operations.length) {
     view.addChild(new TruncatedText(theme.fg("muted", "  Tools")));
-    for (const operation of operations) {
+    operations.forEach((operation, operationIndex) => {
       const counts = operation.added !== undefined && operation.removed !== undefined
         ? ` +${operation.added} -${operation.removed}`
         : "";
       const status = operation.state === "running" ? " …"
         : operation.state === "failed" ? " failed" : "";
-      view.addChild(new TruncatedText(theme.fg(
-        operation.state === "failed" ? "error" : "muted",
-        `  ${safeText(operation.name)}${counts}${status}`,
-      )));
-    }
+      const key = `${taskIndex}:${operationIndex}:${operation.id}`;
+      const expanded = () => interaction?.state.expandedOperation === key;
+      const invocation = safeText(operation.invocation ?? operation.name);
+      const name = safeText(operation.name);
+      const detail = counts && invocation.startsWith(`${name} `)
+        ? `${name}${counts} ${invocation.slice(name.length + 1)}${status}`
+        : `${invocation}${counts}${status}`;
+      const color = operation.state === "failed" ? "error" : "muted";
+      const line: Component = {
+        render(width) {
+          if (expanded()) return new Text(theme.fg(color, `▾ ${detail}`), 2, 0).render(width);
+          const compact = detail.replace(/\r?\n/g, " ↵ ");
+          return new TruncatedText(theme.fg(color, `${interaction ? "▸ " : ""}${compact}`), 2, 0)
+            .render(width);
+        },
+        invalidate() {},
+      };
+      view.addChild(interaction ? new MouseRegion(line, (event) => {
+        if (event.type !== "click" || event.button !== "left") return undefined;
+        interaction.state.expandedOperation = expanded() ? undefined : key;
+        interaction.invalidate();
+        return { handled: true };
+      }) : line);
+    });
   }
   if (reply) {
     view.addChild(new TruncatedText(theme.fg("muted", "  Assistant")));
@@ -358,7 +383,8 @@ export function renderOmpCall(
         interaction,
       ),
     );
-    if (expanded && showDetails) view.addChild(taskDetails(task.task, undefined, theme));
+    if (expanded && showDetails)
+      view.addChild(taskDetails(task.task, undefined, theme, [], interaction, index));
   });
   return view;
 }
@@ -407,6 +433,8 @@ export function renderPinnedOmpDetail(
   final: Result | undefined,
   theme: Theme,
   state?: OmpRenderState,
+  invalidate: () => void = () => {},
+  taskIndex = 0,
 ): Component {
   const reply = assistantReply(item, final);
   const operations = item?.operations;
@@ -416,14 +444,15 @@ export function renderPinnedOmpDetail(
   if (
     cached &&
     cached.task === task &&
+    cached.taskIndex === taskIndex &&
     cached.reply === reply &&
     cached.operations === operations &&
     cached.theme === theme &&
     cached.palette === palette
   )
     return cached.view;
-  const view = taskDetails(task, reply, theme, operations);
-  if (state) state.detail = { task, reply, operations, theme, palette, view };
+  const view = taskDetails(task, reply, theme, operations, state ? { state, invalidate } : undefined, taskIndex);
+  if (state) state.detail = { task, taskIndex, reply, operations, theme, palette, view };
   return view;
 }
 
@@ -528,7 +557,7 @@ export function renderOmpResult(
       ),
     );
     if (expanded && showDetails)
-      view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme, item?.operations));
+      view.addChild(taskDetails(item?.task ?? "", assistantReply(item, final), theme, item?.operations, interaction, index));
     // Only completed, successful final output. Progress text may be an interim
     // explanation; failed output may contain stderr or provider secrets.
     if (!interaction && !options.isPartial && state === "done" && final?.ok) {
