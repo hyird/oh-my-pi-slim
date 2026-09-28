@@ -28,8 +28,9 @@ import {
   INHERIT,
   INHERIT_THINKING,
 } from "../extensions/omp/settings-ui.ts";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, TruncatedText, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
+  paintPinnedBackground,
   renderOmpCall,
   renderOmpResult,
   renderOmpToolCall,
@@ -851,6 +852,42 @@ test("short tool paths show colored edit counts after the file without an expand
     .toBe(true);
 });
 
+test("fixed OMP background covers truncated and hovered rows through ANSI resets", () => {
+  const colors = { toolSuccessBg: "\x1b[42m", selectedBg: "\x1b[100m" };
+  const theme: any = {
+    bg: (color: keyof typeof colors, text: string) => colors[color] + text + "\x1b[49m",
+    getBgAnsi: (color: keyof typeof colors) => colors[color],
+  };
+  const backgrounds = (line: string) => {
+    let active = "default";
+    const cells: string[] = [];
+    let offset = 0;
+    for (const match of line.matchAll(/\x1b\[([0-9;]*)m/g)) {
+      cells.push(...Array.from(line.slice(offset, match.index), () => active));
+      const codes = match[1] ? match[1].split(";").map(Number) : [0];
+      if (codes.includes(0) || codes.includes(49)) active = "default";
+      if (codes.includes(42)) active = "base";
+      if (codes.includes(100)) active = "selected";
+      offset = match.index! + match[0].length;
+    }
+    cells.push(...Array.from(line.slice(offset), () => active));
+    return cells;
+  };
+  const box = new Box(1, 0, (text) => paintPinnedBackground(theme, "toolSuccessBg", text));
+  box.addChild(new TruncatedText("\x1b[37m" + "long command ".repeat(6) + "\x1b[39m"));
+  const normal = box.render(28)[0]!;
+  expect(normal).toContain("...");
+  expect(backgrounds(normal)).toEqual(Array(28).fill("base"));
+
+  const hovered = new Box(1, 0, (text) => paintPinnedBackground(theme, "toolSuccessBg", text));
+  hovered.addChild({
+    render: (width) => [theme.bg("selectedBg", new TruncatedText("long task ".repeat(8)).render(width)[0]!)],
+    invalidate() {},
+  });
+  const selected = backgrounds(hovered.render(28)[0]!);
+  expect(selected).toEqual(["base", ...Array(26).fill("selected"), "base"]);
+});
+
 test("edit line counts ignore diff context and unified patch headers", () => {
   expect(editLineCounts({ details: { diff: " 1 context\n-2 old\n+2 new\n+3 new" } }))
     .toEqual({ added: 2, removed: 1 });
@@ -1157,6 +1194,36 @@ test("OMP task rows show measured output token speed without clipping the task n
   expect(card.render(80).join("\n")).toContain("Explorer task ▸ · 42 token/s");
   expect(card.render(34).join("\n")).toContain("Explorer task ▸");
   expect(card.render(34).join("\n")).not.toContain("token/s");
+});
+
+test("OMP task rows show retries and quiet time without exposing activity text", () => {
+  initTheme();
+  const theme: any = {
+    fg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  };
+  const item: AgentProgress = {
+    agent: "explorer",
+    task: "private task",
+    state: "running",
+    activity: "SECRET_ACTIVITY private-command",
+    text: "SECRET_PREVIEW",
+    activities: ["SECRET_ACTIVITY private-command"],
+    phase: "retrying",
+    retry: { attempt: 3, max: 3, delayMs: 8000 },
+    lastEventAt: Date.now() - 125_000,
+  };
+  const pinned = renderPinnedOmpOverview(
+    [{ kind: "job", progress: [item], isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  ).render(120).join("\n");
+  expect(pinned).toContain("Explorer task ▸ · no events 2m · retrying 3/3");
+  const result = renderOmpResult(
+    { content: [], details: { progress: [item] } },
+    { expanded: false, isPartial: true }, theme,
+  ).render(120).join("\n");
+  expect(result).toContain("Explorer task · no events 2m · retrying 3/3");
+  expect(pinned + result).not.toMatch(/SECRET_|private-command|private task/);
 });
 
 test("OMP main status shows its own measured token speed and resets for a new turn", async () => {

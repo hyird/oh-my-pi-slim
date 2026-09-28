@@ -259,15 +259,19 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
         sessions,
       );
     const activities: string[] = [];
-    const first = await run("remember the first objective", undefined, (row) =>
-      activities.push(row.activity),
-    );
+    const phases: string[] = [];
+    const first = await run("remember the first objective", undefined, (row) => {
+      activities.push(row.activity);
+      phases.push(row.phase ?? "");
+    });
     expect(first.output).toBe("native result");
     expect(first.ok).toBe(true);
     expect(activities.some((activity) => activity.startsWith("Retrying model request 1/1"))).toBe(
       true,
     );
     expect(activities).toContain("Model request recovered");
+    expect(phases).toContain("retrying");
+    expect(phases).toContain("model");
     expect(activities.every((activity) => !activity.includes("Temporary local outage"))).toBe(true);
     const second = await run("continue the first objective", first.taskId);
     expect(second.ok).toBe(true);
@@ -288,14 +292,17 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
     expect(requests).toHaveLength(5);
     outage = true;
     const failedActivities: string[] = [];
-    const failed = await run("retry during outage", undefined, (row) =>
-      failedActivities.push(row.activity),
-    );
+    const failedPhases: string[] = [];
+    const failed = await run("retry during outage", undefined, (row) => {
+      failedActivities.push(row.activity);
+      failedPhases.push(row.phase ?? "");
+    });
     expect(failed.ok).toBe(false);
     expect(failed.output).toBe(
       "Model request failed after retry. Inspect partial work before continuing.",
     );
     expect(failedActivities).toContain("Model request failed after retry");
+    expect(failedPhases).toContain("retry-failed");
     expect(requests).toHaveLength(7);
     outage = false;
     const recovered = await run("continue after outage", failed.taskId);

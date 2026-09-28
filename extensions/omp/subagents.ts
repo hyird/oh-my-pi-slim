@@ -55,6 +55,11 @@ export interface AgentProgress {
   operations?: readonly ToolOperation[];
   /** Confirmed output token throughput across assistant messages; tool time is excluded. */
   tokensPerSecond?: number;
+  /** Safe, OMP-generated phase for the task row; never provider text or tool arguments. */
+  phase?: "starting" | "model" | "tool" | "retrying" | "retry-failed" | "settling";
+  retry?: Readonly<{ attempt: number; max: number; delayMs: number }>;
+  /** Last child event received, including thinking updates that have no visible preview. */
+  lastEventAt?: number;
 }
 export interface ToolOperation {
   id: string;
@@ -289,8 +294,12 @@ export async function runAgent(
     replyText: "",
     activities: Object.freeze([]),
     operations: Object.freeze([]),
+    phase: "starting",
+    lastEventAt: Date.now(),
   };
+  let lastPublishedAt = 0;
   const publish = () => {
+    lastPublishedAt = Date.now();
     try {
       onActivity?.(Object.freeze({ ...progress }));
     } catch {
@@ -435,6 +444,7 @@ export async function runAgent(
     // A leading slash in task text must not execute a Pi slash/skill command.
     const message = `${assignment.instructions ? assignment.instructions + "\n\n" : ""}Assigned task:\n${task}`;
     await worker.prompt(message, signal, (event) => {
+      progress.lastEventAt = Date.now();
       try {
         conversation!.record(event);
       } catch {
@@ -448,6 +458,8 @@ export async function runAgent(
         const attempt = Number.isSafeInteger(event.attempt) ? Math.max(0, event.attempt) : 0;
         const max = Number.isSafeInteger(event.maxAttempts) ? Math.max(0, event.maxAttempts) : 0;
         const delay = Number.isFinite(event.delayMs) ? Math.max(0, event.delayMs) : 0;
+        progress.phase = "retrying";
+        progress.retry = Object.freeze({ attempt, max, delayMs: delay });
         report(
           `Retrying model request ${attempt}/${max} after ${delay >= 1000 ? `${Math.round(delay / 1000)}s` : `${Math.round(delay)}ms`}`,
         );
@@ -456,6 +468,8 @@ export async function runAgent(
       if (event.type === "auto_retry_end") {
         const retryCancelled = event.finalError === "Retry cancelled";
         retryFailed = !event.success && !retryCancelled;
+        progress.phase = event.success ? "model" : "retry-failed";
+        progress.retry = undefined;
         report(
           event.success
             ? "Model request recovered"
@@ -469,6 +483,9 @@ export async function runAgent(
         messageStartedAt = performance.now();
         output = "";
         finalStop = "";
+        progress.phase = "model";
+        progress.retry = undefined;
+        publish();
         return;
       }
       if (event.type === "message_update") {
@@ -489,10 +506,11 @@ export async function runAgent(
           progress.text = update.content.slice(-2000);
           changed = true;
         }
-        if (changed) publish();
+        if (changed || Date.now() - lastPublishedAt >= 10_000) publish();
         return;
       }
       if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+        progress.phase = "tool";
         toolStarts.set(event.toolCallId ?? event.toolName, performance.now());
         const name = safeText(event.toolName).slice(0, 50) || "tool";
         const args = event.args && typeof event.args === "object" ? event.args : {};
@@ -516,6 +534,7 @@ export async function runAgent(
         return;
       }
       if (event.type === "tool_execution_end" && typeof event.toolName === "string") {
+        progress.phase = "model";
         const key = event.toolCallId ?? event.toolName;
         const start = toolStarts.get(key);
         if (start !== undefined) {
@@ -531,9 +550,15 @@ export async function runAgent(
         report(`${event.toolName.slice(0, 50)} ${event.isError ? "failed" : "completed"}`);
         return;
       }
+      if (event.type === "agent_settled") {
+        progress.phase = "settling";
+        publish();
+        return;
+      }
       if (event.type !== "message_end" || event.message?.role !== "assistant") return;
       const msg = event.message;
       finalStop = msg.stopReason;
+      progress.phase = msg.stopReason === "error" ? "retry-failed" : "model";
       const text =
         msg.content
           ?.filter((part: { type: string }) => part.type === "text")

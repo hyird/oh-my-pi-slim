@@ -21,6 +21,31 @@ const OUTPUT_LINES = 180;
 // Match Pi's Working loader cadence and glyphs.
 export const OMP_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
 
+/** Keep the fixed card's background across resets inserted by text truncation. */
+export function paintPinnedBackground(
+  theme: Theme,
+  color: Parameters<Theme["bg"]>[0],
+  text: string,
+): string {
+  if (typeof theme.getBgAnsi !== "function") return theme.bg(color, text);
+  const base = theme.getBgAnsi(color);
+  let active = base;
+  const restored = text.replace(/\x1b\[([0-9;]*)m/g, (sequence, parameters: string) => {
+    const codes = parameters ? parameters.split(";").map(Number) : [0];
+    if (codes.some((code) => code === 48 || (code >= 40 && code <= 47) ||
+      (code >= 100 && code <= 107))) {
+      active = sequence;
+      return sequence;
+    }
+    if (codes.includes(49)) {
+      active = base;
+      return sequence + base;
+    }
+    return codes.includes(0) ? sequence + active : sequence;
+  });
+  return theme.bg(color, restored);
+}
+
 export function formatTokenRate(rate: number): string {
   return `${rate < 10 ? rate.toFixed(1) : Math.round(rate)} token/s`;
 }
@@ -66,6 +91,33 @@ function taskName(agent: string, index: number, count: number): string {
   return count > 1 ? `${title} ${index + 1}` : title;
 }
 
+function taskStatusLabels(item: AgentProgress | undefined, state: AgentProgress["state"]): string[] {
+  if (!item || state !== "running") return [];
+  const labels: string[] = [];
+  const lastEventAt = item.lastEventAt;
+  if (typeof lastEventAt === "number" && Number.isFinite(lastEventAt)) {
+    const quietMinutes = Math.floor(Math.max(0, Date.now() - lastEventAt) / 60_000);
+    if (quietMinutes > 0) labels.push(`no events ${quietMinutes}m`);
+  }
+  // Only fixed OMP phases are rendered. Activity text can contain tool paths or
+  // provider data, so it must never be used as a task-row label.
+  switch (item.phase) {
+    case "starting": labels.push("starting"); break;
+    case "model": labels.push("model working"); break;
+    case "tool": labels.push("tool running"); break;
+    case "retrying": {
+      const attempt = item.retry?.attempt;
+      const max = item.retry?.max;
+      labels.push(Number.isSafeInteger(attempt) && Number.isSafeInteger(max)
+        ? `retrying ${attempt}/${max}` : "retrying");
+      break;
+    }
+    case "retry-failed": labels.push("request failed"); break;
+    case "settling": labels.push("finishing"); break;
+  }
+  return labels;
+}
+
 export interface OmpRenderState {
   card?: Container;
   expanded?: Set<number>;
@@ -105,6 +157,7 @@ function taskRow(
   theme: Theme,
   interaction?: Interaction,
   throughput?: number,
+  statusLabels?: () => readonly string[],
 ): Component {
   const currentLine = () => (typeof line === "function" ? line() : line);
   let previousLine = currentLine();
@@ -121,6 +174,11 @@ function taskRow(
       : undefined;
     if (range && visibleWidth(content) + visibleWidth(range) <= width)
       content += theme.fg("muted", range);
+    for (const label of statusLabels?.() ?? []) {
+      const suffix = ` · ${label}`;
+      if (visibleWidth(content) + visibleWidth(suffix) <= width)
+        content += theme.fg("muted", suffix);
+    }
     if (throughput !== undefined && Number.isFinite(throughput) && throughput > 0) {
       const rate = ` · ${formatTokenRate(throughput)}`;
       if (visibleWidth(content) + visibleWidth(rate) <= width) content += theme.fg("muted", rate);
@@ -203,7 +261,17 @@ export function renderPinnedOmpOverview(
 ): Component {
   const view = new Container();
   const states = batches.map((batch) => batch.state);
-  const rows = batches.flatMap((batch) => {
+  type PinnedRow = {
+    agent: string;
+    index: number;
+    count: number;
+    status: AgentProgress["state"];
+    state: OmpRenderState;
+    frame: () => number;
+    throughput?: number;
+    item?: AgentProgress;
+  };
+  const rows = batches.flatMap((batch): PinnedRow[] => {
     if (batch.kind === "call")
       return batch.tasks.map((task, index) => ({
         agent: task.agent,
@@ -213,6 +281,7 @@ export function renderPinnedOmpOverview(
         state: batch.state,
         frame: () => 0,
         throughput: undefined as number | undefined,
+        item: undefined,
       }));
     const count = Math.max(batch.progress.length, batch.results?.length ?? 0);
     return Array.from({ length: count }, (_, index) => {
@@ -229,6 +298,7 @@ export function renderPinnedOmpOverview(
         state: batch.state,
         frame: batch.frame,
         throughput: item?.tokensPerSecond,
+        item,
       };
     });
   });
@@ -279,7 +349,8 @@ export function renderPinnedOmpOverview(
       return theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") +
         theme.fg("accent", taskName(row.agent, row.index, row.count)) +
         theme.fg("muted", expanded ? " ▾" : " ▸");
-    }, row.index, theme, interaction, row.throughput));
+    }, row.index, theme, interaction, row.throughput,
+    () => taskStatusLabels(row.item, row.status)));
   }
   return clearHoverOutsideTasks(view, states, invalidate);
 }
@@ -556,6 +627,7 @@ export function renderOmpResult(
         theme,
         interaction,
         item?.tokensPerSecond,
+        () => taskStatusLabels(item, state),
       ),
     );
     if (expanded && showDetails)

@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { runAgent } from "../extensions/omp/subagents.ts";
 import { getConversation, startConversation } from "../extensions/omp/transcript.ts";
 
@@ -268,7 +270,7 @@ test("cancellation flushes events still inside the buffer", async () => {
   expect(getConversation(id)?.meta.state).toBe("cancelled");
 });
 
-test("each text/usage event emits one immutable snapshot with shared activity history", async () => {
+test("phase and text/usage events emit immutable snapshots with shared activity history", async () => {
   fake([
     { type: "message_start", message: { role: "assistant" } },
     {
@@ -297,15 +299,17 @@ test("each text/usage event emits one immutable snapshot with shared activity hi
   expect(result.ok).toBe(true);
   expect(snapshots.map((row) => row.text)).toEqual([
     "",
+    "",
     "first",
     "first second",
     "finished",
     "finished",
+    "finished",
   ]);
-  expect(snapshots[1].tokensPerSecond).toBeGreaterThan(0);
   expect(snapshots[2].tokensPerSecond).toBeGreaterThan(0);
-  expect(snapshots[1].activities).toBe(snapshots[2].activities);
-  expect(snapshots[2].activities).toEqual([]);
+  expect(snapshots[3].tokensPerSecond).toBeGreaterThan(0);
+  expect(snapshots[2].activities).toBe(snapshots[3].activities);
+  expect(snapshots[3].activities).toEqual([]);
   expect(snapshots.at(-1).activities).toEqual(["Work completed"]);
   expect(snapshots.every((row) => Object.isFrozen(row) && Object.isFrozen(row.activities))).toBe(
     true,
@@ -321,6 +325,38 @@ test("incomplete live lines become readable once finished", () => {
   fs.appendFileSync(fileFor(run.id), tail.slice(cut));
   expect(getConversation(run.id)?.events).toEqual([message("completed")]);
   run.finish("done");
+});
+
+test("parent process exit flushes a terminal failure for active recordings", () => {
+  const moduleUrl = pathToFileURL(path.resolve(import.meta.dir, "../extensions/omp/transcript.ts")).href;
+  const script = `
+    import { startConversation } from ${JSON.stringify(moduleUrl)};
+    const run = startConversation("explorer", "interrupted", "test/model");
+    run.record({ type: "message_start", message: { role: "assistant" } });
+    process.exit(0);
+  `;
+  const child = spawnSync(process.execPath, ["-e", script], {
+    cwd: process.cwd(),
+    env: { ...process.env, PI_CODING_AGENT_DIR: root },
+    encoding: "utf8",
+  });
+  expect(child.status).toBe(0);
+  const files = fs.readdirSync(path.join(root, "omp", "conversations"));
+  expect(files).toHaveLength(1);
+  const id = path.basename(files[0]!, ".jsonl");
+  const conversation = getConversation(id)!;
+  expect(conversation.meta.state).toBe("failed");
+  expect(conversation.meta.error).toBe("Parent Pi process exited before specialist settled");
+  expect(conversation.events).toEqual([{ type: "message_start", message: { role: "assistant" } }]);
+});
+
+test("concurrent recordings share one parent exit listener", () => {
+  const before = process.listenerCount("exit");
+  const runs = Array.from({ length: 12 }, (_, index) =>
+    startConversation("explorer", `task ${index}`, "test/model"));
+  expect(process.listenerCount("exit")).toBe(before + 1);
+  for (const run of runs) run.finish("cancelled");
+  expect(process.listenerCount("exit")).toBe(before);
 });
 
 test("a completion is not accepted before its JSONL line is terminated", () => {

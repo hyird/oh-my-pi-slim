@@ -50,6 +50,18 @@ const conversationCache = new Map<
   { revision: fs.BigIntStats; value: Conversation; cost: number }
 >();
 let cacheSize = 0;
+const exitFlushes = new Set<() => void>();
+function flushOnParentExit(): void {
+  for (const flush of [...exitFlushes]) flush();
+}
+function registerExitFlush(flush: () => void): void {
+  if (exitFlushes.size === 0) process.once("exit", flushOnParentExit);
+  exitFlushes.add(flush);
+}
+function unregisterExitFlush(flush: () => void): void {
+  exitFlushes.delete(flush);
+  if (exitFlushes.size === 0) process.off("exit", flushOnParentExit);
+}
 function sameRevision(a: fs.BigIntStats, b: fs.BigIntStats): boolean {
   return (
     a.dev === b.dev &&
@@ -124,6 +136,40 @@ export function startConversation(agent: Role, task: string, model: string, onEr
     pending.push(line);
     pendingBytes += Buffer.byteLength(line);
   };
+  const finish = (
+    state: "done" | "failed" | "cancelled",
+    error?: string,
+    diagnostics?: Record<string, unknown>,
+  ) => {
+    if (finished) return;
+    finished = true;
+    unregisterExitFlush(onProcessExit);
+    meta.state = state;
+    meta.finishedAt = Date.now();
+    if (error) meta.error = error;
+    try {
+      enqueue({
+        type: "completion",
+        state,
+        finishedAt: meta.finishedAt,
+        ...(error ? { error } : {}),
+        ...diagnostics,
+      });
+      flush();
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  const onProcessExit = () => {
+    // Async shutdown hooks cannot run once Pi exits. This synchronous final
+    // flush leaves an honest terminal record for work that lost its parent.
+    try {
+      finish("failed", "Parent Pi process exited before specialist settled");
+    } catch {
+      /* No recovery is possible during process exit. */
+    }
+  };
+  registerExitFlush(onProcessExit);
   return {
     id: meta.id,
     flush,
@@ -151,29 +197,7 @@ export function startConversation(agent: Role, task: string, model: string, onEr
         timer.unref?.();
       }
     },
-    finish(
-      state: "done" | "failed" | "cancelled",
-      error?: string,
-      diagnostics?: Record<string, unknown>,
-    ) {
-      if (finished) return;
-      finished = true;
-      meta.state = state;
-      meta.finishedAt = Date.now();
-      if (error) meta.error = error;
-      try {
-        enqueue({
-          type: "completion",
-          state,
-          finishedAt: meta.finishedAt,
-          ...(error ? { error } : {}),
-          ...diagnostics,
-        });
-        flush();
-      } finally {
-        fs.closeSync(fd);
-      }
-    },
+    finish,
   };
 }
 

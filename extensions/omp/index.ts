@@ -27,6 +27,7 @@ import { TaskSessions } from "./task-sessions.ts";
 import {
   formatTokenRate,
   OMP_SPINNER_FRAMES,
+  paintPinnedBackground,
   renderPinnedOmpOverview,
   renderPinnedOmpDetail,
   renderOmpToolCall,
@@ -282,8 +283,9 @@ export default function omp(pi: ExtensionAPI) {
               refreshPinned();
             };
             const overview = new Box(1, 1, (text) =>
-              theme.bg(batches.some((batch) => batch.kind === "job")
-                ? "toolSuccessBg" : "toolPendingBg", text),
+              paintPinnedBackground(theme,
+                batches.some((batch) => batch.kind === "job")
+                  ? "toolSuccessBg" : "toolPendingBg", text),
             );
             overview.addChild(renderPinnedOmpOverview(batches, theme, refreshPinned, toggle));
             list.addChild(overview);
@@ -300,7 +302,7 @@ export default function omp(pi: ExtensionAPI) {
                 const item = batch.kind === "job" ? batch.progress[index] : undefined;
                 const final = batch.kind === "job" ? batch.results?.[index] : undefined;
                 const task = batch.kind === "call" ? batch.tasks[index].task : item?.task ?? "";
-                detail = new Box(1, 0, (text) => theme.bg(
+                detail = new Box(1, 0, (text) => paintPinnedBackground(theme,
                   batch.kind === "call" ? "toolPendingBg" : "toolSuccessBg", text,
                 ));
                 detail.addChild(renderPinnedOmpDetail(task, item, final, theme, batch.state, refreshPinned, index));
