@@ -69,6 +69,8 @@ test("expanded detail scrolls below its row while later tasks remain visible", (
   card.handleMouse?.(mouse("wheel", 1, 100));
   expect(state.detailTop).toBe(23);
   expect(card.render(40)[1]).toContain("24–30/30");
+  expect(card.handleMouse?.(mouse("wheel", 1, 5))).toEqual({ handled: true, render: false });
+  expect(state.detailTop).toBe(23);
 });
 
 test("a long task list scrolls separately while detail stays visible", () => {
@@ -176,6 +178,23 @@ test("short task lists retain their height and reset stale offsets", () => {
     (text) => text,
   );
   expect(card.render(40)).toEqual(["OMP", "task"]);
+  expect(state).toEqual({ listTop: 0, detailTop: 0 });
+  expect(card.handleMouse?.(mouse("wheel", 1, 5))).toEqual({ handled: true, render: false });
+});
+
+test("wheel over a fully visible expanded detail stays inside the fixed widget", () => {
+  const state = { listTop: 0, detailTop: 0 };
+  const card = scrollablePinnedCard(
+    { render: () => ["OMP", "task"], invalidate() {} },
+    { render: () => ["short detail"], invalidate() {} },
+    2,
+    20,
+    state,
+    () => {},
+    (text) => text,
+  );
+  expect(card.render(40)).toEqual(["OMP", "task", "short detail"]);
+  expect(card.handleMouse?.(mouse("wheel", 2, 5))).toEqual({ handled: true, render: false });
   expect(state).toEqual({ listTop: 0, detailTop: 0 });
 });
 

@@ -133,7 +133,9 @@ export function scrollablePinnedCard(
           if (state[key] !== previous) requestRender();
           return { handled: true, render: state[key] !== previous };
         }
-        return undefined;
+        // Keep a wheel over the fixed OMP widget from scrolling Pi's chat when
+        // this region fits or has already reached its scroll boundary.
+        return { handled: true, render: false };
       }
       if (!target || localY < 0 || localY >= regionContentRows) return undefined;
       const result = target.handleMouse?.({
