@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/hyird/oh-my-pi-slim.git" },
   "homepage": "https://github.com/hyird/oh-my-pi-slim#readme",
-  "files": ["extensions/", "docs/", "README.md", "LICENSE"],
+  "files": ["extensions/", "skills/", "docs/", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./extensions/omp/entry.ts"]
   },

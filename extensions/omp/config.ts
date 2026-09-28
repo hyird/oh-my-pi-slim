@@ -16,7 +16,24 @@ export interface OmpConfig {
   serviceTier?: Partial<Record<Role, ServiceTier>>;
 }
 
-export const DEFAULT_CONFIG: OmpConfig = { defaultAgent: "orchestrator", models: {}, thinking: {} };
+/** Factory settings for a new OMP install. Saved per-role choices override these. */
+export const DEFAULT_CONFIG: OmpConfig = {
+  defaultAgent: "orchestrator",
+  models: {
+    oracle: "openai-codex/gpt-6-astra",
+    librarian: "openai-codex/gpt-6-luna",
+    explorer: "openai-codex/gpt-6-luna",
+    designer: "openai-codex/gpt-6-luna",
+    fixer: "openai-codex/gpt-6-luna",
+  },
+  thinking: {
+    oracle: "high",
+    librarian: "low",
+    explorer: "low",
+    designer: "medium",
+    fixer: "high",
+  },
+};
 export const configPath = () => path.join(getAgentDir(), "omp.json");
 
 export function parseModel(value: string): { provider: string; id: string } | undefined {
@@ -93,7 +110,12 @@ export function parseConfig(raw: unknown): OmpConfig {
 }
 
 export function readConfig(file = configPath()): OmpConfig {
-  if (!fs.existsSync(file)) return { defaultAgent: "orchestrator", models: {}, thinking: {} };
+  if (!fs.existsSync(file))
+    return {
+      defaultAgent: DEFAULT_CONFIG.defaultAgent,
+      models: { ...DEFAULT_CONFIG.models },
+      thinking: { ...DEFAULT_CONFIG.thinking },
+    };
   return parseConfig(JSON.parse(fs.readFileSync(file, "utf8")));
 }
 

@@ -69,6 +69,7 @@ afterEach(() => {
 function harness() {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-mcp-test-"));
   process.env.PI_CODING_AGENT_DIR = tmp;
+  fs.writeFileSync(path.join(tmp, "omp.json"), "{}\n");
   const handlers: Record<string, any> = {};
   const commands: Record<string, any> = {};
   let active = [...names];
@@ -331,7 +332,17 @@ test("librarian child uses only public exclusive MCP servers; other roles inheri
     expect(fixer.args).toContain("--no-themes");
     expect(fixer.args).toContain("--no-prompt-templates");
     expect(fixer.args).not.toContain("--no-extensions");
-    expect(fixer.args).not.toContain("--no-skills");
+    expect(fixer.args).toContain("--no-skills");
+    expect(fixer.args).not.toContain("--skill");
+    await runAgent(h.ctx, { agent: "oracle", task: "review" }, undefined, {
+      model: "test/model",
+      mcpAdapter: true,
+    });
+    const oracle = JSON.parse(fs.readFileSync(capture, "utf8"));
+    expect(oracle.args).toContain("--no-skills");
+    const skill = oracle.args[oracle.args.indexOf("--skill") + 1];
+    expect(path.basename(skill)).toBe("SKILL.md");
+    expect(fs.readFileSync(skill, "utf8")).toContain("name: simplify");
   } finally {
     process.argv[1] = savedArgv;
     delete process.env.OMP_TEST_CAPTURE;

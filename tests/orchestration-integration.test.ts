@@ -6,6 +6,7 @@ import omp from "../extensions/omp/index.ts";
 import { initTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
   configPath,
+  DEFAULT_CONFIG,
   parseConfig,
   parseModel,
   readConfig,
@@ -46,6 +47,8 @@ const liveHarnesses: Array<{ handlers: Record<string, any>; ctx: any }> = [];
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-"));
   process.env.PI_CODING_AGENT_DIR = tmp;
+  // Most integration cases exercise explicit user settings and inheritance.
+  fs.writeFileSync(configPath(), "{}\n");
 });
 afterEach(async () => {
   await Promise.all(liveHarnesses.splice(0).map((h) => h.handlers.session_shutdown({}, h.ctx)));
@@ -229,6 +232,13 @@ function widgetText(content: any, width = 100): string {
 }
 
 describe("config safety", () => {
+  test("a new install uses the factory role defaults without sharing mutable config", () => {
+    fs.rmSync(configPath());
+    expect(readConfig()).toEqual(DEFAULT_CONFIG);
+    const first = readConfig();
+    first.models.oracle = "other/model";
+    expect(readConfig().models.oracle).toBe("openai-codex/gpt-6-astra");
+  });
   test("parses defaults and model IDs; rejects invalid roles and models", () => {
     expect(parseConfig({})).toEqual({ defaultAgent: "orchestrator", models: {}, thinking: {} });
     expect(parseModel("openai-codex/gpt-5.5")).toEqual({ provider: "openai-codex", id: "gpt-5.5" });
@@ -304,6 +314,7 @@ describe("config safety", () => {
 
 describe("/omp settings entry point", () => {
   test("registers only /omp; rejects subcommands without creating a config file", async () => {
+    fs.rmSync(configPath());
     const h = harness();
     expect(Object.keys(h.commands)).toEqual(["omp"]);
     expect(Object.keys(h.shortcuts)).toEqual([]);
@@ -519,6 +530,7 @@ describe("/omp settings entry point", () => {
     await finished;
   });
   test("RPC cannot set a specialist as default even with a forged option", async () => {
+    const before = fs.readFileSync(configPath(), "utf8");
     const h = harness();
     h.ctx.mode = "rpc";
     let calls = 0;
@@ -526,7 +538,7 @@ describe("/omp settings entry point", () => {
       ++calls === 1 ? options[0] : "fixer";
     await h.commands.omp.handler("", h.ctx);
     expect(readConfig().defaultAgent).toBe("orchestrator");
-    expect(fs.existsSync(configPath())).toBe(false);
+    expect(fs.readFileSync(configPath(), "utf8")).toBe(before);
     expect(h.notifications.at(-1)).toContain("Invalid setting");
   });
   test("RPC provides a hierarchical picker without a custom TUI", async () => {

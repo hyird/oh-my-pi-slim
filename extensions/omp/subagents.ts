@@ -394,8 +394,12 @@ export async function runAgent(
           ...(sessionFile ? ["--session", sessionFile] : ["--session-id", lease.taskId]),
           "--no-themes",
           "--no-prompt-templates",
-          // Read-only scouting needs no skill catalog. Explicit task references can still be read.
-          ...(["explorer", "librarian"].includes(agent) ? ["--no-skills"] : []),
+          // Council inherits the main session's skills. Specialists use only
+          // their assigned skills; Oracle gets the bundled simplify skill.
+          ...(agent !== "council" ? ["--no-skills"] : []),
+          ...(agent === "oracle"
+            ? ["--skill", path.resolve(import.meta.dir, "../../skills/simplify/SKILL.md")]
+            : []),
           projectTrusted ? "--approve" : "--no-approve",
           "--model",
           model,
