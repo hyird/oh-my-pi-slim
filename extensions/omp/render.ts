@@ -299,29 +299,31 @@ function taskDetails(
     view.addChild(new TruncatedText(theme.fg("muted", "  Tools")));
     operations.forEach((operation, operationIndex) => {
       const counts = operation.added !== undefined && operation.removed !== undefined
-        ? ` +${operation.added} -${operation.removed}`
+        ? theme.fg("toolDiffAdded", ` +${operation.added}`) +
+          theme.fg("toolDiffRemoved", ` -${operation.removed}`)
         : "";
       const status = operation.state === "running" ? " …"
         : operation.state === "failed" ? " failed" : "";
       const key = `${taskIndex}:${operationIndex}:${operation.id}`;
       const expanded = () => interaction?.state.expandedOperation === key;
       const invocation = safeText(operation.invocation ?? operation.name);
-      const name = safeText(operation.name);
-      const detail = counts && invocation.startsWith(`${name} `)
-        ? `${name}${counts} ${invocation.slice(name.length + 1)}${status}`
-        : `${invocation}${counts}${status}`;
       const color = operation.state === "failed" ? "error" : "muted";
+      const detail = theme.fg(color, invocation) + counts + theme.fg(color, status);
+      const compact = detail.replace(/\r?\n/g, " ↵ ");
+      let canExpand = false;
       const line: Component = {
         render(width) {
-          if (expanded()) return new Text(theme.fg(color, `▾ ${detail}`), 2, 0).render(width);
-          const compact = detail.replace(/\r?\n/g, " ↵ ");
-          return new TruncatedText(theme.fg(color, `${interaction ? "▸ " : ""}${compact}`), 2, 0)
+          canExpand = visibleWidth(compact) > Math.max(1, width - 4);
+          if (canExpand && expanded())
+            return new Text(theme.fg("muted", "▾ ") + detail, 2, 0).render(width);
+          const prefix = canExpand && interaction ? theme.fg("muted", "▸ ") : "";
+          return new TruncatedText(prefix + compact, 2, 0)
             .render(width);
         },
         invalidate() {},
       };
       view.addChild(interaction ? new MouseRegion(line, (event) => {
-        if (event.type !== "click" || event.button !== "left") return undefined;
+        if (event.type !== "click" || event.button !== "left" || !canExpand) return undefined;
         interaction.state.expandedOperation = expanded() ? undefined : key;
         interaction.invalidate();
         return { handled: true };

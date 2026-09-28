@@ -777,8 +777,7 @@ test("expanded OMP details show commands and file paths with click-to-wrap, with
     expect(rendered).toContain("Specialist read the task");
     expect(rendered).toContain("▸ bash rg -n");
     expect(rendered).toContain("▸ read src/core/tasks");
-    expect(rendered).toContain("▸ edit +2 -1");
-    expect(rendered).toContain("▸ edit +1 -2");
+    expect(rendered).toContain("▸ edit src/core/tasks");
     expect(rendered.match(/▸ /g)).toHaveLength(4);
     expect(rendered).toContain("...");
     expect(rendered).not.toMatch(/SECRET_|root-task\.ts|deeply-nested-source-file\.ts/);
@@ -799,13 +798,57 @@ test("expanded OMP details show commands and file paths with click-to-wrap, with
     const editRow = detail.render(50).findIndex((line) => line.includes("▸ edit"));
     expect(detail.handleMouse?.(click(editRow))?.handled).toBe(true);
     const editExpanded = detail.render(50).map((line) => stripTerminalSequences(line).trim()).join("");
-    expect(editExpanded).toContain(file);
-    expect(editExpanded).toContain("+2 -1");
+    expect(editExpanded).toContain(`${file} +2 -1`);
     expect(editExpanded).not.toMatch(/SECRET_/);
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_TOOL_SUMMARY;
   }
+});
+
+test("short tool paths show colored edit counts after the file without an expand arrow", () => {
+  initTheme();
+  const theme: any = {
+    fg: (color: string, value: string) => color === "toolDiffAdded"
+      ? `\x1b[32m${value}\x1b[0m`
+      : color === "toolDiffRemoved" ? `\x1b[31m${value}\x1b[0m` : value,
+    bold: (value: string) => value,
+  };
+  const state = {};
+  const progress: AgentProgress = {
+    agent: "fixer",
+    task: "fix router",
+    state: "done",
+    activity: "",
+    text: "",
+    activities: [],
+    operations: [{
+      id: "edit-1",
+      name: "edit",
+      invocation: "edit tests/web/unit/router/context_dispatch.cpp",
+      state: "done",
+      added: 8,
+      removed: 9,
+    }],
+  };
+  const detail = renderPinnedOmpDetail("fix router", progress, undefined, theme, state);
+  const rows = detail.render(80);
+  const editRow = rows.find((line) => line.includes("context_dispatch.cpp")) ?? "";
+  expect(stripTerminalSequences(editRow).trim()).toBe(
+    "edit tests/web/unit/router/context_dispatch.cpp +8 -9",
+  );
+  expect(editRow).toContain("\x1b[32m +8\x1b[0m");
+  expect(editRow).toContain("\x1b[31m -9\x1b[0m");
+  expect(editRow).not.toContain("▸");
+  const rowIndex = rows.indexOf(editRow);
+  const click: any = { type: "click", button: "left", x: 10, y: rowIndex,
+    screenX: 10, screenY: rowIndex, width: 80, height: rows.length };
+  expect(detail.handleMouse?.(click)?.handled).not.toBe(true);
+  expect(state).not.toHaveProperty("expandedOperation");
+
+  const narrow = detail.render(36);
+  expect(narrow.some((line) => stripTerminalSequences(line).includes("▸ edit") && line.includes("...")))
+    .toBe(true);
 });
 
 test("edit line counts ignore diff context and unified patch headers", () => {
