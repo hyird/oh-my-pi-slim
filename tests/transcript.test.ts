@@ -339,16 +339,24 @@ test("a completion is not accepted before its JSONL line is terminated", () => {
 });
 
 test("a corrupt middle line cannot turn an incomplete recording into a completed one", () => {
-  const run = startConversation("explorer", "corrupt", "test/model");
-  try {
-    fs.appendFileSync(fileFor(run.id), '{"type":"event","event":\n');
-    fs.appendFileSync(
-      fileFor(run.id),
-      JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }) + "\n",
-    );
-    expect(getConversation(run.id)).toBeUndefined();
-  } finally {
-    run.finish("failed");
+  for (const line of [
+    '{"type":"event","event":',
+    '"unexpected string"',
+    '{"type":"unknown"}',
+    '{"type":"meta","meta":{}}',
+    '{"type":"event"}',
+  ]) {
+    const run = startConversation("explorer", "corrupt", "test/model");
+    try {
+      fs.appendFileSync(fileFor(run.id), line + "\n");
+      fs.appendFileSync(
+        fileFor(run.id),
+        JSON.stringify({ type: "completion", state: "done", finishedAt: Date.now() }) + "\n",
+      );
+      expect(getConversation(run.id)).toBeUndefined();
+    } finally {
+      run.finish("failed");
+    }
   }
 });
 

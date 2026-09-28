@@ -249,7 +249,13 @@ export function getConversation(id: string): Conversation | undefined {
         meta.state = event.state;
         meta.finishedAt = event.finishedAt;
         if (event.error) meta.error = event.error;
-      } else if (event.type === "event") events.push(event.event);
+      } else if (event.type === "event" && Object.hasOwn(event, "event")) {
+        events.push(event.event);
+      } else {
+        // Valid JSON can still be a corrupt record. Do not skip it and accept
+        // a later completion as proof that the recording is intact.
+        return undefined;
+      }
     }
     if (completed && trailing) return undefined;
     const result = { meta, events };
