@@ -23,7 +23,6 @@ const capture = () => {
       count,
       pid: process.pid,
       childGuard: process.env.PI_OMP_CHILD,
-      serviceTier: process.env.PI_OMP_SERVICE_TIER,
       mcpMode: process.env.PI_MCP_CONFIG_MODE,
       mcpConfig: args.includes("--mcp-config")
         ? JSON.parse(fs.readFileSync(option("--mcp-config"), "utf8"))

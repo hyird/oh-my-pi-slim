@@ -312,6 +312,7 @@ test("librarian child uses only public exclusive MCP servers; other roles inheri
       "find",
       "ls",
       "bash",
+      "websearch",
       "mcp__context7",
       "mcp__gh_grep",
     ]);

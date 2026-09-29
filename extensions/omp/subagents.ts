@@ -7,7 +7,6 @@ import { readConfig, parseModel, type OmpConfig, type ThinkingLevel } from "./co
 import { ROLES, isRole, type Role } from "./roles.ts";
 import { startConversation } from "./transcript.ts";
 import { ReplyAccumulator, safeText } from "./conversation-content.ts";
-import { supportsServiceTier, type ServiceTier } from "./service-tier.ts";
 import { availableChildModels } from "./models.ts";
 import { RpcWorker } from "./rpc-worker.ts";
 import { TaskSessions, resourceRevision, type TaskSession } from "./task-sessions.ts";
@@ -165,7 +164,6 @@ export interface ModelSnapshot {
 export interface AgentLaunch {
   model: string;
   thinking?: ThinkingLevel;
-  serviceTier?: ServiceTier;
   mcpAdapter?: boolean;
 }
 
@@ -183,7 +181,6 @@ export function resolveLaunches(
         agent === "council"
           ? ctx.thinkingLevel
           : (snapshot.config.thinking[agent] ?? ctx.thinkingLevel),
-      serviceTier: snapshot.config.serviceTier?.[agent],
     });
   }
   return launches;
@@ -261,12 +258,6 @@ export async function runAgent(
       : agent === "council"
         ? ctx.thinkingLevel
         : (config!.thinking[agent] ?? ctx.thinkingLevel);
-  const tier =
-    typeof modelOverride === "object" ? modelOverride.serviceTier : config?.serviceTier?.[agent];
-  const serviceTier =
-    agent !== "council" && supportsServiceTier(parseModel(model)?.provider)
-      ? (tier ?? "default")
-      : undefined;
   const mcpAdapter = typeof modelOverride === "object" && modelOverride.mcpAdapter;
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
@@ -274,7 +265,6 @@ export async function runAgent(
   const signature = JSON.stringify([
     model,
     thinking,
-    serviceTier,
     mcpAdapter,
     prompt,
     ROLES[agent].tools,
@@ -419,7 +409,6 @@ export async function runAgent(
           {
             ...process.env,
             PI_OMP_CHILD: "1",
-            PI_OMP_SERVICE_TIER: serviceTier,
             PI_MCP_CONFIG_MODE: mcpPath ? "exclusive" : undefined,
             MCP_DIRECT_TOOLS: undefined,
           },
@@ -669,7 +658,6 @@ export async function runAssignments(
           typeof modelOverride === "string" ? modelOverride : resolveModel(ctx, agent, snapshot!),
         thinking:
           agent === "council" ? ctx.thinkingLevel : (config!.thinking[agent] ?? ctx.thinkingLevel),
-        serviceTier: config!.serviceTier?.[agent],
       };
       resolved.set(agent, launch);
     }

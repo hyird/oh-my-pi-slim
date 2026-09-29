@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
+import ompEntry from "../extensions/omp/entry.ts";
 import { initTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
   configPath,
@@ -275,6 +276,25 @@ describe("config safety", () => {
     );
     expect(() => parseConfig({ thinking: [] })).toThrow("thinking must be an object");
   });
+  test("obsolete speed settings are ignored and removed when settings change", async () => {
+    const legacy = {
+      defaultAgent: "orchestrator",
+      models: { explorer: "openai-codex/gpt-6-luna" },
+      thinking: { explorer: "low" as const },
+      serviceTier: { explorer: "priority", fixer: "default" },
+    };
+    fs.writeFileSync(configPath(), JSON.stringify(legacy));
+    expect(readConfig()).toEqual({
+      defaultAgent: "orchestrator",
+      models: legacy.models,
+      thinking: legacy.thinking,
+    });
+    await updateConfig((c) => ({ ...c, thinking: { ...c.thinking, explorer: "high" } }));
+    expect(JSON.parse(fs.readFileSync(configPath(), "utf8"))).not.toHaveProperty("serviceTier");
+    for (const serviceTier of [null, [], "fast", { explorer: true }]) {
+      expect(parseConfig({ serviceTier })).toEqual(parseConfig({}));
+    }
+  });
   test("concurrent config writes remain intact", async () => {
     await Promise.all([
       updateConfig((c) => ({
@@ -313,6 +333,31 @@ describe("config safety", () => {
 });
 
 describe("/omp settings entry point", () => {
+  test("children register only websearch, not orchestration or provider tier hooks", async () => {
+    const savedChild = process.env.PI_OMP_CHILD;
+    const savedTier = process.env.PI_OMP_SERVICE_TIER;
+    process.env.PI_OMP_CHILD = "1";
+    process.env.PI_OMP_SERVICE_TIER = "priority";
+    const registered: string[] = [];
+    const pi: any = new Proxy({}, {
+      get(_target, name) {
+        if (name === "registerTool") return (tool: any) => registered.push(tool.name);
+        throw new Error(`Child must not access ${String(name)}`);
+      },
+    });
+    try {
+      await ompEntry(pi);
+      expect(registered).toEqual(["websearch"]);
+      registered.length = 0;
+      omp(pi);
+      expect(registered).toEqual(["websearch"]);
+    } finally {
+      if (savedChild === undefined) delete process.env.PI_OMP_CHILD;
+      else process.env.PI_OMP_CHILD = savedChild;
+      if (savedTier === undefined) delete process.env.PI_OMP_SERVICE_TIER;
+      else process.env.PI_OMP_SERVICE_TIER = savedTier;
+    }
+  });
   test("registers only /omp; rejects subcommands without creating a config file", async () => {
     fs.rmSync(configPath());
     const h = harness();
@@ -341,7 +386,7 @@ describe("/omp settings entry point", () => {
       "designer",
       "fixer",
     ]);
-    expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING} · Standard`);
+    expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
     expect(rows[1].description).toContain("Choose the model, then the thinking level");
     expect(getChoices("default", harness().ctx)).toEqual(["pi", "orchestrator", "council"]);
     expect(getChoices("model:explorer", harness().ctx)[0]).toBe(INHERIT);
@@ -381,7 +426,6 @@ describe("/omp settings entry point", () => {
       if (++calls === 1) return options[3];
       if (calls === 2) return "openai-codex/gpt-5.5"; // forged, now disabled
       if (calls === 3) return "high";
-      if (calls === 4) return "Standard";
       return undefined;
     };
     await h.commands.omp.handler("", h.ctx);
@@ -448,10 +492,7 @@ describe("/omp settings entry point", () => {
     expect(readConfig().models.explorer).toBeUndefined(); // save after thinking is chosen
     for (let i = 0; i < 5; i++) component.handleInput("\x1b[B"); // high
     component.handleInput("\r");
-    expect(component.render(90).join("\n")).toContain("explorer speed");
-    expect(component.render(90).join("\n")).not.toContain("Default");
-    expect(component.render(90).join("\n")).toContain("Standard");
-    component.handleInput("\r"); // standard speed
+    expect(component.render(90).join("\n")).not.toContain("explorer speed");
     await waitFor(
       () =>
         readConfig().models.explorer === "openai-codex/gpt-5.3-codex-spark" &&
@@ -463,7 +504,6 @@ describe("/omp settings entry point", () => {
     component.handleInput("\r");
     for (let i = 0; i < 5; i++) component.handleInput("\x1b[A"); // inherit
     component.handleInput("\r");
-    component.handleInput("\r"); // standard speed
     await waitFor(() => !readConfig().models.explorer && !readConfig().thinking.explorer);
     expect(h.selected).toEqual([]);
     component.handleInput("\x1b");
@@ -568,18 +608,18 @@ describe("/omp settings entry point", () => {
         expect(readConfig().models.explorer).toBeUndefined();
         return "high";
       }
-      if (calls === 4) return "Fast";
       return undefined;
     };
     await h.commands.omp.handler("", h.ctx);
-    expect(titles.slice(0, 3)).toEqual([
+    expect(titles).toEqual([
       "OMP · Main agent / specialist settings (cancel to close)",
       "explorer model",
       "explorer thinking",
+      "OMP · Main agent / specialist settings (cancel to close)",
     ]);
     expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.5");
     expect(readConfig().thinking.explorer).toBe("high");
-    expect(readConfig().serviceTier?.explorer).toBe("priority");
+    expect(readConfig()).not.toHaveProperty("serviceTier");
   });
   test("pi main agent cannot launch OMP children even through a stale tool call", async () => {
     await updateConfig((config) => ({ ...config, defaultAgent: "pi" }));
@@ -644,7 +684,7 @@ describe("/omp settings entry point", () => {
     expect(event.systemPromptOptions.sections.omp_roster).toContain(
       "Never use shell sleep or polling",
     );
-    expect(Object.keys(h.tools).sort()).toEqual(["omp_council", "omp_delegate"]);
+    expect(Object.keys(h.tools).sort()).toEqual(["omp_council", "omp_delegate", "websearch"]);
     await expect(
       h.tools.omp_delegate.execute(
         "id",
@@ -679,7 +719,7 @@ test("isolated child uses the configured specialist model and tool allowlist (of
     expect(recorded.args).not.toContain("--mcp-config"); // adapter is optional for non-Librarians
     expect(recorded.childGuard).toBe("1");
     expect(recorded.args).toContain("--no-approve");
-    expect(recorded.args[recorded.args.indexOf("--tools") + 1]).toBe("read,grep,find,ls");
+    expect(recorded.args[recorded.args.indexOf("--tools") + 1]).toBe("read,grep,find,ls,websearch");
     expect(recorded.args[recorded.args.indexOf("--model") + 1]).toBe(
       "openai-codex/gpt-5.3-codex-spark",
     );

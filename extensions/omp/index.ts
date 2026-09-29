@@ -36,7 +36,7 @@ import {
   type PinnedOmpBatch,
 } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
-import { installChildServiceTier, supportsServiceTier } from "./service-tier.ts";
+import { registerWebSearch } from "./websearch.ts";
 import { hasMcpAdapter, installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
@@ -98,7 +98,7 @@ type OmpRuntime = {
 };
 
 export default function omp(pi: ExtensionAPI) {
-  installChildServiceTier(pi);
+  registerWebSearch(pi);
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
   let role: MainAgent = "orchestrator";
@@ -739,11 +739,6 @@ export default function omp(pi: ExtensionAPI) {
       if (thinkingLevel === null)
         throw new Error(`Invalid specialist model/thinking selection: ${value}`);
       const model = selected.model === INHERIT ? undefined : selected.model;
-      if (!["Standard", "Fast"].includes(selected.speed))
-        throw new Error("Invalid specialist speed");
-      const provider = model ? parseModel(model)?.provider : ctx.model?.provider;
-      if (selected.speed === "Fast" && !supportsServiceTier(provider))
-        throw new Error("Speed settings require an OpenAI or OpenAI Codex model");
       if (model) {
         const spec = parseModel(model);
         if (
@@ -762,10 +757,7 @@ export default function omp(pi: ExtensionAPI) {
         const thinking = { ...current.thinking };
         if (thinkingLevel === undefined) delete thinking[name];
         else thinking[name] = thinkingLevel;
-        const serviceTier = { ...current.serviceTier };
-        if (!supportsServiceTier(provider)) delete serviceTier[name];
-        else serviceTier[name] = selected.speed === "Fast" ? "priority" : "default";
-        return { ...current, models, thinking, serviceTier };
+        return { ...current, models, thinking };
       });
       return;
     }

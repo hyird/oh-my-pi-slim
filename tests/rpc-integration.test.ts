@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,13 @@ import {
   type AgentSession,
   type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
+
+const savedOffline = process.env.PI_OFFLINE;
+beforeEach(() => { process.env.PI_OFFLINE = "1"; });
+afterEach(() => {
+  if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+  else process.env.PI_OFFLINE = savedOffline;
+});
 
 test.each([true, false])(
   "native goal follow-ups wait for OMP results (goal registered first: %s)",
@@ -165,7 +172,7 @@ test.each([true, false])(
   15_000,
 );
 
-test("real Pi RPC retries transient failures, stops at exhaustion, and restores native context", async () => {
+test.each(["dist/cli.js", "dist/bundle/cli.js"])("real Pi 0.99 RPC (%s) retries failures and restores context without tier overrides", async (cliPath) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-native-rpc-"));
   const savedDir = process.env.PI_CODING_AGENT_DIR;
   const argv = process.argv[1];
@@ -215,7 +222,7 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
     process.env.PI_CODING_AGENT_DIR = root;
     process.argv[1] = path.resolve(
       import.meta.dir,
-      "../node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      `../node_modules/@earendil-works/pi-coding-agent/${cliPath}`,
     );
     fs.writeFileSync(
       path.join(root, "settings.json"),
@@ -229,7 +236,7 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
       path.join(root, "models.json"),
       JSON.stringify({
         providers: {
-          "omp-test": {
+          openai: {
             baseUrl: `${server.url.origin}/v1`,
             api: "openai-completions",
             apiKey: "local-test-only",
@@ -248,13 +255,16 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
         },
       }),
     );
+    fs.writeFileSync(path.join(root, "omp.json"), JSON.stringify({
+      serviceTier: { explorer: "priority" },
+    }));
     const ctx: any = { cwd: root, isProjectTrusted: () => false };
     const run = (task: string, taskId?: string, onActivity?: (row: AgentProgress) => void) =>
       runAgent(
         ctx,
         { agent: "explorer", task, taskId },
         undefined,
-        { model: "omp-test/mock", thinking: "off" },
+        { model: "openai/mock", thinking: "off" },
         onActivity,
         sessions,
       );
@@ -284,6 +294,7 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
     expect(requests[0].tools.some((tool: any) => tool.function.name === "omp_delegate")).toBe(
       false,
     );
+    expect(requests[0].tools.some((tool: any) => tool.function.name === "websearch")).toBe(true);
     await run("independent objective"); // evict the first idle process
     const restored = await run("continue after cold restore", first.taskId);
     expect(restored.ok).toBe(true);
@@ -309,6 +320,7 @@ test("real Pi RPC retries transient failures, stops at exhaustion, and restores 
     expect(recovered.ok).toBe(true);
     expect(requests).toHaveLength(8);
     expect(JSON.stringify(requests[7].messages)).toContain("retry during outage");
+    for (const request of requests) expect(request).not.toHaveProperty("service_tier");
   } finally {
     await sessions.clear();
     server.stop(true);

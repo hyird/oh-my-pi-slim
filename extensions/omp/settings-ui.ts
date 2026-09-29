@@ -11,7 +11,6 @@ import {
 } from "@earendil-works/pi-tui";
 import { readConfig, THINKING_LEVELS } from "./config.ts";
 import { MAIN_AGENT_NAMES, ROLES } from "./roles.ts";
-import { supportsServiceTier } from "./service-tier.ts";
 import { availableChildModels } from "./models.ts";
 
 const INHERIT = "Inherit";
@@ -19,19 +18,15 @@ const INHERIT_THINKING = "Inherit";
 const SETTING_SEPARATOR = " · ";
 const SETTING_ROLE_ORDER = ["oracle", "librarian", "explorer", "designer", "fixer"] as const;
 
-export const roleSettingValue = (model: string, thinking: string, speed = "Standard"): string =>
-  [model, thinking, speed].join(SETTING_SEPARATOR);
+export const roleSettingValue = (model: string, thinking: string): string =>
+  [model, thinking].join(SETTING_SEPARATOR);
 export function parseRoleSettingValue(
   value: string,
-): { model: string; thinking: string; speed: string } | undefined {
+): { model: string; thinking: string } | undefined {
   const parts = value.split(SETTING_SEPARATOR);
-  if (parts.length < 2 || parts.length > 3) return undefined;
-  return { model: parts[0], thinking: parts[1], speed: parts[2] ?? "Standard" };
+  if (parts.length !== 2) return undefined;
+  return { model: parts[0], thinking: parts[1] };
 }
-const speedChoices = (model: string, ctx: ExtensionCommandContext) =>
-  supportsServiceTier(model === INHERIT ? ctx.model?.provider : model.split("/")[0])
-    ? ["Standard", "Fast"]
-    : ["Standard"];
 
 export interface SettingsActions {
   /** Applies a selected setting (may throw). */
@@ -55,9 +50,8 @@ export function getSettingsRows(ctx?: ExtensionCommandContext): SettingItem[] {
       currentValue: roleSettingValue(
         config.models[name] ?? INHERIT,
         config.thinking[name] ?? INHERIT_THINKING,
-        config.serviceTier?.[name] === "priority" ? "Fast" : "Standard",
       ),
-      description: `${ROLES[name].description}. Choose the model, then the thinking level and OpenAI speed.${enabled && config.models[name] && !enabled.has(config.models[name]) ? " Configured model is disabled or unavailable; choose an enabled model or Inherit." : ""}`,
+      description: `${ROLES[name].description}. Choose the model, then the thinking level.${enabled && config.models[name] && !enabled.has(config.models[name]) ? " Configured model is disabled or unavailable; choose an enabled model or Inherit." : ""}`,
     })),
   ];
 }
@@ -139,10 +133,9 @@ async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): 
         const selected = parseRoleSettingValue(current);
         let model = selected?.model ?? INHERIT;
         let thinking = selected?.thinking ?? INHERIT_THINKING;
-        let speed = selected?.speed ?? "Standard";
         const modelChoices = itemsFor(`model:${role}`);
         const thinkingChoices = itemsFor(`thinking:${role}`);
-        let phase: "model" | "thinking" | "speed" = "model";
+        let phase: "model" | "thinking" = "model";
         const newSearch = () => {
           const input = new Input({
             prompt: "Search models: ",
@@ -161,28 +154,7 @@ async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): 
             thinking,
             (choice) => {
               thinking = choice;
-              const speeds = speedChoices(model, ctx);
-              if (speeds.length === 1) {
-                close(roleSettingValue(model, thinking));
-                return;
-              }
-              phase = "speed";
-              picker = makePicker(
-                speeds.map((value) => ({
-                  value,
-                  label: value,
-                  description:
-                    value === "Fast"
-                      ? "Request priority processing; higher cost or quota use may apply"
-                      : "Request standard processing",
-                })),
-                speed,
-                (choice) => {
-                  speed = choice;
-                  close(roleSettingValue(model, thinking, speed));
-                },
-                selectThinking,
-              );
+              close(roleSettingValue(model, thinking));
             },
             () => {
               phase = "model";
@@ -213,12 +185,7 @@ async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): 
                   "",
                   ...picker.render(width),
                   truncateToWidth(
-                    theme.fg(
-                      "muted",
-                      phase === "speed"
-                        ? "  Choose speed · Enter save · Esc thinking"
-                        : "  Choose thinking · Enter next · Esc model",
-                    ),
+                    theme.fg("muted", "  Choose thinking · Enter save · Esc model"),
                     width,
                   ),
                 ];
@@ -369,13 +336,7 @@ async function showDialogs(ctx: ExtensionCommandContext, actions: SettingsAction
     if (!model) continue;
     const thinking = await ctx.ui.select(`${role} thinking`, getChoices(`thinking:${role}`, ctx));
     if (!thinking) continue;
-    const speeds = speedChoices(model, ctx);
-    const speed =
-      speeds.length === 1
-        ? "Standard"
-        : await ctx.ui.select(`${role} speed (Fast may cost more)`, speeds);
-    if (!speed) continue;
-    await actions.apply(row.id, roleSettingValue(model, thinking, speed), ctx);
+    await actions.apply(row.id, roleSettingValue(model, thinking), ctx);
   }
 }
 
