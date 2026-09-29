@@ -52,6 +52,26 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("Oracle starts with the bundled simplify skill resolved independently of cwd", async () => {
+  const result = await runAgent(
+    ctx,
+    { agent: "oracle", task: "review" },
+    undefined,
+    { model: "test/model" },
+    undefined,
+    sessions,
+  );
+  expect(result.ok).toBe(true);
+  const args = capture().args as string[];
+  const skillArg = args.indexOf("--skill");
+  expect(skillArg).toBeGreaterThanOrEqual(0);
+  expect(args[skillArg + 1]).toBe(
+    path.resolve(import.meta.dir, "../skills/simplify/SKILL.md"),
+  );
+  expect(path.isAbsolute(args[skillArg + 1]!)).toBe(true);
+  expect(fs.existsSync(args[skillArg + 1]!)).toBe(true);
+});
+
 test("same task resumes in the same process, while independent tasks have separate context", async () => {
   const first = await run("first");
   const initial = capture();

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readConfig, parseModel, type OmpConfig, type ThinkingLevel } from "./config.ts";
@@ -90,6 +91,9 @@ export interface OmpDetails {
   animationFrame?: number;
 }
 const MAX_OUTPUT = 20_000;
+const SIMPLIFY_SKILL_PATH = fileURLToPath(
+  new URL("../../skills/simplify/SKILL.md", import.meta.url),
+);
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
   return items.map(({ agent, task, taskId }) =>
@@ -392,9 +396,7 @@ export async function runAgent(
           // Council inherits the main session's skills. Specialists use only
           // their assigned skills; Oracle gets the bundled simplify skill.
           ...(agent !== "council" ? ["--no-skills"] : []),
-          ...(agent === "oracle"
-            ? ["--skill", path.resolve(import.meta.dir, "../../skills/simplify/SKILL.md")]
-            : []),
+          ...(agent === "oracle" ? ["--skill", SIMPLIFY_SKILL_PATH] : []),
           projectTrusted ? "--approve" : "--no-approve",
           "--model",
           model,
