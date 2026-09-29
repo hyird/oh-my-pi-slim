@@ -39,6 +39,7 @@ import { prepareAssignments } from "./language.ts";
 import { registerWebSearch } from "./websearch.ts";
 import { hasMcpAdapter, installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
+import { failureDetail } from "./failure-detail.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 
 const COUNCIL_PERSPECTIVES = [
@@ -654,13 +655,17 @@ export default function omp(pi: ExtensionAPI) {
               : "Verify and integrate these specialist results before finalizing.\n\n";
         deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
       })
-      .catch(() => {
+      .catch((err) => {
         flushResults();
         job.state = controller.signal.aborted ? "cancelled" : "failed";
         runtime.running.delete(job);
         stopAnimationIfIdle();
         repaint(job);
-        deliver(job, `OMP background ${kind} ${job.state}. Inspect partial work before retrying.`);
+        const detail = failureDetail(err);
+        deliver(
+          job,
+          `OMP background ${kind} ${job.state}. Inspect partial work before retrying.${detail ? ` Cause: ${detail}` : ""}`,
+        );
       });
     flushPaint();
     return {

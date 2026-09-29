@@ -2506,8 +2506,7 @@ test("specialist failure clears the pinned status and exposes failure state in t
       h.ctx,
     );
     await waitFor(() => h.sentMessages.length === 1);
-    expect(h.sentMessages[0].message.content).toContain("Specialist run failed");
-    expect(h.sentMessages[0].message.content).not.toContain("simulated failure");
+    expect(h.sentMessages[0].message.content).toContain("simulated secret failure");
     const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
     for (const isExpanded of [false, true]) {
       const displayed = h.tools.omp_delegate

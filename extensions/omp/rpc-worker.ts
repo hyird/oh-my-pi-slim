@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { failureDetail } from "./failure-detail.ts";
 
 type State = {
   isStreaming: boolean;
@@ -15,6 +16,11 @@ type Pending = {
 };
 const MAX_RPC_LINE_CHARS = 16 * 1024 * 1024;
 
+function causedFailure(message: string, cause: unknown): Error {
+  const detail = failureDetail(cause);
+  return new Error(`${message}${detail ? `: ${detail}` : ""}`, { cause });
+}
+
 /** One isolated Pi runtime. Only one prompt may own its event stream at a time. */
 export class RpcWorker {
   private proc: ChildProcessWithoutNullStreams;
@@ -24,6 +30,8 @@ export class RpcWorker {
   private closing = false;
   private prompting = false;
   private exited = false;
+  private firstFailure?: Error;
+  private stderrTail = "";
   private killTimer?: ReturnType<typeof setTimeout>;
   private outputEndTimer?: ReturnType<typeof setTimeout>;
   private shutdownId?: string;
@@ -84,9 +92,14 @@ export class RpcWorker {
         if (!pending) return;
         this.pending.delete(event.id);
         clearTimeout(pending.timer);
-        // Provider errors may contain credentials; never expose their raw text.
+        // RPC errors may contain credentials; retain a bounded, redacted cause.
         if (event.success) pending.resolve(event.data);
-        else pending.reject(new Error(`Specialist RPC ${event.command} failed`));
+        else {
+          const detail = failureDetail(event.error ?? event.data?.error);
+          pending.reject(
+            new Error(`Specialist RPC ${event.command} failed${detail ? `: ${detail}` : ""}`),
+          );
+        }
       } else if (
         event.type === "extension_ui_request" &&
         ["select", "confirm", "input", "editor"].includes(event.method)
@@ -100,8 +113,8 @@ export class RpcWorker {
       } else {
         try {
           this.listener?.(event);
-        } catch {
-          this.fail(new Error("Failed to process specialist events"));
+        } catch (err) {
+          this.fail(causedFailure("Failed to process specialist events", err));
           void this.stop();
         }
       }
@@ -159,18 +172,20 @@ export class RpcWorker {
       }, 100);
       this.outputEndTimer.unref?.();
     });
-    this.proc.stdout.on("error", () => {
-      this.fail(new Error("Specialist RPC output closed"));
+    this.proc.stdout.on("error", (err: Error) => {
+      this.fail(causedFailure("Specialist RPC output failed", err));
       this.forceClose();
     });
-    // stderr is intentionally discarded; losing it must not crash healthy RPC work.
+    this.proc.stderr.on("data", (chunk: Buffer) => {
+      this.stderrTail = (this.stderrTail + chunk.toString("utf8")).slice(-4000);
+    });
     this.proc.stderr.on("error", () => {});
     this.proc.stderr.resume();
-    this.proc.stdin.on("error", () => {
-      this.fail(new Error("Specialist RPC input closed"));
+    this.proc.stdin.on("error", (err: Error) => {
+      this.fail(causedFailure("Specialist RPC input failed", err));
       this.forceClose();
     });
-    this.proc.on("error", () => this.fail(new Error("Failed to launch specialist process")));
+    this.proc.on("error", (err: Error) => this.fail(causedFailure("Failed to launch specialist process", err)));
     this.closed = new Promise<void>((resolve) => {
       this.proc.on("close", () => {
         this.exited = true;
@@ -179,7 +194,12 @@ export class RpcWorker {
         feed(decoder.end());
         // JSONL messages require a newline; a final fragment was not committed.
         fragments = [];
-        this.fail(new Error("Specialist process closed before settlement"));
+        const status = this.proc.signalCode
+          ? `signal ${this.proc.signalCode}`
+          : `exit code ${this.proc.exitCode ?? "unknown"}`;
+        const stderr = failureDetail(this.stderrTail);
+        const cause = this.firstFailure ? `; cause: ${failureDetail(this.firstFailure)}` : "";
+        this.fail(new Error(`Specialist process closed before settlement (${status})${cause}${stderr ? `; stderr: ${stderr}` : ""}`));
         void cleanup()
           .catch(() => {})
           .finally(resolve);
@@ -200,6 +220,7 @@ export class RpcWorker {
   }
 
   private fail(error: Error): void {
+    this.firstFailure ??= error;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
@@ -230,9 +251,9 @@ export class RpcWorker {
       this.pending.set(id, { resolve, reject, timer });
       try {
         this.proc.stdin.write(JSON.stringify({ id, type, ...fields }) + "\n");
-      } catch {
+      } catch (err) {
         // A synchronous pipe failure must not leave this request and its timer pending.
-        this.fail(new Error("Specialist RPC input closed"));
+        this.fail(causedFailure("Specialist RPC input write failed", err));
         void this.stop();
       }
     });

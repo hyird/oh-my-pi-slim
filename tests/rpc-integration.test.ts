@@ -309,9 +309,10 @@ test.each(["dist/cli.js", "dist/bundle/cli.js"])("real Pi 0.99 RPC (%s) retries 
       failedPhases.push(row.phase ?? "");
     });
     expect(failed.ok).toBe(false);
-    expect(failed.output).toBe(
+    expect(failed.output).toContain(
       "Model request failed after retry. Inspect partial work before continuing.",
     );
+    expect(failed.output).toContain("Temporary local outage");
     expect(failedActivities).toContain("Model request failed after retry");
     expect(failedPhases).toContain("retry-failed");
     expect(requests).toHaveLength(7);

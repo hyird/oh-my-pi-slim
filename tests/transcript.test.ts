@@ -174,8 +174,10 @@ test("live recordings flush on the deadline and UTF-8 byte limit", async () => {
 
 test("timer write failures notify the owner and remain observable at finish", async () => {
   let failures = 0;
-  const run = startConversation("explorer", "disk failure", "test/model", () => {
+  let failureReason: unknown;
+  const run = startConversation("explorer", "disk failure", "test/model", (error) => {
     failures++;
+    failureReason = error;
   });
   const write = spyOn(fs, "writeSync").mockImplementation(() => {
     throw new Error("disk full");
@@ -184,6 +186,8 @@ test("timer write failures notify the owner and remain observable at finish", as
   try {
     run.record(message("pending"));
     await waitUntil(() => failures === 1);
+    expect(failureReason).toBeInstanceOf(Error);
+    expect((failureReason as Error).message).toBe("disk full");
     expect(() => run.record(message("later"))).toThrow("disk full");
     expect(() => run.finish("failed")).toThrow("disk full");
     expect(close).toHaveBeenCalledTimes(1);
@@ -217,7 +221,8 @@ test("a background recording failure stops the child and reports failure", async
   try {
     await waitUntil(() => !!result);
     expect(result?.ok).toBe(false);
-    expect(result?.output).toBe("Failed to save specialist conversation");
+    expect(result?.output).toContain("Failed to save specialist conversation");
+    expect(result?.output).toContain("disk full");
   } finally {
     controller.abort();
     await pending;
@@ -241,7 +246,8 @@ test("a final recording flush failure is reported as a recording failure", async
       "test/model",
     );
     expect(result.ok).toBe(false);
-    expect(result.output).toBe("Failed to save specialist conversation");
+    expect(result.output).toContain("Failed to save specialist conversation");
+    expect(result.output).toContain("disk full");
   } finally {
     write.mockRestore();
   }
@@ -437,6 +443,53 @@ test("invalid IDs and symlinked recordings are rejected even after caching", () 
   }
 });
 
+test("startup stderr and exit status reach the result and durable recording", async () => {
+  const script = path.join(root, "bad-startup.mjs");
+  fs.writeFileSync(script, 'console.error("configuration rejected: api_key=private-secret"); process.exit(23);');
+  process.argv[1] = script;
+  const result = await runAgent(ctx, { agent: "explorer", task: "startup error" }, undefined, "test/model");
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain("exit code 23");
+  expect(result.output).toContain("configuration rejected");
+  expect(result.output).toContain("api_key=[redacted]");
+  expect(result.output).not.toContain("private-secret");
+  const conversations = fs.readdirSync(path.join(root, "omp", "conversations"));
+  const id = path.basename(conversations[0]!, ".jsonl");
+  expect(getConversation(id)?.meta.error).toBe(result.output);
+  const records = fs.readFileSync(fileFor(id), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  expect(records.at(-1)?.error).toBe(result.output);
+});
+
+test("model errors retain a bounded, redacted cause in results and durable logs", async () => {
+  fake([
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "Provider overloaded; Bearer top-secret-token",
+      },
+    },
+  ]);
+  let id = "";
+  const result = await runAgent(
+    ctx,
+    { agent: "explorer", task: "model failure" },
+    undefined,
+    "test/model",
+    (progress) => { id = progress.conversationId ?? id; },
+  );
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain("Provider overloaded");
+  expect(result.output).toContain("[redacted]");
+  expect(result.output).not.toContain("top-secret-token");
+  const conversation = getConversation(id)!;
+  expect(conversation.meta.state).toBe("failed");
+  expect(conversation.meta.error).toBe(result.output);
+  expect(fs.readFileSync(fileFor(id), "utf8")).toContain(result.output);
+});
+
 test("failed and cancelled children finalize their recordings", async () => {
   fake([message("partial")], 2);
   let failedId = "";
@@ -450,8 +503,11 @@ test("failed and cancelled children finalize their recordings", async () => {
     },
   );
   expect(failed.ok).toBe(false);
+  expect(failed.output).toContain("Specialist process closed before settlement");
   expect(getConversation(failedId)?.meta.state).toBe("failed");
+  expect(getConversation(failedId)?.meta.error).toBe(failed.output);
   expect(getConversation(failedId)?.events).toEqual([message("partial")]);
+  expect(fs.readFileSync(fileFor(failedId), "utf8")).toContain(failed.output);
 
   fake(
     Array.from({ length: 30 }, (_, i) => ({

@@ -383,7 +383,7 @@ test("a synchronous RPC input failure rejects promptly and retires the worker", 
   };
   const started = performance.now();
   await expect(worker.prompt("work", undefined, () => {})).rejects.toThrow(
-    "Specialist RPC input closed",
+    "Specialist RPC input write failed: secret transport error",
   );
   await worker.closed;
   expect(performance.now() - started).toBeLessThan(1000);
@@ -433,7 +433,7 @@ test("RPC output pipe failure retires the worker without an uncaught stream erro
     expect(() =>
       (worker as any).proc.stdout.emit("error", new Error("secret output error")),
     ).not.toThrow();
-    await expect(pending).rejects.toThrow("Specialist RPC output closed");
+    await expect(pending).rejects.toThrow("Specialist RPC output failed: secret output error");
     await worker.closed;
     expect(worker.alive).toBe(false);
     expect((worker as any).pending.size).toBe(0);
@@ -715,6 +715,40 @@ test("settlement rechecks a transient busy state without another event", async (
   } finally {
     await worker.stop();
   }
+});
+
+test("a missing worker executable preserves ENOENT", async () => {
+  const worker = new RpcWorker(path.join(root, "missing-pi-executable"), [], root, process.env, async () => {});
+  await expect(worker.ready).rejects.toThrow("ENOENT");
+  await worker.closed;
+});
+
+test("RPC error responses retain a redacted cause", async () => {
+  const script = path.join(root, "rpc-error.mjs");
+  fs.writeFileSync(script, `
+    import { createInterface } from "node:readline";
+    const input = createInterface({ input: process.stdin });
+    input.on("line", line => {
+      const request = JSON.parse(line);
+      if (request.type === "abort") process.exit(0);
+      console.log(JSON.stringify({ type: "response", id: request.id, command: request.type, success: false, error: "denied: Bearer private-token" }));
+    });
+  `);
+  const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {});
+  await expect(worker.ready).rejects.toThrow("denied: Bearer [redacted]");
+  await worker.closed;
+});
+
+test("startup failures include exit status and redacted stderr", async () => {
+  const script = path.join(root, "stderr-exit.mjs");
+  fs.writeFileSync(script, 'console.error("configuration rejected: api_key=private-secret"); process.exit(23);');
+  const worker = new RpcWorker(process.execPath, [script], root, process.env, async () => {});
+  const error: Error = await worker.ready.then(() => new Error("unexpected success"), (err) => err as Error);
+  expect(error.message).toContain("exit code 23");
+  expect(error.message).toContain("configuration rejected");
+  expect(error.message).toContain("api_key=[redacted]");
+  expect(error.message).not.toContain("private-secret");
+  await worker.closed;
 });
 
 test("a permanently busy state after settlement has a bounded wait", async () => {

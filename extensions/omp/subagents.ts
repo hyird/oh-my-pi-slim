@@ -10,6 +10,7 @@ import { ReplyAccumulator, safeText } from "./conversation-content.ts";
 import { availableChildModels } from "./models.ts";
 import { RpcWorker } from "./rpc-worker.ts";
 import { TaskSessions, resourceRevision, type TaskSession } from "./task-sessions.ts";
+import { failureDetail } from "./failure-detail.ts";
 
 export interface Assignment {
   agent: Role;
@@ -333,9 +334,12 @@ export async function runAgent(
   let worker: RpcWorker | undefined;
   let conversation: ReturnType<typeof startConversation> | undefined;
   let recordingFailed = false;
+  let recordingError: string | undefined;
   let output = "";
   let finalStop = "";
   let retryFailed = false;
+  let failureReason: string | undefined;
+  let retryError: string | undefined;
   let streamingText = "";
   let messageStartedAt: number | undefined;
   let completedOutputTokens = 0;
@@ -346,8 +350,9 @@ export async function runAgent(
     progress.tokensPerSecond = tokens > 0 && duration > 0 ? (tokens * 1000) / duration : undefined;
   };
   try {
-    conversation = startConversation(agent, task, model, () => {
+    conversation = startConversation(agent, task, model, (err) => {
       recordingFailed = true;
+      recordingError ??= failureDetail(err);
       void worker?.stop();
     });
     progress.conversationId = conversation.id;
@@ -440,9 +445,9 @@ export async function runAgent(
       progress.lastEventAt = Date.now();
       try {
         conversation!.record(event);
-      } catch {
+      } catch (err) {
         recordingFailed = true;
-        throw new Error("Failed to save specialist conversation");
+        throw new Error("Failed to save specialist conversation", { cause: err });
       }
       replies.record(event);
       progress.replyText = replies.text();
@@ -461,6 +466,7 @@ export async function runAgent(
       if (event.type === "auto_retry_end") {
         const retryCancelled = event.finalError === "Retry cancelled";
         retryFailed = !event.success && !retryCancelled;
+        retryError = !event.success ? failureDetail(event.finalError) : undefined;
         progress.phase = event.success ? "model" : "retry-failed";
         progress.retry = undefined;
         report(
@@ -474,6 +480,7 @@ export async function runAgent(
       }
       if (event.type === "message_start" && event.message?.role === "assistant") {
         messageStartedAt = performance.now();
+        failureReason = undefined;
         output = "";
         finalStop = "";
         progress.phase = "model";
@@ -551,6 +558,7 @@ export async function runAgent(
       if (event.type !== "message_end" || event.message?.role !== "assistant") return;
       const msg = event.message;
       finalStop = msg.stopReason;
+      failureReason = failureDetail(msg.errorMessage);
       progress.phase = msg.stopReason === "error" ? "retry-failed" : "model";
       const text =
         msg.content
@@ -576,7 +584,9 @@ export async function runAgent(
       messageStartedAt = undefined;
       publish();
     });
-    if (!output || finalStop !== "stop") throw new Error("Specialist run failed");
+    if (!output || finalStop !== "stop") {
+      throw new Error(failureReason ?? (output ? `Assistant stopped: ${finalStop || "unknown"}` : "Assistant returned no output"));
+    }
     timings.totalMs = performance.now() - started;
     try {
       conversation.finish("done", undefined, { taskId, runId, timings });
@@ -592,22 +602,30 @@ export async function runAgent(
   } catch (err) {
     await worker?.stop();
     const cancelled = signal?.aborted;
-    const failure = cancelled
-      ? "Specialist cancelled"
+    const thrownDetail = failureDetail(err);
+    const modelDetail = failureDetail(failureReason);
+    const retryDetail = failureDetail(retryError);
+    const detail = [...new Set([recordingError, thrownDetail, retryDetail, modelDetail].filter(Boolean))].join("; ");
+    const suffix = detail ? `: ${detail}` : "";
+    let failure = cancelled
+      ? `Specialist cancelled${suffix}`
       : recordingFailed
-        ? "Failed to save specialist conversation"
+        ? `Failed to save specialist conversation${suffix}`
         : finalStop === "length"
-          ? "Specialist response reached the model output limit. Inspect partial work before continuing."
-          : err instanceof Error && err.message.includes("interactive input")
-            ? err.message
+          ? `Specialist response reached the model output limit. Inspect partial work before continuing.${suffix}`
+          : failureDetail(err)?.includes("interactive input")
+            ? `${failureDetail(err)}${suffix && !failureDetail(err)?.includes(modelDetail ?? "\0") ? suffix : ""}`
             : retryFailed && finalStop === "error"
-              ? "Model request failed after retry. Inspect partial work before continuing."
-              : `Specialist run failed${agent === "librarian" ? "; check pi-mcp-adapter and context7/gh_grep eager metadata" : ""}`;
+              ? `Model request failed after retry. Inspect partial work before continuing.${suffix}`
+              : `Specialist run failed${agent === "librarian" ? "; check pi-mcp-adapter and context7/gh_grep eager metadata" : ""}${suffix}`;
     timings.totalMs = performance.now() - started;
     try {
       conversation?.finish(cancelled ? "cancelled" : "failed", failure, { taskId, runId, timings });
-    } catch {
+    } catch (err) {
       recordingFailed = true;
+      recordingError ??= failureDetail(err);
+      if (recordingError && !failure.includes(recordingError))
+        failure = `${failure}; conversation log write failed: ${recordingError}`;
     }
     ownedSessions.release(lease);
     progress.state = cancelled ? "cancelled" : "failed";
@@ -617,7 +635,7 @@ export async function runAgent(
       model,
       ok: false,
       cancelled,
-      output: recordingFailed ? "Failed to save specialist conversation" : failure,
+      output: failure,
       usage,
       taskId,
       runId,

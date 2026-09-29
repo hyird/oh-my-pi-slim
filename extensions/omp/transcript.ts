@@ -88,7 +88,12 @@ function append(fd: number, bytes: Buffer) {
 }
 
 /** Record only parsed, child-visible JSON events; never copy the child environment or stderr. */
-export function startConversation(agent: Role, task: string, model: string, onError?: () => void) {
+export function startConversation(
+  agent: Role,
+  task: string,
+  model: string,
+  onError?: (error: unknown) => void,
+) {
   const meta: ConversationMeta = {
     id: randomUUID(),
     agent,
@@ -184,11 +189,11 @@ export function startConversation(agent: Role, task: string, model: string, onEr
         timer ??= setTimeout(() => {
           try {
             flush();
-          } catch {
+          } catch (err) {
             // Surface timer failures to the process supervisor, never as an
             // uncaught timer exception. record/finish also retain the failure.
             try {
-              onError?.();
+              onError?.(err);
             } catch {
               /* finish still reports the write failure */
             }
