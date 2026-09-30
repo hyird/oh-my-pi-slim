@@ -50,6 +50,32 @@ export function formatTokenRate(rate: number): string {
   return `${rate < 10 ? rate.toFixed(1) : Math.round(rate)} token/s`;
 }
 
+function formatTokens(count: number): string {
+  if (count < 1000) return `${count}`;
+  if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+  return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(Math.max(0, ms) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function taskUsageLabels(item?: AgentProgress, final?: Result): string[] {
+  const labels: string[] = [];
+  const elapsed = item?.elapsedMs ?? final?.timings?.totalMs ??
+    (item?.state === "running" && item.startedAt !== undefined ? Date.now() - item.startedAt : undefined);
+  if (elapsed !== undefined && Number.isFinite(elapsed)) labels.push(formatDuration(elapsed));
+  const tokens = final?.usage?.totalTokens ?? item?.totalTokens;
+  if (tokens !== undefined && Number.isFinite(tokens) && tokens >= 0)
+    labels.push(`${formatTokens(tokens)} tokens`);
+  return labels;
+}
+
 function boundedOutput(value: string): string {
   const lines = safeText(value).trim().split("\n");
   const shown = lines.slice(0, OUTPUT_LINES).join("\n");
@@ -158,6 +184,7 @@ function taskRow(
   interaction?: Interaction,
   throughput?: number,
   statusLabels?: () => readonly string[],
+  usageLabels?: () => readonly string[],
 ): Component {
   const currentLine = () => (typeof line === "function" ? line() : line);
   let previousLine = currentLine();
@@ -174,7 +201,7 @@ function taskRow(
       : undefined;
     if (range && visibleWidth(content) + visibleWidth(range) <= width)
       content += theme.fg("muted", range);
-    for (const label of statusLabels?.() ?? []) {
+    for (const label of usageLabels?.() ?? []) {
       const suffix = ` · ${label}`;
       if (visibleWidth(content) + visibleWidth(suffix) <= width)
         content += theme.fg("muted", suffix);
@@ -182,6 +209,11 @@ function taskRow(
     if (throughput !== undefined && Number.isFinite(throughput) && throughput > 0) {
       const rate = ` · ${formatTokenRate(throughput)}`;
       if (visibleWidth(content) + visibleWidth(rate) <= width) content += theme.fg("muted", rate);
+    }
+    for (const label of statusLabels?.() ?? []) {
+      const suffix = ` · ${label}`;
+      if (visibleWidth(content) + visibleWidth(suffix) <= width)
+        content += theme.fg("muted", suffix);
     }
     return content === base ? text.render(width) : new TruncatedText(content).render(width);
   };
@@ -270,6 +302,7 @@ export function renderPinnedOmpOverview(
     frame: () => number;
     throughput?: number;
     item?: AgentProgress;
+    final?: Result;
   };
   const rows = batches.flatMap((batch): PinnedRow[] => {
     if (batch.kind === "call")
@@ -299,6 +332,7 @@ export function renderPinnedOmpOverview(
         frame: batch.frame,
         throughput: item?.tokensPerSecond,
         item,
+        final,
       };
     });
   });
@@ -350,7 +384,7 @@ export function renderPinnedOmpOverview(
         theme.fg("accent", taskName(row.agent, row.index, row.count)) +
         theme.fg("muted", expanded ? " ▾" : " ▸");
     }, row.index, theme, interaction, row.throughput,
-    () => taskStatusLabels(row.item, row.status)));
+    () => taskStatusLabels(row.item, row.status), () => taskUsageLabels(row.item, row.final)));
   }
   return clearHoverOutsideTasks(view, states, invalidate);
 }
@@ -628,6 +662,7 @@ export function renderOmpResult(
         interaction,
         item?.tokensPerSecond,
         () => taskStatusLabels(item, state),
+        () => taskUsageLabels(item, final),
       ),
     );
     if (expanded && showDetails)

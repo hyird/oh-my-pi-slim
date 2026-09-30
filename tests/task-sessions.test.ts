@@ -124,6 +124,13 @@ test("message_end and retries do not complete a task before settlement", async (
   expect(snapshots.every((row) => !row.replyText?.includes("failed provider draft"))).toBe(true);
   expect(snapshots.every((row) => !row.text.includes("failed provider draft"))).toBe(true);
   expect(result.usage.cost.total).toBeCloseTo(0.6);
+  expect(snapshots[0]?.totalTokens).toBe(0);
+  expect(snapshots.some((row) => row.state === "running" && row.totalTokens === 20)).toBe(true);
+  const finished = snapshots.at(-1)!;
+  expect(finished.totalTokens).toBe(result.usage.totalTokens);
+  expect(finished.startedAt).toBeNumber();
+  expect(finished.elapsedMs).toBe(result.timings?.totalMs);
+  expect(snapshots[0]?.totalTokens).toBe(0); // earlier snapshots must not change
   expect(snapshots.filter((row) => row.state === "done")).toHaveLength(1);
 });
 

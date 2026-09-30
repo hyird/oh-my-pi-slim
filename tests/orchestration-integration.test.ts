@@ -1248,6 +1248,51 @@ test("OMP task rows show measured output token speed without clipping the task n
   expect(card.render(34).join("\n")).not.toContain("token/s");
 });
 
+test("OMP task rows show live run time and tokens, then retain final values", () => {
+  const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+  const now = spyOn(Date, "now").mockReturnValue(100_000);
+  try {
+    const item: AgentProgress = {
+      ...queuedProgress([{ agent: "explorer", task: "inspect" }])[0]!,
+      state: "running", startedAt: 27_000, totalTokens: 186_000,
+      tokensPerSecond: 42.3, phase: "model",
+    };
+    const pinned = renderPinnedOmpOverview(
+      [{ kind: "job", progress: [item], isPartial: true, frame: () => 0, state: {} }],
+      theme, () => {}, () => {},
+    );
+    expect(pinned.render(80).join("\n")).toContain("Explorer task ▸ · 1m 13s · 186k tokens · 42 token/s");
+    now.mockReturnValue(103_000);
+    expect(pinned.render(80).join("\n")).toContain("1m 16s");
+    expect(pinned.render(34).every((line) => visibleWidth(line) <= 34)).toBe(true);
+    const completed = { ...item, state: "done" as const, elapsedMs: 76_500 };
+    const history = renderOmpResult(
+      { content: [], details: { progress: [completed] } },
+      { expanded: false, isPartial: false }, theme,
+    );
+    now.mockReturnValue(200_000);
+    expect(history.render(80).join("\n")).toContain("done · Explorer task · 1m 16s · 186k tokens");
+  } finally {
+    now.mockRestore();
+  }
+});
+
+test("result-only cards retain run time and tokens after cancellation", () => {
+  const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+  const results: Result[] = [{
+    agent: "fixer", model: "test/model", ok: false, cancelled: true, output: "private error",
+    usage: { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 1010,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    timings: { startupMs: 1, generationMs: 20, toolMs: 10, totalMs: 45_000 },
+  }];
+  const output = renderOmpResult(
+    { content: [], details: { progress: [], results } },
+    { expanded: false, isPartial: false }, theme,
+  ).render(80).join("\n");
+  expect(output).toContain("cancelled · Fixer task · 45s · 1.0k tokens");
+  expect(output).not.toContain("private error");
+});
+
 test("OMP task rows show retries and quiet time without exposing activity text", () => {
   initTheme();
   const theme: any = {

@@ -61,6 +61,11 @@ export interface AgentProgress {
   retry?: Readonly<{ attempt: number; max: number; delayMs: number }>;
   /** Last child event received, including thinking updates that have no visible preview. */
   lastEventAt?: number;
+  /** Current run's reported token usage, including cache tokens. */
+  totalTokens?: number;
+  /** Wall-clock start for live display; elapsedMs freezes the duration once settled. */
+  startedAt?: number;
+  elapsedMs?: number;
 }
 export interface ToolOperation {
   id: string;
@@ -248,6 +253,7 @@ export async function runAgent(
     throw new Error("A valid agent and nonempty task are required");
   if (signal?.aborted) throw new Error("Specialist tasks cancelled");
   const started = performance.now();
+  const startedAt = Date.now();
   const config = typeof modelOverride === "object" ? undefined : readConfig();
   const model =
     typeof modelOverride === "object"
@@ -291,6 +297,8 @@ export async function runAgent(
     operations: Object.freeze([]),
     phase: "starting",
     lastEventAt: Date.now(),
+    startedAt,
+    totalTokens: 0,
   };
   let lastPublishedAt = 0;
   const publish = () => {
@@ -487,6 +495,7 @@ export async function runAgent(
         finalStop = "";
         progress.phase = "model";
         progress.retry = undefined;
+        progress.totalTokens = usage.totalTokens;
         publish();
         return;
       }
@@ -495,6 +504,11 @@ export async function runAgent(
         const update = event.assistantMessageEvent;
         messageStartedAt ??= performance.now();
         let changed = false;
+        const partialUsage = event.message?.usage ?? update?.partial?.usage ?? event.usage;
+        if (Number.isFinite(partialUsage?.totalTokens) && partialUsage.totalTokens >= 0) {
+          progress.totalTokens = usage.totalTokens + partialUsage.totalTokens;
+          changed = true;
+        }
         const partialOutput = event.usage?.output ?? update?.partial?.usage?.output;
         if (Number.isFinite(partialOutput) && partialOutput > 0) {
           updateThroughput(partialOutput, Math.max(1, performance.now() - messageStartedAt));
@@ -584,6 +598,7 @@ export async function runAgent(
         }
       }
       messageStartedAt = undefined;
+      progress.totalTokens = usage.totalTokens;
       publish();
     });
     if (!output || finalStop !== "stop") {
@@ -599,6 +614,7 @@ export async function runAgent(
     // Release ownership only after settlement and durable recording, before publishing done.
     ownedSessions.release(lease);
     progress.state = "done";
+    progress.elapsedMs = timings.totalMs;
     report("Work completed");
     return { agent, model, ok: true, output, usage, taskId, runId, timings };
   } catch (err) {
@@ -631,6 +647,7 @@ export async function runAgent(
     }
     ownedSessions.release(lease);
     progress.state = cancelled ? "cancelled" : "failed";
+    progress.elapsedMs = timings.totalMs;
     report(cancelled ? "Cancelled" : "Run failed");
     return {
       agent,
