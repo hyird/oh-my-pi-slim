@@ -41,12 +41,30 @@ function adapterTool(tool: ToolInfo | undefined): boolean {
   );
 }
 
-export const hasMcpAdapter = (tools: readonly ToolInfo[]): boolean => tools.some(adapterTool);
+function nativeMcpTool(tool: ToolInfo | undefined): boolean {
+  return tool?.sourceInfo?.path === "builtin:mcp";
+}
 
-/** Namespaces have unambiguous server ownership. Direct tools do not: deny them unless
- * the adapter exposes a trustworthy server-to-tool mapping in a future API. */
+const resourceNames = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);
+
+function allowedResourceServer(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const server = (input as Record<string, unknown>).server;
+  return typeof server === "string" && /^[A-Za-z0-9_-]+$/.test(server)
+    && server.toLowerCase() !== "context7";
+}
+
+/** Native MCP uses host-owned namespaces; legacy adapter direct tools lack server metadata. */
 export function allowedMcpTool(name: string, role: MainAgent, tools: readonly ToolInfo[]): boolean {
   if (role === "pi") return !ompToolNames.has(name);
+  const tool = tools.find((item) => item.name === name);
+  if (nativeMcpTool(tool)) {
+    if (role !== "orchestrator") return false;
+    if (resourceNames.has(name)) return true; // tool_call checks the explicit server below.
+    // The host namespace remains authoritative when a long tool name is shortened.
+    const server = tool?.namespace?.name.match(/^mcp__([A-Za-z0-9_-]+)$/)?.[1];
+    return !!server && server.toLowerCase() !== "context7" && name.startsWith("mcp__");
+  }
   if (gatewayNames.has(name))
     return (
       name === "mcp" &&
@@ -66,7 +84,6 @@ export function allowedMcpTool(name: string, role: MainAgent, tools: readonly To
         );
       })
     );
-  const tool = tools.find((item) => item.name === name);
   if (adapterTool(tool)) return false; // direct tools have no reliable server identity
   // A source-less extension tool may be a late-registered direct MCP tool.
   if (tool && !tool.sourceInfo && !builtins.has(name) && !name.startsWith("omp_")) return false;
@@ -118,7 +135,8 @@ export function installMcpPolicy(
     const role = currentRole();
     if (
       !allowedMcpTool(event.toolName, role, pi.getAllTools?.() ?? []) ||
-      (role !== "pi" && event.toolName === "mcp" && !allowedMcpGateway(event.input))
+      (role !== "pi" && event.toolName === "mcp" && !allowedMcpGateway(event.input)) ||
+      (role !== "pi" && resourceNames.has(event.toolName) && !allowedResourceServer(event.input))
     ) {
       return { block: true, reason: `OMP ${role} MCP policy denies ${event.toolName}` };
     }

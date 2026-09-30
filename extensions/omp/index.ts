@@ -925,7 +925,7 @@ export default function omp(pi: ExtensionAPI) {
       delete event.systemPromptOptions.sections.omp_roster;
       return;
     }
-    event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
+    event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " Prefer Pi's native MCP tools, including calls through codemode or tools loaded with tool_search. Use only permitted non-context7 server namespaces. Resource requests must name one permitted server explicitly. With a legacy adapter, use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Unattributed adapter direct tools are unavailable." : ""}`;
     event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter(
       (name) => name !== "orchestrator" && name !== "council",
     )
@@ -971,6 +971,7 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_delegate",
+    exposure: "model-only",
     label: "OMP delegate",
     renderShell: "self",
     description:
@@ -1050,6 +1051,7 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_council",
+    exposure: "model-only",
     label: "OMP council",
     renderShell: "self",
     description:

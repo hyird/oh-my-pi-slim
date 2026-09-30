@@ -10,6 +10,7 @@ import {
   SessionManager,
   SettingsManager,
   type ExtensionAPI,
+  type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -17,7 +18,7 @@ import { createChildMcpExtension } from "../extensions/omp/child-mcp.ts";
 
 let tmp = "";
 let originalAgentDir: string | undefined;
-const sessions: Array<{ dispose(): void }> = [];
+const sessions: AgentSession[] = [];
 const originalTestEnv: Record<string, string | undefined> = {};
 for (const key of [
   "OMP_NATIVE_MCP_CALL_LOG",
@@ -26,8 +27,11 @@ for (const key of [
   "OMP_NATIVE_MCP_STOPPED_LOG",
 ]) originalTestEnv[key] = process.env[key];
 
-afterEach(() => {
-  for (const session of sessions.splice(0)) session.dispose();
+afterEach(async () => {
+  for (const session of sessions.splice(0)) {
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    session.dispose();
+  }
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   for (const [key, value] of Object.entries(originalTestEnv)) {

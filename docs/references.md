@@ -1,5 +1,12 @@
 # References and implementation boundaries
 
+## Official Pi 0.99.1 contracts
+
+- [Extensions](https://github.com/earendil-works/pi/blob/v0.99.1/packages/coding-agent/docs/extensions.md): use public registration, lifecycle hooks, `ctx.executeTool()`, and `model-only` exposure for orchestration tools.
+- [MCP](https://github.com/earendil-works/pi/blob/v0.99.1/packages/coding-agent/docs/mcp.md) and [SDK](https://github.com/earendil-works/pi/blob/v0.99.1/packages/coding-agent/docs/sdk.md#codemode-mcp): use Pi's native connector. Remove `pi-mcp-adapter` from loaded packages before using OMP children, since competing `/mcp` owners cause their isolation check to fail.
+- [Providers](https://github.com/earendil-works/pi/blob/v0.99.1/packages/coding-agent/docs/providers.md): new installations prefer `/login openai` with Sign in with ChatGPT; saved legacy credentials are not converted between grants.
+- [Packages](https://github.com/earendil-works/pi/blob/v0.99.1/packages/coding-agent/docs/packages.md#declare-dependencies): host-provided modules are wildcard peers and are not bundled; exact 0.99.1 development dependencies validate the implementation.
+
 These are **read-only inspiration**, not runtime dependencies or promises of API compatibility with future releases. OMP has its own isolated Pi RPC child subprocess backend and its own local conversation recorder. No third-party `pi-subagents` installation or integration is required.
 
 ## [Upstream source](https://github.com/alvinunreal/oh-my-opencode-slim)
@@ -35,7 +42,7 @@ Librarian children use Pi's built-in MCP extension with an injected in-memory `l
 
 This is a Pi tool/configuration boundary, **not a network sandbox**: children retaining `bash` can still make network requests. The `--tools` hard allowlist includes `mcp` and the exact native target. Pi 0.99's MCP `deferred` exposure keeps the target out of the active/model-declared set while still callable through `ctx.executeTool`; the gateway hides MCP declarations and rejects direct calls.
 
-Main-session OMP policy remains separate and adapter-aware: it filters active adapter tools and blocks denied calls even when tools activate later. Direct adapter tools remain unavailable under OMP, Council has no gateway access, and switching back to native Pi restores only tools OMP actually suppressed. This policy is not an OS trust boundary.
+Main-session OMP policy reads native MCP source metadata (`builtin:mcp`) and the host-provided namespace rather than guessing ownership from a potentially shortened name. Orchestrator allows non-context7 namespaces and explicitly scoped resources; Council denies MCP. The tool_call hook applies to nested codemode calls and tools activated later by tool_search. Legacy adapter tools retain their server-scoped policy. Switching back to native Pi restores only tools OMP suppressed. This policy is not an OS trust boundary.
 
 ## What OMP actually does
 

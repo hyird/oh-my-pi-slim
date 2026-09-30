@@ -254,6 +254,48 @@ test("unattributed namespace and direct tools fail closed", () => {
   ).toBe(false);
 });
 
+test("native MCP namespaces remain enforced for direct and nested calls and resources", async () => {
+  const h = harness();
+  const native = (name: string, server?: string) => ({
+    ...builtin(name),
+    sourceInfo: { ...builtin(name).sourceInfo, path: "builtin:mcp" },
+    namespace: server ? { name: `mcp__${server}` } : undefined,
+    exposure: "deferred",
+  });
+  const tools = [
+    native("mcp__gh_grep__searchGitHub", "gh_grep"),
+    native("mcp__CONTEXT7__resolve", "CONTEXT7"),
+    native("mcp__a_long_shortened_tool_12345678", "context7"),
+    native("mcp__unattributed__tool"),
+    ...["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"].map((name) => native(name)),
+  ];
+  h.pi.getAllTools = () => [...all, ...tools];
+  h.pi.setActiveTools([...h.active(), ...tools.map((tool) => tool.name)]);
+  await h.handlers.session_start({}, h.ctx);
+  expect(h.active()).toContain("mcp__gh_grep__searchGitHub");
+  for (const parentToolCallId of [undefined, "codemode-call/1"]) {
+    const call = (toolName: string, input = {}) => h.handlers.tool_call({ toolName, input, parentToolCallId });
+    expect(call("mcp__gh_grep__searchGitHub")).toBeUndefined();
+    for (const name of ["mcp__CONTEXT7__resolve", "mcp__a_long_shortened_tool_12345678", "mcp__unattributed__tool"]) {
+      expect(call(name)?.block).toBe(true);
+      expect(h.active()).not.toContain(name);
+    }
+    for (const name of ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]) {
+      expect(call(name, { server: "gh_grep" })).toBeUndefined();
+      for (const input of [{}, { server: "context7" }, { server: "CONTEXT7" }, { server: " gh_grep" }]) {
+        expect(call(name, input)?.block).toBe(true);
+      }
+    }
+  }
+  await updateConfig((config) => ({ ...config, defaultAgent: "council" }));
+  await h.handlers.session_start({}, h.ctx);
+  for (const tool of tools) expect(h.call(tool.name, { server: "gh_grep" })?.block).toBe(true);
+  await updateConfig((config) => ({ ...config, defaultAgent: "pi" }));
+  await h.handlers.session_start({}, h.ctx);
+  expect(h.active()).toContain("mcp__gh_grep__searchGitHub");
+  expect(h.call("mcp__CONTEXT7__resolve")).toBeUndefined();
+});
+
 test("namespace context7 denial uses the declared server, not a case-sensitive name prefix", () => {
   expect(allowedMcpTool("mcp__context7_foo", "orchestrator", [adapter("mcp__context7_foo")])).toBe(
     true,

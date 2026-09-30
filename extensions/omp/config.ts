@@ -18,11 +18,11 @@ export interface OmpConfig {
 export const DEFAULT_CONFIG: OmpConfig = {
   defaultAgent: "orchestrator",
   models: {
-    oracle: "openai-codex/gpt-6-astra",
-    librarian: "openai-codex/gpt-6-luna",
-    explorer: "openai-codex/gpt-6-luna",
-    designer: "openai-codex/gpt-6-luna",
-    fixer: "openai-codex/gpt-6-luna",
+    oracle: "openai/gpt-6-astra",
+    librarian: "openai/gpt-6-luna",
+    explorer: "openai/gpt-6-luna",
+    designer: "openai/gpt-6-luna",
+    fixer: "openai/gpt-6-luna",
   },
   thinking: {
     oracle: "high",

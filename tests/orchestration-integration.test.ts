@@ -238,7 +238,7 @@ describe("config safety", () => {
     expect(readConfig()).toEqual(DEFAULT_CONFIG);
     const first = readConfig();
     first.models.oracle = "other/model";
-    expect(readConfig().models.oracle).toBe("openai-codex/gpt-6-astra");
+    expect(readConfig().models.oracle).toBe("openai/gpt-6-astra");
   });
   test("parses defaults and model IDs; rejects invalid roles and models", () => {
     expect(parseConfig({})).toEqual({ defaultAgent: "orchestrator", models: {}, thinking: {} });
