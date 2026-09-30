@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { failureDetail } from "./failure-detail.ts";
+import { MCP_ISOLATION_ERROR_MARKER } from "./mcp-isolation.ts";
 
 type State = {
   isStreaming: boolean;
@@ -47,7 +49,10 @@ export class RpcWorker {
     cleanup: () => Promise<void>,
     private readonly timeoutMs = 30_000,
     private readonly settleTimeoutMs = 5 * 60_000,
+    private readonly fatalExtensionPath?: string,
   ) {
+    if (fatalExtensionPath && !path.isAbsolute(fatalExtensionPath))
+      throw new Error("Fatal extension path must be absolute");
     this.proc = spawn(command, args, {
       cwd,
       shell: false,
@@ -72,6 +77,20 @@ export class RpcWorker {
         typeof event.type !== "string"
       )
         return;
+      if (
+        this.fatalExtensionPath &&
+        event.type === "extension_error" &&
+        typeof event.extensionPath === "string" &&
+        path.isAbsolute(event.extensionPath) &&
+        path.resolve(event.extensionPath) === path.resolve(this.fatalExtensionPath) &&
+        typeof event.error === "string" &&
+        event.error.includes(MCP_ISOLATION_ERROR_MARKER)
+      ) {
+        const detail = failureDetail(event.error);
+        this.fail(new Error(detail ?? MCP_ISOLATION_ERROR_MARKER));
+        void this.stop();
+        return;
+      }
       // Closing still needs the abort reply before sending EOF. Ignore late
       // task events without discarding the shutdown handshake.
       if (

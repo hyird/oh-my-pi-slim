@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
 import { allowedMcpGateway, allowedMcpTool } from "../extensions/omp/mcp-policy.ts";
-import { librarianMcpConfig, runAgent } from "../extensions/omp/subagents.ts";
+import { runAgent } from "../extensions/omp/subagents.ts";
+import { childMcpConfig } from "../extensions/omp/child-mcp.ts";
 import { updateConfig } from "../extensions/omp/config.ts";
 
 const adapter = (name: string) =>
@@ -273,82 +274,79 @@ test("namespace context7 denial uses the declared server, not a case-sensitive n
   ).toBe(false);
 });
 
-test("librarian child uses only public exclusive MCP servers; other roles inherit no gateways", async () => {
-  const config = librarianMcpConfig();
-  expect(config.mcpServers).toEqual({
-    context7: { url: "https://mcp.context7.com/mcp", lifecycle: "eager" },
-    gh_grep: { url: "https://mcp.grep.app", lifecycle: "eager" },
+test("native child MCP config is role-scoped and librarian launch uses only its scoped gateway", async () => {
+  const librarian = childMcpConfig("librarian");
+  expect(librarian.servers).toHaveLength(1);
+  expect(librarian.servers[0]).toMatchObject({
+    name: "gh_grep",
+    config: {
+      url: "https://mcp.grep.app",
+      exposure: "hidden",
+      toolExposure: { "*": "hidden", searchGitHub: "deferred" }
+    },
   });
-  expect(config.settings).toEqual({
-    namespaceProxyTools: true,
-    directTools: false,
-    scriptMode: false,
-    allowInstall: false,
-    exposeResources: false,
-  });
+  expect(librarian.autoEnableCodemode).toBe(false);
+  for (const role of ["explorer", "oracle", "designer", "fixer", "council"])
+    expect(childMcpConfig(role).servers).toEqual([]);
+  expect(() => childMcpConfig("unknown")).toThrow("Invalid OMP child role");
+
   const h = harness();
   const savedArgv = process.argv[1];
-  const savedDirect = process.env.MCP_DIRECT_TOOLS;
   const capture = path.join(tmp, "capture.json");
   process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
   process.env.OMP_TEST_CAPTURE = capture;
-  process.env.MCP_DIRECT_TOOLS = "*";
   process.env.OMP_TEST_WAIT_MS = "250";
   try {
-    const pending = runAgent(h.ctx, { agent: "librarian", task: "research" });
-    for (let i = 0; i < 100 && !fs.existsSync(capture); i++) await Bun.sleep(5);
-    expect(fs.existsSync(capture)).toBe(true);
-    const liveArgs: string[] = JSON.parse(fs.readFileSync(capture, "utf8")).args;
-    const livePath = liveArgs[liveArgs.indexOf("--mcp-config") + 1];
-    if (process.platform !== "win32") expect(fs.statSync(livePath).mode & 0o777).toBe(0o600);
-    expect(JSON.parse(fs.readFileSync(livePath, "utf8"))).toEqual(config);
-    const result = await pending;
+    const result = await runAgent(h.ctx, { agent: "librarian", task: "research" });
     expect(result.ok).toBe(true);
     const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
     const args: string[] = captured.args;
+    expect(args).not.toContain("--mcp-config");
+    expect(args).toContain("--extension");
+    expect(captured.childGuard).toBe("1");
+    expect(captured.childRole).toBe("librarian");
     expect(args[args.indexOf("--tools") + 1].split(",")).toEqual([
-      "read",
-      "grep",
-      "find",
-      "ls",
-      "bash",
-      "websearch",
-      "mcp__context7",
-      "mcp__gh_grep",
+      "read", "grep", "find", "ls", "bash", "websearch", "mcp", "mcp__gh_grep__searchGitHub",
     ]);
-    expect(args[args.indexOf("--tools") + 1]).not.toContain("mcp,");
-    const configPath = args[args.indexOf("--mcp-config") + 1];
-    expect(fs.existsSync(configPath)).toBe(false);
-    // Cannot use project/global namespaces: they are absent from this hard allowlist.
-    expect(args[args.indexOf("--tools") + 1]).not.toContain("mcp__private");
-    expect(args[args.indexOf("--tools") + 1]).not.toContain("mcpScript");
-    expect(captured.prompt).toContain("do not use mcp or mcpScript");
-    await runAgent(h.ctx, { agent: "fixer", task: "fix" }, undefined, {
-      model: "test/model",
-      mcpAdapter: true,
-    });
-    const fixer = JSON.parse(fs.readFileSync(capture, "utf8"));
-    expect(fixer.mcpMode).toBe("exclusive");
-    expect(fixer.mcpConfig.mcpServers).toEqual({});
-    expect(fixer.args).toContain("--no-themes");
-    expect(fixer.args).toContain("--no-prompt-templates");
-    expect(fixer.args).not.toContain("--no-extensions");
-    expect(fixer.args).toContain("--no-skills");
-    expect(fixer.args).not.toContain("--skill");
-    await runAgent(h.ctx, { agent: "oracle", task: "review" }, undefined, {
-      model: "test/model",
-      mcpAdapter: true,
-    });
-    const oracle = JSON.parse(fs.readFileSync(capture, "utf8"));
-    expect(oracle.args).toContain("--no-skills");
-    const skill = oracle.args[oracle.args.indexOf("--skill") + 1];
-    expect(path.basename(skill)).toBe("SKILL.md");
-    expect(fs.readFileSync(skill, "utf8")).toContain("name: simplify");
+    expect(args[args.indexOf("--tools") + 1]).not.toMatch(/context7|mcpScript|codemode|tool_search|list_mcp/);
+    expect(captured.prompt).toContain("mcp({server:'gh_grep',tool:'search',args:");
+    expect(captured.prompt).toContain("If the scoped gateway is unavailable");
+
+    for (const role of ["explorer", "oracle", "designer", "fixer", "council"] as const) {
+      await runAgent(h.ctx, { agent: role, task: "review" });
+      const other = JSON.parse(fs.readFileSync(capture, "utf8"));
+      const tools = other.args[other.args.indexOf("--tools") + 1];
+      expect(other.childRole).toBe(role);
+      expect(other.args).not.toContain("--mcp-config");
+      expect(tools).not.toMatch(/(^|,)(mcp|mcpScript|codemode|tool_search|mcp__[^,]+|list_mcp_resources)(,|$)/);
+    }
   } finally {
     process.argv[1] = savedArgv;
     delete process.env.OMP_TEST_CAPTURE;
     delete process.env.OMP_TEST_WAIT_MS;
-    if (savedDirect === undefined) delete process.env.MCP_DIRECT_TOOLS;
-    else process.env.MCP_DIRECT_TOOLS = savedDirect;
+  }
+});
+
+test("OMP native MCP isolation extension errors terminate only the scoped child", async () => {
+  const h = harness();
+  const savedArgv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  process.env.OMP_TEST_MCP_EXTENSION_ERROR = "1";
+  try {
+    const result = await runAgent(h.ctx, { agent: "librarian", task: "collision" });
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain("fixture command collision");
+    expect(result.output).toContain("access_token=[redacted]");
+    expect(result.output).not.toContain("fixture-secret");
+    expect(result.output).not.toContain("child extension reported a runtime error");
+    const conversations = fs.readdirSync(path.join(tmp, "omp", "conversations"));
+    expect(conversations).toHaveLength(1);
+    const log = fs.readFileSync(path.join(tmp, "omp", "conversations", conversations[0]!), "utf8");
+    expect(log).toContain("fixture command collision");
+    expect(log).toContain("access_token=[redacted]");
+    expect(log).not.toContain("fixture-secret");
+  } finally {
+    process.argv[1] = savedArgv;
+    delete process.env.OMP_TEST_MCP_EXTENSION_ERROR;
   }
 });

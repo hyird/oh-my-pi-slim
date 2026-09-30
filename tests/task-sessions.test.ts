@@ -13,6 +13,8 @@ const keys = [
   "OMP_TEST_SETTLE_WAIT_MS",
   "OMP_TEST_EXIT_WAIT_MS",
   "OMP_TEST_RETRY",
+  "OMP_TEST_STARTUP_MCP_EXTENSION_ERROR",
+  "OMP_TEST_NONFATAL_EXTENSION_ERRORS",
   "OMP_TEST_DUPLICATE",
   "OMP_TEST_FAIL",
   "OMP_TEST_LENGTH",
@@ -50,6 +52,24 @@ afterEach(async () => {
     else process.env[key] = saved[i];
   });
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("unrelated extension errors are not treated as fatal MCP isolation failures", async () => {
+  process.env.OMP_TEST_NONFATAL_EXTENSION_ERRORS = "1";
+  const result = await run("continue after unrelated extension warnings");
+  expect(result.ok).toBe(true);
+  expect(capture().count).toBe(1);
+});
+
+test("startup MCP isolation errors fail before prompt/model work and retain only redacted details", async () => {
+  process.env.OMP_TEST_STARTUP_MCP_EXTENSION_ERROR = "1";
+  const result = await run("startup collision");
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain("fixture startup collision");
+  expect(result.output).toContain("access_token=[redacted]");
+  expect(result.output).not.toContain("fixture-secret");
+  expect(capture().count).toBe(0);
+  expect(capture().message).toBeUndefined();
 });
 
 test("Oracle starts with the bundled simplify skill resolved independently of cwd", async () => {

@@ -23,10 +23,7 @@ const capture = () => {
       count,
       pid: process.pid,
       childGuard: process.env.PI_OMP_CHILD,
-      mcpMode: process.env.PI_MCP_CONFIG_MODE,
-      mcpConfig: args.includes("--mcp-config")
-        ? JSON.parse(fs.readFileSync(option("--mcp-config"), "utf8"))
-        : undefined,
+      childRole: process.env.PI_OMP_CHILD_ROLE,
       prompt: fs.readFileSync(option("--append-system-prompt"), "utf8"),
     }),
   );
@@ -57,6 +54,25 @@ input.on("line", async (line) => {
     return;
   }
   if (command.type === "get_state") {
+    if (process.env.OMP_TEST_NONFATAL_EXTENSION_ERRORS) {
+      const childExtension = option("--extension");
+      emit({ type: "extension_error", extensionPath: childExtension, event: "session_start", error: "ordinary extension warning" });
+      emit({
+        type: "extension_error",
+        extensionPath: path.join(path.dirname(childExtension), "other-extension.ts"),
+        event: "session_start",
+        error: "OMP child native MCP isolation failed: unrelated source",
+      });
+    }
+    if (process.env.OMP_TEST_STARTUP_MCP_EXTENSION_ERROR) {
+      emit({
+        type: "extension_error",
+        extensionPath: option("--extension"),
+        event: "session_start",
+        error: "OMP child native MCP isolation failed: fixture startup collision access_token=fixture-secret",
+      });
+      return;
+    }
     emit({
       type: "response",
       id: command.id,
@@ -73,6 +89,15 @@ input.on("line", async (line) => {
   fs.writeFileSync(sessionFile, JSON.stringify({ count }));
   capture();
   emit({ type: "response", id: command.id, command: "prompt", success: true });
+  if (process.env.OMP_TEST_MCP_EXTENSION_ERROR) {
+    emit({
+      type: "extension_error",
+      extensionPath: option("--extension"),
+      event: "before_agent_start",
+      error: "OMP child native MCP isolation failed: fixture command collision access_token=fixture-secret",
+    });
+    return;
+  }
   emit({ type: "agent_start" });
   emit({ type: "message_start", message: { role: "assistant" } });
   emit({

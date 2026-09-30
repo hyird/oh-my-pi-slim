@@ -37,7 +37,7 @@ import {
 } from "./render.ts";
 import { prepareAssignments } from "./language.ts";
 import { registerWebSearch } from "./websearch.ts";
-import { hasMcpAdapter, installMcpPolicy } from "./mcp-policy.ts";
+import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
 import { failureDetail } from "./failure-detail.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
@@ -565,10 +565,7 @@ export default function omp(pi: ExtensionAPI) {
     callId: string,
     launches: ReadonlyMap<Role, AgentLaunch>,
   ): AgentToolResult<OmpDetails> => {
-    const mcpAdapter = hasMcpAdapter(pi.getAllTools?.() ?? []);
-    const childLaunches = new Map(
-      [...launches].map(([role, launch]) => [role, { ...launch, mcpAdapter }]),
-    );
+    const childLaunches = launches;
     const id = randomUUID();
     const controller = new AbortController();
     const job: BackgroundJob = {

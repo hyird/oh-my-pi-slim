@@ -99,6 +99,7 @@ const MAX_OUTPUT = 20_000;
 const SIMPLIFY_SKILL_PATH = fileURLToPath(
   new URL("../../skills/simplify/SKILL.md", import.meta.url),
 );
+const CHILD_MCP_EXTENSION_PATH = fileURLToPath(new URL("./child-mcp.ts", import.meta.url));
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
   return items.map(({ agent, task, taskId }) =>
@@ -141,23 +142,6 @@ export function editLineCounts(result: unknown): { added: number; removed: numbe
   return { added, removed };
 }
 
-/** Only the two public upstream endpoints; no inherited imports or credentials. */
-export function librarianMcpConfig() {
-  return {
-    mcpServers: {
-      context7: { url: "https://mcp.context7.com/mcp", lifecycle: "eager" },
-      gh_grep: { url: "https://mcp.grep.app", lifecycle: "eager" },
-    },
-    settings: {
-      namespaceProxyTools: true,
-      directTools: false,
-      scriptMode: false,
-      allowInstall: false,
-      exposeResources: false,
-    },
-  };
-}
-
 const emptyUsage = (): Usage => ({
   input: 0,
   output: 0,
@@ -174,7 +158,6 @@ export interface ModelSnapshot {
 export interface AgentLaunch {
   model: string;
   thinking?: ThinkingLevel;
-  mcpAdapter?: boolean;
 }
 
 export function resolveLaunches(
@@ -269,14 +252,12 @@ export async function runAgent(
       : agent === "council"
         ? ctx.thinkingLevel
         : (config!.thinking[agent] ?? ctx.thinkingLevel);
-  const mcpAdapter = typeof modelOverride === "object" && modelOverride.mcpAdapter;
   const projectTrusted = ctx.isProjectTrusted();
   const prompt = assignment.prompt ?? ROLES[agent].prompt;
   const ownedSessions = sessions ?? new TaskSessions(0, 0);
   const signature = JSON.stringify([
     model,
     thinking,
-    mcpAdapter,
     prompt,
     ROLES[agent].tools,
     resourceSnapshot ?? resourceRevision(ctx.cwd),
@@ -377,22 +358,12 @@ export async function runAgent(
         await fs.promises.writeFile(
           promptPath,
           agent === "librarian"
-            ? `${prompt}\nOnly mcp__context7 and mcp__gh_grep are permitted MCP tools. If either namespace is missing, report that the pi-mcp-adapter must be loaded and its eager metadata initialized; do not use mcp or mcpScript.\n`
+            ? `${prompt}\nUse only mcp({server:'gh_grep',tool:'search',args:{...}}) for MCP. Direct MCP calls are blocked; context7, codemode, tool_search, and mcpScript are not available. If the scoped gateway is unavailable, report that clearly and continue with read/websearch where useful.\n`
             : prompt,
           { mode: 0o600 },
         );
         const tools: string[] = [...ROLES[agent].tools];
-        const mcpPath =
-          agent === "librarian" || mcpAdapter ? path.join(tmpDir, "mcp.json") : undefined;
-        if (mcpPath) {
-          const mcpConfig = librarianMcpConfig();
-          await fs.promises.writeFile(
-            mcpPath,
-            JSON.stringify(agent === "librarian" ? mcpConfig : { ...mcpConfig, mcpServers: {} }),
-            { mode: 0o600, flag: "wx" },
-          );
-        }
-        if (agent === "librarian") tools.push("mcp__context7", "mcp__gh_grep");
+        if (agent === "librarian") tools.push("mcp", "mcp__gh_grep__searchGitHub");
         const args = [
           "--mode",
           "rpc",
@@ -411,7 +382,8 @@ export async function runAgent(
           ...(thinking ? ["--thinking", thinking] : []),
           "--tools",
           tools.join(","),
-          ...(mcpPath ? ["--mcp-config", mcpPath] : []),
+          "--extension",
+          CHILD_MCP_EXTENSION_PATH,
           "--append-system-prompt",
           promptPath,
         ];
@@ -424,10 +396,12 @@ export async function runAgent(
           {
             ...process.env,
             PI_OMP_CHILD: "1",
-            PI_MCP_CONFIG_MODE: mcpPath ? "exclusive" : undefined,
-            MCP_DIRECT_TOOLS: undefined,
+            PI_OMP_CHILD_ROLE: agent,
           },
           cleanup,
+          undefined,
+          undefined,
+          CHILD_MCP_EXTENSION_PATH,
         );
       } catch (err) {
         await cleanup();
@@ -635,7 +609,7 @@ export async function runAgent(
             ? `${failureDetail(err)}${suffix && !failureDetail(err)?.includes(modelDetail ?? "\0") ? suffix : ""}`
             : retryFailed && finalStop === "error"
               ? `Model request failed after retry. Inspect partial work before continuing.${suffix}`
-              : `Specialist run failed${agent === "librarian" ? "; check pi-mcp-adapter and context7/gh_grep eager metadata" : ""}${suffix}`;
+              : `Specialist run failed${agent === "librarian" ? "; check the isolated native gh_grep MCP connector or use read/websearch" : ""}${suffix}`;
     timings.totalMs = performance.now() - started;
     try {
       conversation?.finish(cancelled ? "cancelled" : "failed", failure, { taskId, runId, timings });
