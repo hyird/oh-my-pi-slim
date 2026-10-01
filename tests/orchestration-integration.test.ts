@@ -1077,7 +1077,7 @@ test("OMP cards show only safe progress until final outputs, regardless of expan
       .join("\n");
   const compact = render(false, true);
   expect(compact).toContain("running · 0/2");
-  expect(compact).toContain("○ queued · Explorer task 1");
+  expect(compact.replace(/ +/g, " ")).toContain("○ queued · Explorer task 1");
   expect(compact).toContain("⠋ running · Fixer task 2");
   expect(compact).not.toMatch(/SECRET_|private-command|assistant message|Ctrl\+Alt\+O/);
   const expanded = render(true, true);
@@ -1107,7 +1107,7 @@ test("OMP cards show only safe progress until final outputs, regardless of expan
       .render(120)
       .join("\n");
     expect(finished).toContain("failed · 2/2");
-    expect(finished).toContain("✓ done · Explorer task 1");
+    expect(finished.replace(/ +/g, " ")).toContain("✓ done · Explorer task 1");
     expect(finished).toContain("✗ failed · Fixer task 2");
     expect(finished).toContain("Final answer");
     expect(finished).toContain("Safe conclusion.");
@@ -1275,6 +1275,45 @@ test("OMP task rows show live run time and tokens, then retain final values", ()
   } finally {
     now.mockRestore();
   }
+});
+
+test("mixed OMP tasks align columns across statuses, names, metrics and missing values", () => {
+  const theme: any = {
+    fg: (_: string, value: string) => `\x1b[32m${value}\x1b[0m`,
+    bold: (value: string) => value,
+  };
+  const agents = ["explorer", "librarian", "oracle", "designer", "fixer"] as const;
+  const progress = agents.map((agent, i): AgentProgress => ({
+    agent, task: "inspect", state: i === 4 ? "running" : "done",
+    activity: "", text: "", activities: [], elapsedMs: [17000, 21000, 71000, 12000, 202000][i],
+    totalTokens: [8600, 27000, 51000, 9900, 618000][i],
+    tokensPerSecond: [42, 36, 18, 36, 41][i], phase: "model",
+    dcpStatus: i === 4 ? "DCP: ~683" : undefined,
+  }));
+  const pinned = renderPinnedOmpOverview(
+    [{ kind: "job", progress, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
+  const result = renderOmpResult({ content: [], details: { progress } },
+    { expanded: false, isPartial: true }, theme);
+  for (const card of [pinned, result]) {
+    const lines = card.render(140).map(stripTerminalSequences).filter((line) => line.includes(" task "));
+    expect(lines).toHaveLength(5);
+    const separators = (line: string) => Array.from(line.matchAll(/ · /g), (match) => match.index);
+    const columns = separators(lines[0]!);
+    for (const line of lines) expect(separators(line).slice(0, 4)).toEqual(columns);
+    expect(lines[4]).toContain("DCP: ~683");
+    for (const width of [24, 34, 50, 80])
+      expect(card.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
+  }
+  // A queued child reserves positions only when it has later reported metrics.
+  const missing = [{ ...progress[0]!, elapsedMs: undefined, tokensPerSecond: undefined }, progress[4]!];
+  const card = renderPinnedOmpOverview(
+    [{ kind: "job", progress: missing, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
+  const lines = card.render(140).map(stripTerminalSequences).filter((line) => line.includes(" task "));
+  expect(lines[0]!.indexOf("tokens") + "tokens".length).toBe(lines[1]!.indexOf("tokens") + "tokens".length);
 });
 
 test("result-only cards retain run time and tokens after cancellation", () => {
@@ -1805,7 +1844,7 @@ test("a new dispatch returns finished batches to chat while keeping batches sepa
       h.ctx,
     );
     const fixed = widgetText(pinned);
-    expect(fixed).toContain("queued · Fixer task");
+    expect(fixed.replace(/ +/g, " ")).toContain("queued · Fixer task");
     expect(fixed).not.toContain("Explorer task");
     expect(fixed.match(/OMP/g)).toHaveLength(1);
     const releasedCard = tool.renderCall(firstArgs, theme, { ...firstContext, isPartial: false });
@@ -1864,7 +1903,7 @@ test("a new dispatch leaves an unfinished earlier batch fixed", async () => {
     );
     const fixed = widgetText(pinned);
     expect(fixed).toContain("running · Explorer task");
-    expect(fixed).toContain("queued · Fixer task");
+    expect(fixed.replace(/ +/g, " ")).toContain("queued · Fixer task");
     expect((fixed.match(/OMP/g) ?? []).length).toBe(1);
     expect(fixed.indexOf("Explorer task")).toBeLessThan(fixed.indexOf("Fixer task"));
     h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
@@ -2000,7 +2039,7 @@ test("long fixed task details scroll within half the terminal and keep task rows
   const second = card.render(100).join("\n");
   expect(second).toContain("second task detail");
   expect(second).toContain("Explorer task 1 ▸");
-  expect(second).toContain("Fixer task 2 ▾");
+  expect(second.replace(/ +/g, " ")).toContain("Fixer task 2 ▾");
   expect(second).not.toContain("detail line 60");
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
@@ -2202,7 +2241,7 @@ test("only one task can stay expanded across dispatches in the fixed OMP overvie
   expect(second).toContain("second private detail");
   expect(second).not.toContain("first private detail");
   expect(second).toContain("Explorer task ▸");
-  expect(second).toContain("Fixer task ▾");
+  expect(second.replace(/ +/g, " ")).toContain("Fixer task ▾");
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
 
