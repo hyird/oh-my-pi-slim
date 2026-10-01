@@ -73,6 +73,8 @@ function taskUsageLabels(item?: AgentProgress, final?: Result): string[] {
   const tokens = final?.usage?.totalTokens ?? item?.totalTokens;
   if (tokens !== undefined && Number.isFinite(tokens) && tokens >= 0)
     labels.push(`${formatTokens(tokens)} tokens`);
+  const dcp = item ? item.dcpStatus : final?.dcpStatus;
+  if (dcp) labels.push(dcp);
   return labels;
 }
 
@@ -123,22 +125,22 @@ function taskStatusLabels(item: AgentProgress | undefined, state: AgentProgress[
   const lastEventAt = item.lastEventAt;
   if (typeof lastEventAt === "number" && Number.isFinite(lastEventAt)) {
     const quietMinutes = Math.floor(Math.max(0, Date.now() - lastEventAt) / 60_000);
-    if (quietMinutes > 0) labels.push(`no events ${quietMinutes}m`);
+    if (quietMinutes > 0) labels.push(`quiet:${quietMinutes}m`);
   }
   // Only fixed OMP phases are rendered. Activity text can contain tool paths or
   // provider data, so it must never be used as a task-row label.
   switch (item.phase) {
     case "starting": labels.push("starting"); break;
-    case "model": labels.push("model working"); break;
-    case "tool": labels.push("tool running"); break;
+    case "model": labels.push("working"); break;
+    case "tool": labels.push("tool"); break;
     case "retrying": {
       const attempt = item.retry?.attempt;
       const max = item.retry?.max;
       labels.push(Number.isSafeInteger(attempt) && Number.isSafeInteger(max)
-        ? `retrying ${attempt}/${max}` : "retrying");
+        ? `retrying:${attempt}/${max}` : "retrying");
       break;
     }
-    case "retry-failed": labels.push("request failed"); break;
+    case "retry-failed": labels.push("error"); break;
     case "settling": labels.push("finishing"); break;
   }
   return labels;

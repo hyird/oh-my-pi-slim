@@ -224,10 +224,15 @@ test.each(["dist/cli.js", "dist/bundle/cli.js"])("real Pi 0.99 RPC (%s) retries 
       import.meta.dir,
       `../node_modules/@earendil-works/pi-coding-agent/${cliPath}`,
     );
+    const dcpPath = path.join(root, "test-dcp.ts");
+    fs.writeFileSync(dcpPath, `export default function(pi) {
+      pi.on("session_start", (_event, ctx) => ctx.ui.setStatus("dcp", "✂️ DCP: ~683 tokens saved"));
+      pi.on("context", (_event, ctx) => ctx.ui.setStatus("dcp", "✂️ DCP: ~701 tokens saved"));
+    }`);
     fs.writeFileSync(
       path.join(root, "settings.json"),
       JSON.stringify({
-        extensions: [path.resolve(import.meta.dir, "../extensions/omp/entry.ts")],
+        extensions: [path.resolve(import.meta.dir, "../extensions/omp/entry.ts"), dcpPath],
         packages: [],
         retry: { enabled: true, maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 50 },
       }),
@@ -270,12 +275,17 @@ test.each(["dist/cli.js", "dist/bundle/cli.js"])("real Pi 0.99 RPC (%s) retries 
       );
     const activities: string[] = [];
     const phases: string[] = [];
+    const dcpStatuses: Array<string | undefined> = [];
     const first = await run("remember the first objective", undefined, (row) => {
       activities.push(row.activity);
       phases.push(row.phase ?? "");
+      dcpStatuses.push(row.dcpStatus);
     });
     expect(first.output).toBe("native result");
     expect(first.ok).toBe(true);
+    expect(dcpStatuses).toContain("DCP: ~683");
+    expect(dcpStatuses).toContain("DCP: ~701");
+    expect(first.dcpStatus).toBe("DCP: ~701");
     expect(activities.some((activity) => activity.startsWith("Retrying model request 1/1"))).toBe(
       true,
     );

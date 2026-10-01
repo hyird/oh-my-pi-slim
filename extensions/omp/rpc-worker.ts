@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { failureDetail } from "./failure-detail.ts";
 import { MCP_ISOLATION_ERROR_MARKER } from "./mcp-isolation.ts";
+import { safeText } from "./conversation-content.ts";
 
 type State = {
   isStreaming: boolean;
@@ -40,6 +41,8 @@ export class RpcWorker {
   readonly closed: Promise<void>;
   readonly ready: Promise<State>;
   sessionFile?: string;
+  /** Latest child-local DCP estimate, including statuses emitted during startup. */
+  dcpStatus?: string;
 
   constructor(
     command: string,
@@ -98,6 +101,14 @@ export class RpcWorker {
         !(event.type === "response" && this.shutdownId && event.id === this.shutdownId)
       )
         return;
+      if (event.type === "extension_ui_request" && event.method === "setStatus" &&
+        event.statusKey === "dcp") {
+        // Forward only the estimate, never arbitrary extension text or controls.
+        const estimate = /\bDCP\s*:\s*(~?\s*\d{1,15}(?:[.,]\d{1,3})*(?:[kKmM])?)\b/i.exec(
+          safeText(event.statusText).slice(0, 256),
+        )?.[1];
+        this.dcpStatus = estimate ? `DCP: ${estimate.replace(/\s/g, "")}` : undefined;
+      }
       if (event.type === "response") {
         if (this.shutdownId && event.id === this.shutdownId) {
           try {

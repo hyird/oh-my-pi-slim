@@ -18,6 +18,8 @@ const keys = [
   "OMP_TEST_DUPLICATE",
   "OMP_TEST_FAIL",
   "OMP_TEST_LENGTH",
+  "OMP_TEST_DCP_STARTUP",
+  "OMP_TEST_DCP_EVENTS",
 ] as const;
 let saved: Array<string | undefined>;
 let argv: string;
@@ -105,6 +107,35 @@ test("same task resumes in the same process, while independent tasks have separa
   expect(independent.taskId).not.toBe(first.taskId);
   expect(capture().pid).not.toBe(initial.pid);
   expect(capture().count).toBe(1);
+});
+
+test("DCP startup estimates survive readiness, resume, and final settlement", async () => {
+  process.env.OMP_TEST_DCP_STARTUP = "✂️ DCP: ~683 tokens saved";
+  const rows: AgentProgress[] = [];
+  const first = await run("first", undefined, undefined, (row) => rows.push(row));
+  expect(first.dcpStatus).toBe("DCP: ~683");
+  expect(rows.some((row) => row.phase === "starting" && row.dcpStatus === "DCP: ~683")).toBe(true);
+  expect(rows.at(-1)?.dcpStatus).toBe("DCP: ~683");
+  const resumed = await run("follow-up", first.taskId);
+  expect(resumed.dcpStatus).toBe("DCP: ~683");
+  delete process.env.OMP_TEST_DCP_STARTUP;
+  const separate = await run("independent without DCP");
+  expect(separate.dcpStatus).toBeUndefined();
+});
+
+test.each([false, true])("child DCP updates are isolated and cleared when requested: %s", async (clear) => {
+  process.env.OMP_TEST_DCP_EVENTS = JSON.stringify([
+    { statusKey: "dcp", statusText: "\u001b[31m✂️ DCP: ~1.2k tokens saved · SECRET_EXTENSION_TEXT\u001b[0m" },
+    { statusKey: "other", statusText: "DCP: ~999" },
+    ...(clear ? [{ statusKey: "dcp" }] : []),
+  ]);
+  const rows: AgentProgress[] = [];
+  const result = await run("DCP update", undefined, undefined, (row) => rows.push(row));
+  expect(result.ok).toBe(true);
+  expect(rows.some((row) => row.dcpStatus === "DCP: ~1.2k")).toBe(true);
+  expect(result.dcpStatus).toBe(clear ? undefined : "DCP: ~1.2k");
+  expect(rows.at(-1)?.dcpStatus).toBe(result.dcpStatus);
+  expect(rows.every((row) => !row.dcpStatus?.includes("SECRET") && !row.dcpStatus?.includes("999"))).toBe(true);
 });
 
 test("a completed result does not wait for process shutdown", async () => {

@@ -38,6 +38,7 @@ export interface Result {
   taskId?: string;
   runId?: string;
   timings?: Timings;
+  dcpStatus?: string;
 }
 export interface AgentProgress {
   agent: Role;
@@ -63,6 +64,8 @@ export interface AgentProgress {
   lastEventAt?: number;
   /** Current run's reported token usage, including cache tokens. */
   totalTokens?: number;
+  /** Latest estimate reported by this child's configured DCP extension. */
+  dcpStatus?: string;
   /** Wall-clock start for live display; elapsedMs freezes the duration once settled. */
   startedAt?: number;
   elapsedMs?: number;
@@ -422,6 +425,10 @@ export async function runAgent(
       signal?.removeEventListener("abort", abortStartup);
     }
     timings.startupMs = performance.now() - started;
+    if (worker.dcpStatus !== progress.dcpStatus) {
+      progress.dcpStatus = worker.dcpStatus;
+      publish();
+    }
     // Dynamic task/language guidance stays outside the stable role system prompt.
     // A leading slash in task text must not execute a Pi slash/skill command.
     const message = `${assignment.instructions ? assignment.instructions + "\n\n" : ""}Assigned task:\n${task}`;
@@ -435,6 +442,12 @@ export async function runAgent(
       }
       replies.record(event);
       progress.replyText = replies.text();
+      if (event.type === "extension_ui_request" && event.method === "setStatus" &&
+        event.statusKey === "dcp") {
+        progress.dcpStatus = worker!.dcpStatus;
+        publish();
+        return;
+      }
       if (event.type === "auto_retry_start") {
         retryFailed = false;
         const attempt = Number.isSafeInteger(event.attempt) ? Math.max(0, event.attempt) : 0;
@@ -590,7 +603,7 @@ export async function runAgent(
     progress.state = "done";
     progress.elapsedMs = timings.totalMs;
     report("Work completed");
-    return { agent, model, ok: true, output, usage, taskId, runId, timings };
+    return { agent, model, ok: true, output, usage, taskId, runId, timings, dcpStatus: progress.dcpStatus };
   } catch (err) {
     await worker?.stop();
     const cancelled = signal?.aborted;
@@ -633,6 +646,7 @@ export async function runAgent(
       taskId,
       runId,
       timings,
+      dcpStatus: progress.dcpStatus,
     };
   } finally {
     if (!sessions) await ownedSessions.clear();

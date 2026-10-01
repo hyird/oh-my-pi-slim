@@ -1293,6 +1293,29 @@ test("result-only cards retain run time and tokens after cancellation", () => {
   expect(output).not.toContain("private error");
 });
 
+test("DCP estimates appear per child in live, completed and result-only cards", () => {
+  const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+  const progress = queuedProgress([
+    { agent: "explorer", task: "inspect" }, { agent: "fixer", task: "fix" },
+  ]).map((item, i) => ({ ...item, state: "running" as const,
+    dcpStatus: i === 0 ? "DCP: ~683" : undefined }));
+  const pinned = renderPinnedOmpOverview(
+    [{ kind: "job", progress, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
+  const lines = pinned.render(120);
+  expect(lines.find((line) => line.includes("Explorer task"))).toContain("DCP: ~683");
+  expect(lines.find((line) => line.includes("Fixer task"))).not.toContain("DCP:");
+  expect(pinned.render(34).every((line) => visibleWidth(line) <= 34)).toBe(true);
+  const results: Result[] = [{ agent: "explorer", model: "test/model", ok: true,
+    output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, dcpStatus: "DCP: ~683" }];
+  for (const rows of [progress.map((item) => ({ ...item, state: "done" as const })), []]) {
+    expect(renderOmpResult({ content: [], details: { progress: rows, results } },
+      { expanded: false, isPartial: false }, theme).render(120).join("\n")).toContain("DCP: ~683");
+  }
+});
+
 test("OMP task rows show retries and quiet time without exposing activity text", () => {
   initTheme();
   const theme: any = {
@@ -1314,12 +1337,12 @@ test("OMP task rows show retries and quiet time without exposing activity text",
     [{ kind: "job", progress: [item], isPartial: true, frame: () => 0, state: {} }],
     theme, () => {}, () => {},
   ).render(120).join("\n");
-  expect(pinned).toContain("Explorer task ▸ · no events 2m · retrying 3/3");
+  expect(pinned).toContain("Explorer task ▸ · quiet:2m · retrying:3/3");
   const result = renderOmpResult(
     { content: [], details: { progress: [item] } },
     { expanded: false, isPartial: true }, theme,
   ).render(120).join("\n");
-  expect(result).toContain("Explorer task · no events 2m · retrying 3/3");
+  expect(result).toContain("Explorer task · quiet:2m · retrying:3/3");
   expect(pinned + result).not.toMatch(/SECRET_|private-command|private task/);
 });
 
