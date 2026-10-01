@@ -71,14 +71,51 @@ export function createChildMcpExtension(
   childMcpConfig(role, serverEntry);
   return (pi: ExtensionAPI): void => {
     const permits = new Map<string, Permit>();
+    const connectionWaiters = new Set<(error?: unknown) => void>();
     let isolationReady = false;
     let isolationFailure: string | undefined;
+
+    // Pi 0.99.2 connects deferred MCP tools in the background. Wait only when
+    // the gateway needs the target, without exposing discovery tools to children.
+    const waitForTarget = (signal?: AbortSignal): Promise<void> => {
+      if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("MCP call cancelled"));
+      if (pi.getAllTools().some((tool) => tool.name === MCP_TARGET)) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const finish = (error?: unknown) => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          connectionWaiters.delete(finish);
+          if (error !== undefined) reject(error);
+          else resolve();
+        };
+        const abort = () => finish(signal?.reason ?? new Error("MCP call cancelled"));
+        const timer = setTimeout(() => {
+          finish(new Error("Native gh_grep target did not connect within 10 seconds. Refusing fallback."));
+        }, 10_000);
+        connectionWaiters.add(finish);
+        signal?.addEventListener("abort", abort, { once: true });
+      });
+    };
+    pi.on("session_shutdown", () => {
+      isolationReady = false;
+      permits.clear();
+      for (const finish of connectionWaiters) finish(new Error("MCP session closed"));
+    });
 
     // The native connector must not inherit servers registered by another extension.
     // Keep the host registry untouched and replace only the connector's view.
     const connectorApi = new Proxy(pi, {
       get(target, property) {
         if (property === "getMcpServers") return () => [];
+        if (property === "registerTool") {
+          const registerTool: ExtensionAPI["registerTool"] = (definition) => {
+            target.registerTool(definition);
+            if (definition.name === MCP_TARGET) {
+              for (const finish of connectionWaiters) finish();
+            }
+          };
+          return registerTool;
+        }
         const value = Reflect.get(target, property, target) as unknown;
         return typeof value === "function" ? value.bind(target) : value;
       },
@@ -96,6 +133,7 @@ export function createChildMcpExtension(
         ? reason
         : mcpIsolationError(reason);
       permits.clear();
+      for (const finish of connectionWaiters) finish(new Error(isolationFailure));
       try {
         ctx.shutdown();
       } catch {
@@ -158,7 +196,9 @@ export function createChildMcpExtension(
       if (role !== "librarian") isolationReady = true;
     });
 
-    pi.on("before_agent_start", (_event, ctx) => {
+    pi.on("before_agent_start", (event, ctx) => {
+      // Native discovery instructions mention helpers denied by this child's policy.
+      delete event.systemPromptOptions.sections.mcp_servers;
       validateConnector(ctx, role === "librarian");
       isolationReady = true;
     });
@@ -213,6 +253,9 @@ export function createChildMcpExtension(
         if (signal?.aborted) throw signal.reason ?? new Error("MCP call cancelled");
         rethrowLatchedFailure(ctx);
         if (!isolationReady) closeOnIsolationFailure(ctx, "connector has not been validated");
+        if (!validateConnector(ctx, true)) await waitForTarget(signal);
+        if (signal?.aborted) throw signal.reason ?? new Error("MCP call cancelled");
+        if (!isolationReady) throw new Error("MCP session closed");
         const targetReady = validateConnector(ctx, true);
         if (!targetReady || !ctx.tools.some((tool) => tool.name === MCP_TARGET)) {
           throw new Error("Native gh_grep target is unavailable; the server may not be connected. Refusing fallback.");
