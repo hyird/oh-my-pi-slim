@@ -7,7 +7,9 @@
 - [Providers](https://github.com/earendil-works/pi/blob/v0.99.2/packages/coding-agent/docs/providers.md): new installations prefer `/login openai` with Sign in with ChatGPT; saved legacy credentials are not converted between grants.
 - [Packages](https://github.com/earendil-works/pi/blob/v0.99.2/packages/coding-agent/docs/packages.md#declare-dependencies): host-provided modules are wildcard peers and are not bundled; exact 0.99.2 development dependencies validate the implementation.
 
-These are **read-only inspiration**, not runtime dependencies or promises of API compatibility with future releases. OMP has its own isolated Pi RPC child subprocess backend and its own local conversation recorder. No third-party `pi-subagents` installation or integration is required.
+The extension loader regression uses the public SDK `DefaultResourceLoader`, including discovery from a temporary directory outside the checkout. The child connector receives an explicitly typed `ExtensionAPI` view that delegates registration to Pi and scopes its server list; this leaves the host API and registry unchanged. Gateway calls use the public `ctx.executeTool()` pipeline.
+
+The upstream projects below are **read-only inspiration**, not runtime dependencies or promises of API compatibility with future releases. OMP has its own isolated Pi RPC child subprocess backend and its own local conversation recorder. No third-party `pi-subagents` installation or integration is required.
 
 ## [Upstream source](https://github.com/alvinunreal/oh-my-opencode-slim)
 

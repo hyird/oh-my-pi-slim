@@ -104,22 +104,16 @@ export function createChildMcpExtension(
 
     // The native connector must not inherit servers registered by another extension.
     // Keep the host registry untouched and replace only the connector's view.
-    const connectorApi = new Proxy(pi, {
-      get(target, property) {
-        if (property === "getMcpServers") return () => [];
-        if (property === "registerTool") {
-          const registerTool: ExtensionAPI["registerTool"] = (definition) => {
-            target.registerTool(definition);
-            if (definition.name === MCP_TARGET) {
-              for (const finish of connectionWaiters) finish();
-            }
-          };
-          return registerTool;
+    const connectorApi: ExtensionAPI = {
+      ...pi,
+      getMcpServers: () => [],
+      registerTool(definition) {
+        pi.registerTool(definition);
+        if (definition.name === MCP_TARGET) {
+          for (const finish of connectionWaiters) finish();
         }
-        const value = Reflect.get(target, property, target) as unknown;
-        return typeof value === "function" ? value.bind(target) : value;
       },
-    });
+    };
     createMcpExtension({
       loadConfig: () => childMcpConfig(role, serverEntry),
       updateConfig: () => {
