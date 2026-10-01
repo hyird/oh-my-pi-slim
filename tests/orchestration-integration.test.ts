@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
 import ompEntry from "../extensions/omp/entry.ts";
-import { initTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { initTheme, withFileMutationQueue, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   configPath,
   DEFAULT_CONFIG,
@@ -132,7 +132,7 @@ test.each(["input", "abort", "shutdown"])(
   },
 );
 
-function harness() {
+function harness(recovery?: { id: string; branch?: any[]; manager?: SessionManager; queueOnly?: boolean }) {
   const commands: Record<string, any> = {};
   const shortcuts: Record<string, any> = {};
   const tools: Record<string, any> = {};
@@ -141,7 +141,7 @@ function harness() {
   const sentMessages: Array<{ message: any; options: any }> = [];
   const selected: string[] = [];
   const modelCalls: any[] = [];
-  const branch: any[] = [
+  const branch: any[] = recovery?.branch ?? [
     {
       type: "message",
       message: { role: "user", content: [{ type: "text", text: "请用中文处理这个任务" }] },
@@ -159,7 +159,8 @@ function harness() {
         throw new Error("Dispatch must not call the main model");
       },
     },
-    sessionManager: { getBranch: () => branch },
+    sessionManager: recovery?.manager ?? { getBranch: () => branch,
+      ...(recovery ? { getSessionId: () => recovery.id } : {}) },
     isProjectTrusted: () => false,
     ui: {
       notify: (text: string) => notifications.push(text),
@@ -181,6 +182,8 @@ function harness() {
     },
     sendMessage: (message: any, options: any) => {
       sentMessages.push({ message, options });
+      if (recovery?.manager && !recovery.queueOnly) recovery.manager.appendMessage({ ...message, role: "custom", timestamp: Date.now() });
+      else if (recovery && !recovery.queueOnly) branch.push({ type: "message", message: { ...message, role: "custom" } });
     },
     on: (name: string, handler: any) => {
       handlers[name] = handler;
@@ -190,7 +193,9 @@ function harness() {
       ctx.model = model;
       return true;
     },
-    appendEntry: () => {
+    appendEntry: (customType: string, data: unknown) => {
+      if (recovery?.manager) { recovery.manager.appendCustomEntry(customType, structuredClone(data)); return; }
+      if (recovery) { branch.push({ type: "custom", customType, data: structuredClone(data) }); return; }
       throw new Error("/omp must not modify session state");
     },
   };
@@ -218,6 +223,134 @@ async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
   }
   expect(await check()).toBe(true);
 }
+
+test("restarting OMP restores interrupted children from saved sessions without repeating completed tasks", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  try {
+    const h = harness({ id: "parent-restart" });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("restart-batch", { tasks: [
+      { agent: "explorer", task: "[delay=10] finished" },
+      { agent: "fixer", task: "[delay=400] interrupted" },
+    ] }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    await h.handlers.session_shutdown({}, h.ctx);
+    const checkpoint = [...h.branch].reverse().find((entry) => entry.customType === "omp-recovery-v1").data;
+    expect(checkpoint.jobs[0].results[0].ok).toBe(true);
+    expect(checkpoint.jobs[0].results[1]).toBeNull();
+    expect(checkpoint.jobs[0].delivered).toEqual([0]);
+    const completedId = checkpoint.jobs[0].items[0].taskId;
+    const interruptedId = checkpoint.jobs[0].items[1].taskId;
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, "omp", "sessions", completedId, "session.jsonl"), "utf8")).count).toBe(1);
+    const resumed = harness({ id: "parent-restart", branch: h.branch });
+    await resumed.handlers.session_start({}, resumed.ctx);
+    await waitFor(() => resumed.sentMessages.length === 1, 150);
+    expect(resumed.sentMessages[0].message.content).toContain("fixer");
+    expect(resumed.sentMessages[0].message.content).not.toContain("OK explorer");
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, "omp", "sessions", completedId, "session.jsonl"), "utf8")).count).toBe(1);
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, "omp", "sessions", interruptedId, "session.jsonl"), "utf8")).count).toBe(2);
+    await resumed.handlers.session_shutdown({}, resumed.ctx);
+    const again = harness({ id: "parent-restart", branch: h.branch });
+    await again.handlers.session_start({}, again.ctx);
+    await Bun.sleep(60);
+    expect(again.sentMessages).toHaveLength(0);
+    // Task IDs remain usable in the resumed parent, including a completed child.
+    await again.tools.omp_delegate.execute("continue-completed", {
+      agent: "explorer", task: "new follow-up", taskId: completedId,
+    }, undefined, undefined, again.ctx);
+    await waitFor(() => again.sentMessages.length === 1);
+  } finally { process.argv[1] = argv; }
+});
+
+test("recovery state cannot start children in a different parent or trust scope", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  try {
+    const h = harness({ id: "original-parent" });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("pending", { agent: "fixer", task: "[delay=400] work" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.branch.some((entry) => entry.customType === "omp-recovery-v1" && entry.data.tasks.some((task: any) => task.sessionFile)));
+    await h.handlers.session_shutdown({}, h.ctx);
+    const other = harness({ id: "new-parent", branch: h.branch });
+    await other.handlers.session_start({}, other.ctx);
+    expect(other.sentMessages).toHaveLength(0);
+    const trusted = harness({ id: "original-parent", branch: h.branch });
+    trusted.ctx.isProjectTrusted = () => true;
+    await trusted.handlers.session_start({}, trusted.ctx);
+    expect(trusted.sentMessages).toHaveLength(0);
+  } finally { process.argv[1] = argv; }
+});
+
+test.each(["rejected", "queued"])("completed but undelivered results survive shutdown (%s) without replaying the child", async (delivery) => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  try {
+    const h = harness({ id: "pending-delivery", queueOnly: delivery === "queued" });
+    await h.handlers.session_start({}, h.ctx);
+    // Throw before accepting the message, as Pi does when a delivery cannot be queued.
+    h.ctx.ui.setWidget = () => {};
+    const entry = h.tools.omp_delegate;
+    // The harness can fail delivery without changing the public extension API.
+    if (delivery === "rejected") h.sentMessages.push = () => { throw new Error("delivery unavailable"); };
+    await entry.execute("undelivered", { agent: "fixer", task: "finish" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.branch.some((item) => item.customType === "omp-recovery-v1" && item.data.jobs[0]?.active === false));
+    await h.handlers.session_shutdown({}, h.ctx);
+    const stored = [...h.branch].reverse().find((item) => item.customType === "omp-recovery-v1").data;
+    expect(stored.jobs[0].delivered).toEqual([]);
+    const id = stored.jobs[0].items[0].taskId;
+    const resumed = harness({ id: "pending-delivery", branch: h.branch });
+    await resumed.handlers.session_start({}, resumed.ctx);
+    await waitFor(() => resumed.sentMessages.length === 1);
+    expect(resumed.sentMessages[0].message.content).toContain("OK fixer");
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, "omp", "sessions", id, "session.jsonl"), "utf8")).count).toBe(1);
+  } finally { process.argv[1] = argv; }
+});
+
+test("unavailable recovery models preserve pending work until settings are repaired", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  try {
+    const h = harness({ id: "paused-model" });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("model-pending", { agent: "fixer", task: "[delay=300] work" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.branch.some((entry) => entry.customType === "omp-recovery-v1" && entry.data.tasks.some((task: any) => task.sessionFile)));
+    await h.handlers.session_shutdown({}, h.ctx);
+    const unavailable = harness({ id: "paused-model", branch: h.branch });
+    unavailable.ctx.modelRegistry.getAvailable = () => [];
+    await unavailable.handlers.session_start({}, unavailable.ctx);
+    expect(unavailable.notifications.some((text) => text.includes("recovery is waiting"))).toBe(true);
+    await unavailable.handlers.session_shutdown({}, unavailable.ctx);
+    const saved = [...h.branch].reverse().find((entry) => entry.customType === "omp-recovery-v1").data;
+    expect(saved.jobs).toHaveLength(1);
+    const repaired = harness({ id: "paused-model", branch: h.branch });
+    await repaired.handlers.session_start({}, repaired.ctx);
+    await waitFor(() => repaired.sentMessages.length === 1, 100);
+  } finally { process.argv[1] = argv; }
+});
+
+test("recovery checkpoints survive reopening Pi's real parent-session JSONL file", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  try {
+    const manager = SessionManager.create(tmp, path.join(tmp, "parent-sessions"));
+    manager.appendMessage({ role: "user", content: "continue saved work", timestamp: Date.now() });
+    const h = harness({ id: manager.getSessionId(), manager });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("native-parent", { agent: "fixer", task: "[delay=300] work" }, undefined, undefined, h.ctx);
+    await waitFor(() => manager.getBranch().some((entry: any) => entry.customType === "omp-recovery-v1" && entry.data.tasks.some((task: any) => task.sessionFile)));
+    await h.handlers.session_shutdown({}, h.ctx);
+    const reopened = SessionManager.open(manager.getSessionFile()!);
+    expect(reopened.getSessionId()).toBe(manager.getSessionId());
+    const resumed = harness({ id: reopened.getSessionId(), manager: reopened });
+    await resumed.handlers.session_start({}, resumed.ctx);
+    await waitFor(() => resumed.sentMessages.length === 1, 100);
+    const saved: any = [...reopened.getBranch()].reverse().find((entry: any) => entry.customType === "omp-recovery-v1");
+    expect(saved.data.jobs).toEqual([]);
+    const id = saved.data.tasks[0].taskId;
+    expect(JSON.parse(fs.readFileSync(path.join(tmp, "omp", "sessions", id, "session.jsonl"), "utf8")).count).toBe(2);
+  } finally { process.argv[1] = argv; }
+});
 
 function widgetText(content: any, width = 100): string {
   if (!content) return "";

@@ -23,7 +23,8 @@ import {
   type AgentLaunch,
   type ModelSnapshot,
 } from "./subagents.ts";
-import { TaskSessions } from "./task-sessions.ts";
+import { TaskSessions, type SavedTaskSession } from "./task-sessions.ts";
+import { RECOVERY_ENTRY, readRecovery, type SavedJob } from "./recovery.ts";
 import {
   formatTokenRate,
   OMP_SPINNER_FRAMES,
@@ -69,10 +70,12 @@ type BackgroundJob = {
   released: boolean;
   animationFrame: number;
   deliveryTimer?: ReturnType<typeof setTimeout>;
+  saved: SavedJob;
 };
 
 type PendingCall = { tasks: Assignment[]; state: OmpRenderState; displayOrder: number };
 type PendingDelivery = {
+  jobId: string;
   session: number;
   content: string;
   attempts: number;
@@ -110,7 +113,7 @@ export default function omp(pi: ExtensionAPI) {
   let mainTokenRate: number | undefined;
   let lastRateStatusAt = 0;
   // Each extension instance owns its jobs. Reloading disposes this instance and
-  // cancels its children; no cross-version runtime state is shared.
+  // stops its children; only validated parent-session checkpoints are restored.
   const runtime: OmpRuntime = {
     session: 0,
     jobs: new Map(),
@@ -127,6 +130,37 @@ export default function omp(pi: ExtensionAPI) {
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const sessions = new TaskSessions();
+  let suspending = false;
+  let savedTaskRevision = "";
+  let retainedTasks: SavedTaskSession[] = [];
+  let deferredJobs: SavedJob[] = [];
+  const checkpoint = () => {
+    const ctx = runtime.ctx;
+    if (suspending || !ctx?.sessionManager?.getSessionId?.()) return;
+    try {
+      // A queued steer can disappear at shutdown. Acknowledge only messages
+      // already committed to the parent branch, not sendMessage acceptance.
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== "message" || entry.message.role !== "custom" ||
+          entry.message.customType !== "omp-background-result") continue;
+        const details = entry.message.details as { ompJobId?: string; ompIndices?: number[] } | undefined;
+        const job = details?.ompJobId ? jobs.get(details.ompJobId) : undefined;
+        if (job && Array.isArray(details?.ompIndices)) {
+          for (const index of details.ompIndices)
+            if (Number.isSafeInteger(index) && job.saved.results[index] && !job.saved.delivered.includes(index))
+              job.saved.delivered.push(index);
+        }
+      }
+      pi.appendEntry(RECOVERY_ENTRY, structuredClone({
+        version: 1, parentId: ctx.sessionManager.getSessionId(), scope: taskScope(ctx),
+        tasks: [...new Map([...retainedTasks, ...sessions.snapshot()].map((task) => [task.taskId, task])).values()],
+        jobs: [...deferredJobs, ...[...jobs.values()].map((job) => job.saved)]
+          .filter((job) => job.active || job.delivered.length < job.items.length),
+      }));
+    } catch (err) {
+      warn(ctx, `OMP: could not save recovery state: ${failureDetail(err) ?? "unknown error"}`);
+    }
+  };
   const backgroundWaiters = new Set<() => void>();
   let deliveryRevision = 0;
   let observedDeliveryRevision = 0;
@@ -464,10 +498,15 @@ export default function omp(pi: ExtensionAPI) {
           continue;
         }
         try {
+          const owner = jobs.get(item.jobId);
+          const indices = (item.completed ?? []).map((entry) => owner?.saved.results.indexOf(entry.result) ?? -1)
+            .filter((index) => index >= 0);
           runtime.pi.sendMessage(
-            { customType: "omp-background-result", display: false, content: item.content },
+            { customType: "omp-background-result", display: false, content: item.content,
+              details: { ompJobId: item.jobId, ompIndices: indices } },
             { triggerTurn: true, deliverAs: "steer" },
           );
+          checkpoint();
           deliveryRevision++;
           releaseBackgroundWaiters();
         } catch {
@@ -515,7 +554,7 @@ export default function omp(pi: ExtensionAPI) {
     completed?: Array<{ result: Result; at: number }>,
   ) => {
     if (job.session !== runtime.session) return;
-    runtime.pending.push({ session: job.session, content, attempts: 0, completed });
+    runtime.pending.push({ jobId: job.id, session: job.session, content, attempts: 0, completed });
     flushPending();
   };
   const visibleResult = (
@@ -565,9 +604,10 @@ export default function omp(pi: ExtensionAPI) {
     kind: BackgroundJob["kind"],
     callId: string,
     launches: ReadonlyMap<Role, AgentLaunch>,
+    restored?: SavedJob,
   ): AgentToolResult<OmpDetails> => {
     const childLaunches = launches;
-    const id = randomUUID();
+    const id = restored?.id ?? randomUUID();
     const controller = new AbortController();
     const job: BackgroundJob = {
       id,
@@ -582,6 +622,8 @@ export default function omp(pi: ExtensionAPI) {
       displayOrder: calls.get(callId)?.displayOrder ?? runtime.nextDisplayOrder++,
       released: false,
       animationFrame: 0,
+      saved: restored ?? { id, callId, kind, items: prepared.items.map((item) => ({ ...item })),
+        results: prepared.items.map(() => null), delivered: [], active: true },
     };
     bindContext(ctx);
     const dcpSnapshot = discoverDcpTools(pi);
@@ -590,10 +632,24 @@ export default function omp(pi: ExtensionAPI) {
     runtime.jobsByCall.set(callId, job);
     runtime.running.add(job);
     runtime.pinned.add(job);
+    checkpoint();
     refreshPinned();
     startAnimation();
-    const completed = new Set<number>();
-    const pendingResults: Array<{ result: Result; at: number }> = [];
+    const completed = new Set<number>(job.saved.results.flatMap((result, index) => result ? [index] : []));
+    const pendingResults = job.saved.results.flatMap((result, index) =>
+      result && !job.saved.delivered.includes(index) ? [{ result, at: performance.now() }] : []);
+    const activeIndices = prepared.items.flatMap((_, index) => completed.has(index) ? [] : [index]);
+    const activeItems = activeIndices.map((index) => {
+      const item = job.saved.items[index]!;
+      return restored ? { ...item, instructions: `${item.instructions ?? ""}\nThis task was interrupted by a parent-session restart. Inspect partial work and the saved conversation first. Continue the original objective; do not blindly repeat completed commands or external actions.` } : item;
+    });
+    job.progress = job.progress.map((row, index) => {
+      const result = job.saved.results[index];
+      return result ? { ...row, taskId: result.taskId, state: result.ok ? "done" : result.cancelled ? "cancelled" : "failed",
+        model: result.model, runId: result.runId, dcpStatus: result.dcpStatus,
+        elapsedMs: result.timings?.totalMs,
+        text: result.ok ? result.output.slice(-2000) : "", totalTokens: result.usage.totalTokens } : row;
+    });
     const flushResults = () => {
       if (job.deliveryTimer) clearTimeout(job.deliveryTimer);
       job.deliveryTimer = undefined;
@@ -614,17 +670,29 @@ export default function omp(pi: ExtensionAPI) {
     };
     void runAssignments(
       ctx,
-      prepared.items,
+      activeItems,
       controller.signal,
       (progress) => {
-        job.progress = progress;
+        if (job.session !== runtime.session) return;
+        const merged = job.progress.slice();
+        progress.forEach((row, index) => {
+          const original = activeIndices[index]!;
+          merged[original] = row;
+          if (row.taskId) job.saved.items[original]!.taskId = row.taskId;
+        });
+        job.progress = merged;
+        const revision = JSON.stringify(sessions.snapshot());
+        if (revision !== savedTaskRevision) { savedTaskRevision = revision; checkpoint(); }
         repaint(job, runtime.ctx?.mode !== "tui");
       },
       childLaunches,
       sessions,
       (result, index) => {
+        index = activeIndices[index]!;
         if (completed.has(index) || job.session !== runtime.session) return;
         completed.add(index);
+        job.saved.results[index] = result;
+        checkpoint();
         if (kind === "council") return;
         pendingResults.push({ result, at: performance.now() });
         if (completed.size === prepared.items.length) flushResults();
@@ -633,7 +701,14 @@ export default function omp(pi: ExtensionAPI) {
       dcpSnapshot,
     )
       .then((results) => {
+        if (job.session !== runtime.session) return;
+        const merged = job.saved.results.slice();
+        results.forEach((result, index) => { merged[activeIndices[index]!] = result; });
+        results = merged.filter((result): result is Result => result !== null);
         job.results = results;
+        job.saved.results = results;
+        job.saved.active = false;
+        checkpoint();
         job.state = controller.signal.aborted
           ? "cancelled"
           : results.some((result) => !result.ok)
@@ -653,11 +728,16 @@ export default function omp(pi: ExtensionAPI) {
             : kind === "council"
               ? `${results.filter((result) => result.ok).length}/${results.length} reviewers responded. These perspectives use the same inherited model, so do not claim cross-model agreement. Synthesize disagreements.\n\n`
               : "Verify and integrate these specialist results before finalizing.\n\n";
-        deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
+        if (job.saved.delivered.length < prepared.items.length)
+          deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`,
+            results.map((result) => ({ result, at: performance.now() })));
       })
       .catch((err) => {
+        if (job.session !== runtime.session) return;
         flushResults();
         job.state = controller.signal.aborted ? "cancelled" : "failed";
+        job.saved.active = false;
+        checkpoint();
         runtime.running.delete(job);
         stopAnimationIfIdle();
         repaint(job);
@@ -859,6 +939,7 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    suspending = true;
     resetMainThroughput();
     cancelRunning();
     const clearing = sessions.clear();
@@ -870,6 +951,10 @@ export default function omp(pi: ExtensionAPI) {
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
     const session = ++runtime.session;
+    const recovery = ctx.sessionManager?.getSessionId?.()
+      ? readRecovery(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId(), taskScope(ctx)) : undefined;
+    retainedTasks = recovery?.tasks ?? [];
+    deferredJobs = recovery?.jobs ?? [];
     await clearing;
     if (session !== runtime.session) return;
     bindContext(ctx);
@@ -886,7 +971,24 @@ export default function omp(pi: ExtensionAPI) {
     reconcileTools(role);
     status(ctx);
     try {
-      await reconcileModels(ctx, () => session === runtime.session);
+      const snapshot = await reconcileModels(ctx, () => session === runtime.session);
+      if (session !== runtime.session) return;
+      if (recovery && role !== "pi") {
+        sessions.restore(recovery.tasks, taskScope(ctx));
+        for (const saved of recovery.jobs) {
+          // Terminal results never run again; empty active lists only restore their cards/delivery.
+          if (!saved.active && saved.delivered.length === saved.items.length) continue;
+          if (!saved.active && saved.results.some((result) => result === null)) continue;
+          try {
+            startJob(ctx, { items: saved.items }, saved.kind, saved.callId,
+              resolveLaunches(ctx, saved.items.filter((_, index) => !saved.results[index]), snapshot), saved);
+            deferredJobs = deferredJobs.filter((job) => job.id !== saved.id);
+          } catch (err) {
+            warn(ctx, `OMP: task recovery is waiting for valid launch settings. Resolve the error and reload: ${failureDetail(err) ?? "unknown error"}`);
+          }
+        }
+        if (runtime.running.size) warn(ctx, "OMP restored saved background tasks and is continuing interrupted work.");
+      }
     } catch (err) {
       if (session === runtime.session)
         warn(
@@ -894,9 +996,16 @@ export default function omp(pi: ExtensionAPI) {
           `OMP: could not update specialist models: ${err instanceof Error ? err.message : String(err)}`,
         );
     }
+    if (session === runtime.session) {
+      suspending = false;
+      savedTaskRevision = JSON.stringify(sessions.snapshot());
+      if (recovery && role !== "pi") checkpoint();
+    }
   });
 
   pi.on("session_shutdown", () => {
+    checkpoint();
+    suspending = true;
     resetMainThroughput();
     try {
       runtime.ctx?.ui.setWidget?.("omp-active", undefined);
@@ -957,6 +1066,7 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("message_end", (event, ctx) => {
+    if (event.message.role === "custom" && event.message.customType === "omp-background-result") checkpoint();
     if (event.message.role !== "assistant") return;
     const output = event.message.usage?.output;
     if (

@@ -20,6 +20,8 @@ export interface TaskSession {
   finish?: () => void;
 }
 
+export type SavedTaskSession = Pick<TaskSession, "taskId" | "agent" | "scope" | "sessionFile">;
+
 function statRevision(file: string): string {
   try {
     const stat = fs.statSync(file, { bigint: true });
@@ -166,6 +168,25 @@ export class TaskSessions {
   private idle = new Set<TaskSession>();
   private operations = new Set<Promise<unknown>>();
   private epoch = 0;
+  snapshot(): SavedTaskSession[] {
+    return [...this.tasks.values()].map((task) => ({
+      taskId: task.taskId, agent: task.agent, scope: task.scope,
+      sessionFile: task.worker?.sessionFile ?? task.sessionFile,
+    }));
+  }
+
+  restore(saved: readonly SavedTaskSession[], scope: string): void {
+    for (const item of saved) {
+      if (item.scope !== scope || !/^[a-f0-9-]{36}$/.test(item.taskId) || this.tasks.has(item.taskId)) continue;
+      const sessionDir = path.join(getAgentDir(), "omp", "sessions", item.taskId);
+      if (!item.sessionFile || !fs.existsSync(item.sessionFile) || !fs.existsSync(sessionDir)) continue;
+      const owned = path.relative(fs.realpathSync(path.dirname(sessionDir)), fs.realpathSync(sessionDir));
+      if (!owned || owned.startsWith("..") || path.isAbsolute(owned)) continue;
+      const relative = path.relative(fs.realpathSync(sessionDir), fs.realpathSync(item.sessionFile));
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+      this.tasks.set(item.taskId, { ...item, sessionDir, signature: "", runId: "", busy: false });
+    }
+  }
   constructor(
     private readonly idleMs = 120_000,
     private readonly maxIdle = 4,
