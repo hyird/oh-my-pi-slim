@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import * as path from "node:path";
 import { Type } from "typebox";
 import {
   createMcpExtension,
@@ -10,6 +11,7 @@ import {
   type ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { isRole } from "./roles.ts";
+import { DCP_ISOLATION_ERROR_MARKER, dcpRegistrationFailure } from "./dcp-tools.ts";
 import { MCP_ISOLATION_ERROR_MARKER, mcpIsolationError } from "./mcp-isolation.ts";
 
 const MCP_TARGET = "mcp__gh_grep__searchGitHub";
@@ -19,6 +21,33 @@ const MCP_TARGET_EXPOSURE = "deferred";
 const MCP_FORBIDDEN_HELPERS = new Set(["codemode", "tool_search", "mcpScript"]);
 const MCP_RESOURCES = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);
 const CHILD_MCP_SOURCE = fileURLToPath(import.meta.url);
+
+type ExpectedDcpProvider = { path: string; tools: string[] };
+function expectedDcpTools(): Map<string, string> {
+  const providers = JSON.parse(process.env.PI_OMP_DCP_TOOLS ?? "[]") as ExpectedDcpProvider[];
+  if (!Array.isArray(providers)) throw new Error("invalid expected provider list");
+  const expected = new Map<string, string>();
+  for (const provider of providers) {
+    if (!provider || typeof provider.path !== "string" || !path.isAbsolute(provider.path) || !Array.isArray(provider.tools)) {
+      throw new Error("invalid expected provider record");
+    }
+    const providerPath = path.resolve(provider.path);
+    for (const name of provider.tools) {
+      if (typeof name !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(name)) throw new Error("invalid expected DCP tool name");
+      const previous = expected.get(name);
+      if (previous && previous !== providerPath) throw new Error(`duplicate expected DCP tool ${name}`);
+      expected.set(name, providerPath);
+    }
+  }
+  return expected;
+}
+let EXPECTED_DCP_TOOLS = new Map<string, string>();
+let EXPECTED_DCP_ERROR: string | undefined;
+try {
+  EXPECTED_DCP_TOOLS = expectedDcpTools();
+} catch (error) {
+  EXPECTED_DCP_ERROR = error instanceof Error ? error.message : String(error);
+}
 const SERVER_ENTRY: McpServerEntry = {
   name: MCP_SERVER,
   source: "omp:librarian",
@@ -74,6 +103,7 @@ export function createChildMcpExtension(
     const connectionWaiters = new Set<(error?: unknown) => void>();
     let isolationReady = false;
     let isolationFailure: string | undefined;
+    let dcpIsolationFailure: string | undefined;
 
     // Pi 0.99.2 connects deferred MCP tools in the background. Wait only when
     // the gateway needs the target, without exposing discovery tools to children.
@@ -146,6 +176,23 @@ export function createChildMcpExtension(
       throw new Error(isolationFailure);
     };
 
+    const closeOnDcpFailure = (ctx: ExtensionContext, reason: string): never => {
+      dcpIsolationFailure ??= `${DCP_ISOLATION_ERROR_MARKER}: ${reason}`;
+      try {
+        ctx.shutdown();
+      } catch {
+        // The latched failure still blocks later hooks and tool calls.
+      }
+      throw new Error(dcpIsolationFailure);
+    };
+
+    const validateDcpTools = (ctx: ExtensionContext): void => {
+      if (dcpIsolationFailure) closeOnDcpFailure(ctx, dcpIsolationFailure);
+      if (EXPECTED_DCP_ERROR) closeOnDcpFailure(ctx, EXPECTED_DCP_ERROR);
+      const failure = dcpRegistrationFailure(pi, EXPECTED_DCP_TOOLS);
+      if (failure) closeOnDcpFailure(ctx, failure);
+    };
+
     // Returns false only for a normal not-yet-connected/missing target. Conflicting
     // owners, duplicate registrations, changed exposure, and command collisions are fatal.
     const validateConnector = (ctx: ExtensionContext, requireTarget: boolean): boolean => {
@@ -186,6 +233,7 @@ export function createChildMcpExtension(
     };
 
     pi.on("session_start", (_event, ctx) => {
+      validateDcpTools(ctx);
       validateConnector(ctx, false);
       if (role !== "librarian") isolationReady = true;
     });
@@ -193,11 +241,13 @@ export function createChildMcpExtension(
     pi.on("before_agent_start", (event, ctx) => {
       // Native discovery instructions mention helpers denied by this child's policy.
       delete event.systemPromptOptions.sections.mcp_servers;
+      validateDcpTools(ctx);
       validateConnector(ctx, role === "librarian");
       isolationReady = true;
     });
 
     pi.on("tool_call", (event: ToolCallEvent, ctx) => {
+      if (EXPECTED_DCP_TOOLS.has(event.toolName)) validateDcpTools(ctx);
       if (!isMcpTool(event.toolName)) return;
       rethrowLatchedFailure(ctx);
       if (!isolationReady) {

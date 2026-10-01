@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { failureDetail } from "./failure-detail.ts";
 import { MCP_ISOLATION_ERROR_MARKER } from "./mcp-isolation.ts";
+import { DCP_ISOLATION_ERROR_MARKER } from "./dcp-tools.ts";
 import { safeText } from "./conversation-content.ts";
 
 type State = {
@@ -53,9 +54,12 @@ export class RpcWorker {
     private readonly timeoutMs = 30_000,
     private readonly settleTimeoutMs = 5 * 60_000,
     private readonly fatalExtensionPath?: string,
+    private readonly fatalProviderPaths: string[] = [],
   ) {
     if (fatalExtensionPath && !path.isAbsolute(fatalExtensionPath))
       throw new Error("Fatal extension path must be absolute");
+    if (fatalProviderPaths.some((providerPath) => !path.isAbsolute(providerPath)))
+      throw new Error("Fatal provider paths must be absolute");
     this.proc = spawn(command, args, {
       cwd,
       shell: false,
@@ -80,17 +84,19 @@ export class RpcWorker {
         typeof event.type !== "string"
       )
         return;
-      if (
-        this.fatalExtensionPath &&
+      const fatalDcpProviderError = event.type === "extension_error" &&
+        typeof event.extensionPath === "string" && path.isAbsolute(event.extensionPath) &&
+        this.fatalProviderPaths.some((providerPath) => path.resolve(event.extensionPath) === path.resolve(providerPath));
+      const fatalPolicyError = this.fatalExtensionPath &&
         event.type === "extension_error" &&
         typeof event.extensionPath === "string" &&
         path.isAbsolute(event.extensionPath) &&
         path.resolve(event.extensionPath) === path.resolve(this.fatalExtensionPath) &&
         typeof event.error === "string" &&
-        event.error.includes(MCP_ISOLATION_ERROR_MARKER)
-      ) {
+        (event.error.includes(MCP_ISOLATION_ERROR_MARKER) || event.error.includes(DCP_ISOLATION_ERROR_MARKER));
+      if (fatalDcpProviderError || fatalPolicyError) {
         const detail = failureDetail(event.error);
-        this.fail(new Error(detail ?? MCP_ISOLATION_ERROR_MARKER));
+        this.fail(new Error(detail ?? (fatalDcpProviderError ? DCP_ISOLATION_ERROR_MARKER : MCP_ISOLATION_ERROR_MARKER)));
         void this.stop();
         return;
       }

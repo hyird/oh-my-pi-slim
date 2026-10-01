@@ -40,6 +40,7 @@ import { registerWebSearch } from "./websearch.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
 import { failureDetail } from "./failure-detail.ts";
+import { discoverDcpTools } from "./dcp-tools.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 
 const COUNCIL_PERSPECTIVES = [
@@ -583,6 +584,7 @@ export default function omp(pi: ExtensionAPI) {
       animationFrame: 0,
     };
     bindContext(ctx);
+    const dcpSnapshot = discoverDcpTools(pi);
     calls.delete(callId);
     jobs.set(id, job);
     runtime.jobsByCall.set(callId, job);
@@ -628,6 +630,7 @@ export default function omp(pi: ExtensionAPI) {
         if (completed.size === prepared.items.length) flushResults();
         else job.deliveryTimer ??= setTimeout(flushResults, 50);
       },
+      dcpSnapshot,
     )
       .then((results) => {
         job.results = results;

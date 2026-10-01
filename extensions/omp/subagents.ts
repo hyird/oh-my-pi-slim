@@ -12,6 +12,7 @@ import { availableChildModels } from "./models.ts";
 import { RpcWorker } from "./rpc-worker.ts";
 import { TaskSessions, resourceRevision, type TaskSession } from "./task-sessions.ts";
 import { failureDetail } from "./failure-detail.ts";
+import { mergeRoleTools, type DcpToolSnapshot } from "./dcp-tools.ts";
 
 export interface Assignment {
   agent: Role;
@@ -233,6 +234,7 @@ export async function runAgent(
   onActivity?: (snapshot: AgentProgress) => void,
   sessions?: TaskSessions,
   resourceSnapshot?: string,
+  dcpSnapshot: DcpToolSnapshot = { providers: [], tools: [], signature: "[]" },
 ): Promise<Result> {
   const { agent, task } = assignment;
   if (!isRole(agent) || !task.trim())
@@ -263,6 +265,7 @@ export async function runAgent(
     thinking,
     prompt,
     ROLES[agent].tools,
+    dcpSnapshot.signature,
     resourceSnapshot ?? resourceRevision(ctx.cwd),
   ]);
   const lease: TaskSession = ownedSessions.claim(assignment, taskScope(ctx), signature);
@@ -365,8 +368,12 @@ export async function runAgent(
             : prompt,
           { mode: 0o600 },
         );
-        const tools: string[] = [...ROLES[agent].tools];
-        if (agent === "librarian") tools.push("mcp", "mcp__gh_grep__searchGitHub");
+        const tools = mergeRoleTools(
+          agent === "librarian"
+            ? [...ROLES[agent].tools, "mcp", "mcp__gh_grep__searchGitHub"]
+            : ROLES[agent].tools,
+          dcpSnapshot.tools,
+        );
         const args = [
           "--mode",
           "rpc",
@@ -387,6 +394,7 @@ export async function runAgent(
           tools.join(","),
           "--extension",
           CHILD_MCP_EXTENSION_PATH,
+          ...dcpSnapshot.providers.flatMap((provider) => ["--extension", provider.path]),
           "--append-system-prompt",
           promptPath,
         ];
@@ -400,11 +408,13 @@ export async function runAgent(
             ...process.env,
             PI_OMP_CHILD: "1",
             PI_OMP_CHILD_ROLE: agent,
+            PI_OMP_DCP_TOOLS: JSON.stringify(dcpSnapshot.providers),
           },
           cleanup,
           undefined,
           undefined,
           CHILD_MCP_EXTENSION_PATH,
+          dcpSnapshot.providers.map((provider) => provider.path),
         );
       } catch (err) {
         await cleanup();
@@ -660,6 +670,7 @@ export async function runAssignments(
   modelOverride?: string | ReadonlyMap<Role, AgentLaunch>,
   sessions?: TaskSessions,
   onComplete?: (result: Result, index: number) => void,
+  dcpSnapshot: DcpToolSnapshot = { providers: [], tools: [], signature: "[]" },
 ): Promise<Result[]> {
   const launches = typeof modelOverride === "object" ? modelOverride : undefined;
   const config = launches || signal?.aborted ? undefined : readConfig();
@@ -736,6 +747,7 @@ export async function runAssignments(
             },
             sessions,
             batchResources(),
+            dcpSnapshot,
           );
         } catch (err) {
           results[index] = {

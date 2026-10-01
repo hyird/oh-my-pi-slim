@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { runAgent, taskScope, type AgentProgress } from "../extensions/omp/subagents.ts";
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
 import { RpcWorker } from "../extensions/omp/rpc-worker.ts";
+import type { DcpToolSnapshot } from "../extensions/omp/dcp-tools.ts";
 
 const keys = [
   "PI_CODING_AGENT_DIR",
@@ -33,7 +34,8 @@ const run = (
   signal?: AbortSignal,
   activity?: (row: AgentProgress) => void,
   launch = { model: "test/model", thinking: "low" as const },
-) => runAgent(ctx, { agent: "fixer", task, taskId }, signal, launch, activity, sessions);
+  dcpSnapshot?: DcpToolSnapshot,
+) => runAgent(ctx, { agent: "fixer", task, taskId }, signal, launch, activity, sessions, undefined, dcpSnapshot);
 
 beforeEach(() => {
   saved = keys.map((key) => process.env[key]);
@@ -92,6 +94,40 @@ test("Oracle starts with the bundled simplify skill resolved independently of cw
   );
   expect(path.isAbsolute(args[skillArg + 1]!)).toBe(true);
   expect(fs.existsSync(args[skillArg + 1]!)).toBe(true);
+});
+
+test("DCP tools and their extension are passed to children, and loadout changes rebuild workers", async () => {
+  const providerPath = path.join(root, "dcp.ts");
+  fs.writeFileSync(providerPath, "export default () => {};\\n");
+  const firstSnapshot: DcpToolSnapshot = {
+    providers: [{ path: providerPath, tools: ["compress_v2", "prune_context"] }],
+    tools: ["compress_v2", "prune_context"],
+    signature: JSON.stringify([{ path: providerPath, tools: ["compress_v2", "prune_context"] }]),
+  };
+  const first = await run("first", undefined, undefined, undefined, undefined, firstSnapshot);
+  const initial = capture();
+  const firstTools = initial.args[initial.args.indexOf("--tools") + 1];
+  expect(firstTools.split(",")).toContain("compress_v2");
+  expect(firstTools.split(",")).toContain("prune_context");
+  expect(initial.args.slice(initial.args.indexOf("--extension") + 1)).toContain(providerPath);
+
+  const changed: DcpToolSnapshot = {
+    providers: [{ path: providerPath, tools: ["compress_v2", "new_tool"] }],
+    tools: ["compress_v2", "new_tool"],
+    signature: JSON.stringify([{ path: providerPath, tools: ["compress_v2", "new_tool"] }]),
+  };
+  await run("continue with changed DCP", first.taskId, undefined, undefined, undefined, changed);
+  expect(capture().pid).not.toBe(initial.pid);
+  expect(capture().count).toBe(2);
+  expect(capture().args[capture().args.indexOf("--tools") + 1].split(",")).toContain("new_tool");
+
+  const removed: DcpToolSnapshot = { providers: [], tools: [], signature: "[]" };
+  await run("continue after DCP removal", first.taskId, undefined, undefined, undefined, removed);
+  expect(capture().pid).not.toBe(initial.pid);
+  expect(capture().count).toBe(3);
+  const removedTools = capture().args[capture().args.indexOf("--tools") + 1].split(",");
+  expect(removedTools).not.toContain("compress_v2");
+  expect(removedTools).not.toContain("new_tool");
 });
 
 test("same task resumes in the same process, while independent tasks have separate context", async () => {

@@ -9,6 +9,8 @@
 
 The extension loader regression uses the public SDK `DefaultResourceLoader`, including discovery from a temporary directory outside the checkout. The child connector receives an explicitly typed `ExtensionAPI` view that delegates registration to Pi and scopes its server list; this leaves the host API and registry unchanged. Gateway calls use the public `ctx.executeTool()` pipeline.
 
+DCP inheritance reads Pi's registered and active tool metadata. OMP verifies the canonical extension path against a local `@davecodes/pi-dcp` package manifest whose `pi.extensions` entry resolves to that path; this establishes local attribution only, not package authenticity or an upstream signature. Only active `direct` and `model-only` tools with conservative, comma/whitespace-free names are passed to children. Child startup verifies every expected registration, path, exposure, and active status before model work; the RPC supervisor treats failures from those specific providers or OMP's validation hook as fatal, while unrelated extension errors remain nonfatal. Provider/tool changes are part of worker identity and cause continuation workers to rebuild. This uses only resources Pi already loaded under its ordinary trust rules and does not install DCP, inherit unrelated extensions' tools, bypass global protection, or create configuration.
+
 The upstream projects below are **read-only inspiration**, not runtime dependencies or promises of API compatibility with future releases. OMP has its own isolated Pi RPC child subprocess backend and its own local conversation recorder. No third-party `pi-subagents` installation or integration is required.
 
 ## [Upstream source](https://github.com/alvinunreal/oh-my-opencode-slim)
