@@ -1,9 +1,9 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { addUsage, emptyUsage, sessionUsage, type ChildUsageLedger } from "./usage.ts";
+import { mergeModelUsage, sessionModelUsage, type ChildUsageLedger, type ModelUsage } from "./usage.ts";
 
 const fmt = (n: number) => n < 1000 ? `${Math.round(n)}` : n < 1_000_000
   ? `${(n / 1000).toFixed(1)}k` : `${(n / 1_000_000).toFixed(1)}M`;
@@ -12,9 +12,9 @@ const clean = (text: string) => stripTerminalSequences(text).replace(/[\r\n\t]/g
 /** Replaces Pi's built-in footer; extension statuses still share the existing status row. */
 export function installUsageFooter(
   ctx: ExtensionContext,
-  pi: ExtensionAPI,
   children: ChildUsageLedger,
-  liveUsage: () => Usage,
+  liveUsage: () => ModelUsage,
+  configuredModels: () => readonly string[] = () => [],
 ): () => void {
   let requestRender: (() => void) | undefined;
   if (!ctx.hasUI || ctx.mode !== "tui" || typeof ctx.ui.setFooter !== "function") return () => {};
@@ -24,7 +24,7 @@ export function installUsageFooter(
     let cachedSession: string | undefined;
     let cachedLeaf: string | null | undefined;
     let cachedModel: ExtensionContext["model"];
-    let main = emptyUsage();
+    let main: ModelUsage = new Map();
     let context: ReturnType<ExtensionContext["getContextUsage"]>;
     return {
       invalidate() {},
@@ -33,31 +33,33 @@ export function installUsageFooter(
         const session = ctx.sessionManager.getSessionId();
         const leaf = ctx.sessionManager.getLeafId();
         if (session !== cachedSession || leaf !== cachedLeaf || ctx.model !== cachedModel) {
-          main = sessionUsage(ctx.sessionManager.getEntries());
+          const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+          main = sessionModelUsage(ctx.sessionManager.getEntries(), fallback);
           context = ctx.getContextUsage();
           cachedSession = session;
           cachedLeaf = leaf;
           cachedModel = ctx.model;
         }
-        const total = addUsage(addUsage(addUsage(emptyUsage(), main), children.total), liveUsage());
-        const stats = [`Σ${fmt(total.totalTokens)}`, `↑${fmt(total.input)}`, `↓${fmt(total.output)}`];
-        if (total.cacheRead) stats.push(`R${fmt(total.cacheRead)}`);
-        if (total.cacheWrite) stats.push(`W${fmt(total.cacheWrite)}`);
-        if (total.cost.total) stats.push(`$${total.cost.total.toFixed(3)}`);
+        const totals = new Map<string, Usage>();
+        mergeModelUsage(totals, main);
+        mergeModelUsage(totals, children.byModel);
+        mergeModelUsage(totals, liveUsage());
+        const total = [...totals.values()].reduce((sum, usage) => sum + usage.totalTokens, 0);
+        const active = ctx.model ? [`${ctx.model.provider}/${ctx.model.id}`] : [];
+        const models = [...new Set([...active, ...configuredModels(),
+          ...[...totals].filter(([, usage]) => usage.totalTokens > 0).map(([model]) => model)])];
+        const ids = models.map((model) => model.slice(model.indexOf("/") + 1));
+        const stats = [`Σ${fmt(total)}`, ...models.map((model, index) => {
+          const label = ids.filter((id) => id === ids[index]).length > 1 ? model : ids[index]!;
+          return `${clean(label)} ${fmt(totals.get(model)?.totalTokens ?? 0)}`;
+        })];
         const window = context?.contextWindow ?? ctx.model?.contextWindow ?? 0;
         const percent = context?.percent == null ? "?" : `${context.percent.toFixed(1)}%`;
         const color = (context?.percent ?? 0) > 90 ? "error" : (context?.percent ?? 0) > 70 ? "warning" : "dim";
-        stats.push(theme.fg(color, `ctx ${percent}/${fmt(window)}`));
-        const left = truncateToWidth(stats.join(" "), width);
-        const model = ctx.model;
-        const thinking = model?.reasoning ? ` • ${pi.getThinkingLevel()}` : "";
-        let right = `${clean(model?.id ?? "no-model")}${thinking}`;
-        if (model && footerData.getAvailableProviderCount() > 1 &&
-          visibleWidth(left) + 2 + visibleWidth(`(${model.provider}) ${right}`) <= width)
-          right = `(${clean(model.provider)}) ${right}`;
-        const available = width - visibleWidth(left) - 2;
-        right = available > 0 ? truncateToWidth(right, available, "") : "";
-        const statsLine = right ? left + " ".repeat(Math.max(2, width - visibleWidth(left) - visibleWidth(right))) + right : left;
+        const right = theme.fg(color, `${percent}/${fmt(window)}`);
+        const available = width - visibleWidth(right) - 3;
+        const left = available > 0 ? truncateToWidth(stats.join(" · "), available) : "";
+        const statsLine = left ? `${left} · ${right}` : truncateToWidth(right, width);
         const cwd = ctx.sessionManager.getCwd();
         const relative = path.relative(os.homedir(), cwd);
         const displayCwd = relative === "" ? "~" : relative !== ".." && !relative.startsWith(`..${path.sep}`) &&

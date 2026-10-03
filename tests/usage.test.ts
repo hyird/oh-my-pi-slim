@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ChildUsageLedger, USAGE_ENTRY, addUsage, emptyUsage, nativeSessionUsage, sessionUsage, usageDelta } from "../extensions/omp/usage.ts";
+import { ChildUsageLedger, USAGE_ENTRY, addUsage, emptyUsage, nativeSessionUsage, sessionUsage, sessionModelUsage, usageDelta } from "../extensions/omp/usage.ts";
 
 const usage = () => addUsage(emptyUsage(), {
   input: 4, output: 5, cacheRead: 1, cacheWrite: 2,
@@ -33,6 +33,41 @@ test("run snapshots replace earlier progress while separate continuations and re
   ledger.record("run-2", usage());
   expect(ledger.total.totalTokens).toBe(36);
   ledger.record("run-1", usage());
+  expect(ledger.total.totalTokens).toBe(24);
+});
+
+test("main usage follows historical model changes and merges input, output and cache tokens per model", () => {
+  const totals = sessionModelUsage([
+    { type: "model_change", provider: "test", modelId: "first" },
+    { type: "message", message: { role: "assistant", provider: "test", model: "first", usage: usage() } },
+    { type: "compaction", usage: usage() },
+    { type: "model_change", provider: "test", modelId: "second" },
+    { type: "message", message: { role: "assistant", provider: "test", model: "second", usage: usage() } },
+    { type: "message", message: { role: "toolResult", usage: usage() } },
+    { type: "usage", provider: "test", model: "first", usage: usage() },
+  ], "test/current");
+  expect(totals.get("test/first")?.totalTokens).toBe(36);
+  expect(totals.get("test/second")?.totalTokens).toBe(24);
+  expect(totals.has("test/current")).toBe(false);
+});
+
+test("child model attribution survives duplicate legacy snapshots and late attribution of old usage entries", () => {
+  const ledger = new ChildUsageLedger();
+  const entries = [
+    { type: "custom", customType: USAGE_ENTRY, data: { runId: "run", usage: usage() } },
+    { type: "custom", customType: "omp-recovery-v1", data: { jobs: [{ id: "job", results: [
+      { runId: "run", model: "test/first", usage: usage() },
+      { runId: "continuation", model: "test/second", usage: usage() },
+    ] }] } },
+    { type: "custom", customType: USAGE_ENTRY, data: { runId: "run", usage: usage() } },
+  ];
+  ledger.restore(entries);
+  expect(ledger.byModel.get("test/first")?.totalTokens).toBe(12);
+  expect(ledger.byModel.get("test/second")?.totalTokens).toBe(12);
+  expect(ledger.byModel.get("other")?.totalTokens ?? 0).toBe(0);
+  ledger.record("run", usage(), undefined, "test/second");
+  expect(ledger.byModel.get("test/first")?.totalTokens).toBe(0);
+  expect(ledger.byModel.get("test/second")?.totalTokens).toBe(24);
   expect(ledger.total.totalTokens).toBe(24);
 });
 

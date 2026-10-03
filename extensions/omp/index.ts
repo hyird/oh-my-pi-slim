@@ -43,7 +43,7 @@ import { availableChildModels } from "./models.ts";
 import { failureDetail } from "./failure-detail.ts";
 import { discoverDcpTools } from "./dcp-tools.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
-import { ChildUsageLedger, USAGE_ENTRY, addUsage, emptyUsage } from "./usage.ts";
+import { ChildUsageLedger, USAGE_ENTRY, addUsage, addModelUsage, emptyUsage } from "./usage.ts";
 import { installUsageFooter } from "./footer.ts";
 
 const COUNCIL_PERSPECTIVES = [
@@ -135,10 +135,11 @@ export default function omp(pi: ExtensionAPI) {
   const childUsage = new ChildUsageLedger();
   let mainStreamingUsage = emptyUsage();
   let requestFooterRender = () => {};
-  const recordUsage = (runId: string | undefined, usage: Result["usage"] | undefined, taskId?: string) => {
-    if (!runId || !usage || !childUsage.record(runId, usage, taskId)) return;
+  let footerModels: string[] = [];
+  const recordUsage = (runId: string | undefined, usage: Result["usage"] | undefined, taskId?: string, model?: string) => {
+    if (!runId || !usage || !childUsage.record(runId, usage, taskId, model)) return;
     if (runtime.ctx?.sessionManager?.getSessionId?.()) {
-      try { pi.appendEntry(USAGE_ENTRY, { runId, taskId, usage: structuredClone(usage) }); }
+      try { pi.appendEntry(USAGE_ENTRY, { runId, taskId, model, usage: structuredClone(usage) }); }
       catch (err) { warn(runtime.ctx, `OMP: could not save token usage: ${failureDetail(err) ?? "unknown error"}`); }
     }
     requestFooterRender();
@@ -199,6 +200,7 @@ export default function omp(pi: ExtensionAPI) {
       config: readConfig(),
       available: ctx.modelRegistry.getAvailable(),
     };
+    if (canCommit()) footerModels = Object.values(snapshot.config.models);
     const available = availableChildModels(ctx, snapshot.available);
     const byName = new Map(available.map((model) => [`${model.provider}/${model.id}`, model]));
     const configured = snapshot.config.models;
@@ -242,6 +244,7 @@ export default function omp(pi: ExtensionAPI) {
       configPath(),
       canCommit,
     );
+    if (canCommit()) { footerModels = Object.values(snapshot.config.models); requestFooterRender(); }
     if (canCommit() && changed.length)
       warn(
         ctx,
@@ -693,7 +696,7 @@ export default function omp(pi: ExtensionAPI) {
           const original = activeIndices[index]!;
           merged[original] = row;
           if (row.taskId) job.saved.items[original]!.taskId = row.taskId;
-          recordUsage(row.runId, row.usage, row.taskId);
+          recordUsage(row.runId, row.usage, row.taskId, row.model);
         });
         job.progress = merged;
         const revision = JSON.stringify(sessions.snapshot());
@@ -707,7 +710,7 @@ export default function omp(pi: ExtensionAPI) {
         if (completed.has(index) || job.session !== runtime.session) return;
         completed.add(index);
         job.saved.results[index] = result;
-        recordUsage(result.runId, result.usage, result.taskId);
+        recordUsage(result.runId, result.usage, result.taskId, result.model);
         checkpoint();
         if (kind === "council") return;
         pendingResults.push({ result, at: performance.now() });
@@ -852,7 +855,7 @@ export default function omp(pi: ExtensionAPI) {
           );
         }
       }
-      await updateConfig((current) => {
+      const config = await updateConfig((current) => {
         const models = { ...current.models };
         if (model) models[name] = model;
         else delete models[name];
@@ -861,6 +864,8 @@ export default function omp(pi: ExtensionAPI) {
         else thinking[name] = thinkingLevel;
         return { ...current, models, thinking };
       });
+      footerModels = Object.values(config.models);
+      requestFooterRender();
       return;
     }
     throw new Error(`Invalid setting ${id}: ${value}`);
@@ -976,17 +981,22 @@ export default function omp(pi: ExtensionAPI) {
     if (session !== runtime.session) return;
     bindContext(ctx);
     childUsage.restore(ctx.sessionManager.getEntries(), retainedTasks);
-    requestFooterRender = installUsageFooter(ctx, pi, childUsage, () => {
-      const live = addUsage(emptyUsage(), mainStreamingUsage);
+    requestFooterRender = installUsageFooter(ctx, childUsage, () => {
+      const live = new Map();
+      if (ctx.model) addModelUsage(live, `${ctx.model.provider}/${ctx.model.id}`, mainStreamingUsage);
       for (const job of runtime.running)
-        for (const row of job.progress) if (row.state === "running") addUsage(live, row.streamingUsage);
+        for (const row of job.progress)
+          if (row.state === "running" && row.model && row.streamingUsage) addModelUsage(live, row.model, row.streamingUsage);
       return live;
-    });
+    }, () => footerModels);
     refreshPinned();
     try {
-      role = readConfig().defaultAgent;
+      const config = readConfig();
+      role = config.defaultAgent;
+      footerModels = Object.values(config.models);
     } catch (err) {
       role = "orchestrator";
+      footerModels = [];
       warn(
         ctx,
         `OMP: failed to read ${configPath()}: ${err instanceof Error ? err.message : String(err)}`,

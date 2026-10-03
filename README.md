@@ -60,7 +60,11 @@ Pi 0.99.2 native MCP is used for Librarian children. Deferred tools connect in t
 
 ## Delegation and conversations
 
-OMP replaces Pi's built-in footer statistics with session-wide totals: main-session calls plus every OMP specialist run and Council review. `Σ` is total tokens, including cache reads and writes; `↑`, `↓`, `R`, `W`, and cost use the same combined scope. `ctx` remains the main session's current context usage. The working directory, model, thinking level, and other extensions' statuses remain visible. There is only one token statistics row.
+OMP replaces Pi's built-in footer statistics with session-wide totals: main-session calls plus every OMP specialist run and Council review. `Σ` is total tokens, including input, output, cache reads and cache writes. Each configured model appears once with its combined token total; unused models show `0`. Historical models with usage remain visible after configuration changes. Provider names appear only when needed to distinguish identical model IDs. The final percentage and context limit describe the main session. The working directory and other extensions' statuses remain visible. There is only one token statistics row, with no input/output split:
+
+```text
+Σ286k · gpt-6.1-sol 120k · gpt-6-astra 86k · gpt-6-luna 80k · 13.9%/272.0k
+```
 
 Completed usage is saved by run ID, including failed requests and cancelled tasks. Reloading, continuing a task, and redelivering results do not count a run twice. Streaming numbers use provider-reported estimates until the final usage arrives. Child native session records also account for tool calls, compaction, and branch summaries. Existing saved terminal results are included when reopening older sessions.
 

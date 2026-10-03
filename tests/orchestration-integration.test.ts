@@ -234,7 +234,8 @@ test("OMP replaces the native footer and retains every delegate, Council and con
   const argv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
   const manager = SessionManager.inMemory(tmp);
-  manager.appendUsage("main", "test", "model", addUsage(emptyUsage(), { input: 7, output: 3 }));
+  manager.appendUsage("main", "openai-codex", "gpt-5.5", addUsage(emptyUsage(), { input: 7, output: 3 }));
+  fs.writeFileSync(configPath(), JSON.stringify({ models: { fixer: "openai-codex/gpt-5.3-codex-spark" } }));
   const makeFooter = (h: ReturnType<typeof harness>) => h.footers.at(-1)(
     { requestRender() {} }, { fg: (_: string, text: string) => text },
     { onBranchChange: () => () => {}, getGitBranch: () => null, getAvailableProviderCount: () => 1,
@@ -246,11 +247,15 @@ test("OMP replaces the native footer and retains every delegate, Council and con
     await h.handlers.session_start({}, h.ctx);
     expect(h.footers).toHaveLength(1);
     const footer = makeFooter(h);
+    expect(footer.render(160)[1]).toContain("gpt-5.5 10");
+    expect(footer.render(160)[1]).toContain("gpt-5.3-codex-spark 0");
     await h.tools.omp_delegate.execute("tokens", { tasks: [
       { agent: "explorer", task: "first" }, { agent: "fixer", task: "second" },
     ] }, undefined, undefined, h.ctx);
     await waitFor(() => h.sentMessages.length === 1);
     expect(footer.render(160)[1]).toContain("Σ30");
+    expect(footer.render(160)[1]).toContain("gpt-5.5 20");
+    expect(footer.render(160)[1]).toContain("gpt-5.3-codex-spark 10");
     await h.tools.omp_council.execute("review-tokens", { question: "review" }, undefined, undefined, h.ctx);
     await waitFor(() => h.sentMessages.length === 2);
     expect(footer.render(160)[1]).toContain("Σ60");
@@ -266,8 +271,10 @@ test("OMP replaces the native footer and retains every delegate, Council and con
     resumed.ctx.getContextUsage = () => undefined;
     await resumed.handlers.session_start({}, resumed.ctx);
     const lines = makeFooter(resumed).render(160);
-    expect(lines.filter((line: string) => line.includes("↑"))).toHaveLength(1);
+    expect(lines.filter((line: string) => line.includes("Σ"))).toHaveLength(1);
     expect(lines[1]).toContain("Σ70");
+    expect(lines[1]).toContain("gpt-5.5 60");
+    expect(lines[1]).not.toMatch(/↑|↓|ctx|CTX/);
     expect(lines[2]).toBe("Quota: 80%");
     expect(resumed.sentMessages).toHaveLength(0);
   } finally { process.argv[1] = argv; }
