@@ -43,6 +43,8 @@ import { availableChildModels } from "./models.ts";
 import { failureDetail } from "./failure-detail.ts";
 import { discoverDcpTools } from "./dcp-tools.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
+import { ChildUsageLedger, USAGE_ENTRY, addUsage, emptyUsage } from "./usage.ts";
+import { installUsageFooter } from "./footer.ts";
 
 const COUNCIL_PERSPECTIVES = [
   "Find failure modes, safety issues, and counterexamples.",
@@ -130,6 +132,17 @@ export default function omp(pi: ExtensionAPI) {
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const sessions = new TaskSessions();
+  const childUsage = new ChildUsageLedger();
+  let mainStreamingUsage = emptyUsage();
+  let requestFooterRender = () => {};
+  const recordUsage = (runId: string | undefined, usage: Result["usage"] | undefined, taskId?: string) => {
+    if (!runId || !usage || !childUsage.record(runId, usage, taskId)) return;
+    if (runtime.ctx?.sessionManager?.getSessionId?.()) {
+      try { pi.appendEntry(USAGE_ENTRY, { runId, taskId, usage: structuredClone(usage) }); }
+      catch (err) { warn(runtime.ctx, `OMP: could not save token usage: ${failureDetail(err) ?? "unknown error"}`); }
+    }
+    requestFooterRender();
+  };
   let suspending = false;
   let savedTaskRevision = "";
   let retainedTasks: SavedTaskSession[] = [];
@@ -256,6 +269,7 @@ export default function omp(pi: ExtensionAPI) {
     }
     runtime.dirtyJobs.clear();
     refreshPinned();
+    requestFooterRender();
   };
   const setPinnedAvailability = (available: boolean) => {
     if (runtime.pinnedUiAvailable === available) return;
@@ -679,6 +693,7 @@ export default function omp(pi: ExtensionAPI) {
           const original = activeIndices[index]!;
           merged[original] = row;
           if (row.taskId) job.saved.items[original]!.taskId = row.taskId;
+          recordUsage(row.runId, row.usage, row.taskId);
         });
         job.progress = merged;
         const revision = JSON.stringify(sessions.snapshot());
@@ -692,6 +707,7 @@ export default function omp(pi: ExtensionAPI) {
         if (completed.has(index) || job.session !== runtime.session) return;
         completed.add(index);
         job.saved.results[index] = result;
+        recordUsage(result.runId, result.usage, result.taskId);
         checkpoint();
         if (kind === "council") return;
         pendingResults.push({ result, at: performance.now() });
@@ -776,6 +792,7 @@ export default function omp(pi: ExtensionAPI) {
     mainGenerationMs = 0;
     mainTokenRate = undefined;
     lastRateStatusAt = 0;
+    mainStreamingUsage = emptyUsage();
   };
   const updateMainThroughput = (
     ctx: ExtensionContext,
@@ -958,6 +975,13 @@ export default function omp(pi: ExtensionAPI) {
     await clearing;
     if (session !== runtime.session) return;
     bindContext(ctx);
+    childUsage.restore(ctx.sessionManager.getEntries(), retainedTasks);
+    requestFooterRender = installUsageFooter(ctx, pi, childUsage, () => {
+      const live = addUsage(emptyUsage(), mainStreamingUsage);
+      for (const job of runtime.running)
+        for (const row of job.progress) if (row.state === "running") addUsage(live, row.streamingUsage);
+      return live;
+    });
     refreshPinned();
     try {
       role = readConfig().defaultAgent;
@@ -1015,6 +1039,7 @@ export default function omp(pi: ExtensionAPI) {
     runtime.pi = undefined;
     runtime.ctx = undefined;
     runtime.requestPinnedRender = undefined;
+    requestFooterRender = () => {};
     for (const job of jobs.values()) job.invalidators.clear();
     runtime.session++;
     cancelRunning();
@@ -1048,13 +1073,17 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("message_start", (event) => {
-    if (event.message.role === "assistant") mainMessageStartedAt = performance.now();
+    if (event.message.role === "assistant") {
+      mainMessageStartedAt = performance.now();
+      mainStreamingUsage = emptyUsage();
+    }
   });
 
   pi.on("message_update", (event, ctx) => {
     const partial =
       "partial" in event.assistantMessageEvent ? event.assistantMessageEvent.partial : undefined;
     const output = partial?.usage?.output;
+    if (partial?.usage) mainStreamingUsage = addUsage(emptyUsage(), partial.usage);
     if (
       mainMessageStartedAt !== undefined &&
       typeof output === "number" &&
@@ -1068,6 +1097,7 @@ export default function omp(pi: ExtensionAPI) {
   pi.on("message_end", (event, ctx) => {
     if (event.message.role === "custom" && event.message.customType === "omp-background-result") checkpoint();
     if (event.message.role !== "assistant") return;
+    mainStreamingUsage = emptyUsage();
     const output = event.message.usage?.output;
     if (
       mainMessageStartedAt !== undefined &&

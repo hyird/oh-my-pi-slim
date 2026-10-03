@@ -95,6 +95,7 @@ function harness() {
     hasUI: true,
     model: { provider: "test", id: "model" },
     modelRegistry: { getAvailable: () => [{ provider: "test", id: "model" }] },
+    sessionManager: { getEntries: () => [], getBranch: () => [] },
     isProjectTrusted: () => false,
     ui: { setStatus: () => {}, notify: () => {}, select: async () => undefined },
   };

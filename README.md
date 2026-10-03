@@ -60,6 +60,10 @@ Pi 0.99.2 native MCP is used for Librarian children. Deferred tools connect in t
 
 ## Delegation and conversations
 
+OMP replaces Pi's built-in footer statistics with session-wide totals: main-session calls plus every OMP specialist run and Council review. `Σ` is total tokens, including cache reads and writes; `↑`, `↓`, `R`, `W`, and cost use the same combined scope. `ctx` remains the main session's current context usage. The working directory, model, thinking level, and other extensions' statuses remain visible. There is only one token statistics row.
+
+Completed usage is saved by run ID, including failed requests and cancelled tasks. Reloading, continuing a task, and redelivering results do not count a run twice. Streaming numbers use provider-reported estimates until the final usage arrives. Child native session records also account for tool calls, compaction, and branch summaries. Existing saved terminal results are included when reopening older sessions.
+
 Running OMP task rows share one animation timer across batches, using the same spinner frames and cadence as Pi's Working indicator. Progress updates are coalesced, and unchanged animation frames reuse the existing widget and detail components. The timer stops when no active batch remains. Each dispatch resolves one configuration/model snapshot; later settings changes apply to later batches.
 
 From the start of delegation, the interactive OMP task overview appears only above Pi's editor, with Pi's normal tool-card background and padding. It has one heading and one row per current task, ordered by dispatch start even when a later dispatch starts running first. Its height follows the total number of fixed tasks; it is never first drawn in the conversation. Click a task row to read its task and assistant replies. After completion, it stays fixed until the next user message; then its original tool card returns to the conversation. Automatic specialist completion messages do not move it.

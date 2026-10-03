@@ -13,6 +13,7 @@ import { RpcWorker } from "./rpc-worker.ts";
 import { TaskSessions, resourceRevision, type TaskSession } from "./task-sessions.ts";
 import { failureDetail } from "./failure-detail.ts";
 import { mergeRoleTools, type DcpToolSnapshot } from "./dcp-tools.ts";
+import { addUsage, emptyUsage, nativeSessionUsage, usageDelta } from "./usage.ts";
 
 export interface Assignment {
   agent: Role;
@@ -65,6 +66,9 @@ export interface AgentProgress {
   lastEventAt?: number;
   /** Current run's reported token usage, including cache tokens. */
   totalTokens?: number;
+  /** Completed usage for this run; persisted separately from the streaming estimate. */
+  usage?: Usage;
+  streamingUsage?: Usage;
   /** Latest estimate reported by this child's configured DCP extension. */
   dcpStatus?: string;
   /** Wall-clock start for live display; elapsedMs freezes the duration once settled. */
@@ -145,15 +149,6 @@ export function editLineCounts(result: unknown): { added: number; removed: numbe
   }
   return { added, removed };
 }
-
-const emptyUsage = (): Usage => ({
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-});
 
 export interface ModelSnapshot {
   config: OmpConfig;
@@ -331,6 +326,25 @@ export async function runAgent(
   const usage = emptyUsage();
   const timings: Timings = { startupMs: 0, generationMs: 0, toolMs: 0, totalMs: 0 };
   let worker: RpcWorker | undefined;
+  let baseline: Usage | undefined;
+  const publishUsage = () => {
+    progress.usage = structuredClone(usage);
+    progress.streamingUsage = undefined;
+    progress.totalTokens = usage.totalTokens;
+    publish();
+  };
+  const reconcileUsage = () => {
+    const native = nativeSessionUsage(worker?.sessionFile);
+    if (!native || !baseline) return;
+    const delta = usageDelta(native, baseline);
+    // Keep reported events when a cancelled/failed process did not flush its last message.
+    for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const)
+      usage[key] = Math.max(usage[key], delta[key]);
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const)
+      usage.cost[key] = Math.max(usage.cost[key], delta.cost[key]);
+    addUsage(usage, undefined);
+    publishUsage();
+  };
   let conversation: ReturnType<typeof startConversation> | undefined;
   let recordingFailed = false;
   let recordingError: string | undefined;
@@ -431,6 +445,7 @@ export async function runAgent(
         throw new Error("Specialist cancelled");
       }
       await worker.ready;
+      baseline = nativeSessionUsage(worker.sessionFile) ?? emptyUsage();
     } finally {
       signal?.removeEventListener("abort", abortStartup);
     }
@@ -493,6 +508,7 @@ export async function runAgent(
         progress.phase = "model";
         progress.retry = undefined;
         progress.totalTokens = usage.totalTokens;
+        progress.streamingUsage = undefined;
         publish();
         return;
       }
@@ -504,6 +520,7 @@ export async function runAgent(
         const partialUsage = event.message?.usage ?? update?.partial?.usage ?? event.usage;
         if (Number.isFinite(partialUsage?.totalTokens) && partialUsage.totalTokens >= 0) {
           progress.totalTokens = usage.totalTokens + partialUsage.totalTokens;
+          progress.streamingUsage = addUsage(emptyUsage(), partialUsage);
           changed = true;
         }
         const partialOutput = event.usage?.output ?? update?.partial?.usage?.output;
@@ -568,6 +585,11 @@ export async function runAgent(
         publish();
         return;
       }
+      if (event.type === "message_end" && event.message?.role === "toolResult" && event.message.usage) {
+        addUsage(usage, event.message.usage);
+        publishUsage();
+        return;
+      }
       if (event.type !== "message_end" || event.message?.role !== "assistant") return;
       const msg = event.message;
       finalStop = msg.stopReason;
@@ -584,10 +606,7 @@ export async function runAgent(
       streamingText = "";
       const u = msg.usage;
       if (u) {
-        for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const)
-          usage[key] += u[key] ?? 0;
-        for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const)
-          usage.cost[key] += u.cost?.[key] ?? 0;
+        addUsage(usage, u);
         if (Number.isFinite(u.output) && u.output > 0 && messageStartedAt !== undefined) {
           completedOutputTokens += u.output;
           timings.generationMs += Math.max(1, performance.now() - messageStartedAt);
@@ -595,9 +614,9 @@ export async function runAgent(
         }
       }
       messageStartedAt = undefined;
-      progress.totalTokens = usage.totalTokens;
-      publish();
+      publishUsage();
     });
+    reconcileUsage();
     if (!output || finalStop !== "stop") {
       throw new Error(failureReason ?? (output ? `Assistant stopped: ${finalStop || "unknown"}` : "Assistant returned no output"));
     }
@@ -616,6 +635,8 @@ export async function runAgent(
     return { agent, model, ok: true, output, usage, taskId, runId, timings, dcpStatus: progress.dcpStatus };
   } catch (err) {
     await worker?.stop();
+    reconcileUsage();
+    publishUsage();
     const cancelled = signal?.aborted;
     const thrownDetail = failureDetail(err);
     const modelDetail = failureDetail(failureReason);
@@ -741,7 +762,8 @@ export async function runAssignments(
             (snapshot) => {
               const important =
                 snapshot.activities !== progress[index].activities ||
-                snapshot.state !== progress[index].state;
+                snapshot.state !== progress[index].state ||
+                snapshot.usage !== progress[index].usage;
               progress[index] = snapshot;
               publish(important);
             },

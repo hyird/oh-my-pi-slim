@@ -41,6 +41,7 @@ import {
 } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
+import { ChildUsageLedger, USAGE_ENTRY, addUsage, emptyUsage } from "../extensions/omp/usage.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
 let tmp: string;
@@ -141,6 +142,7 @@ function harness(recovery?: { id: string; branch?: any[]; manager?: SessionManag
   const sentMessages: Array<{ message: any; options: any }> = [];
   const selected: string[] = [];
   const modelCalls: any[] = [];
+  const footers: any[] = [];
   const branch: any[] = recovery?.branch ?? [
     {
       type: "message",
@@ -160,12 +162,14 @@ function harness(recovery?: { id: string; branch?: any[]; manager?: SessionManag
       },
     },
     sessionManager: recovery?.manager ?? { getBranch: () => branch,
+      getEntries: () => branch,
       ...(recovery ? { getSessionId: () => recovery.id } : {}) },
     isProjectTrusted: () => false,
     ui: {
       notify: (text: string) => notifications.push(text),
       setStatus: () => {},
       setWidget: () => {},
+      setFooter: (factory: any) => footers.push(factory),
       select: async () => undefined,
       input: async () => undefined,
     },
@@ -198,6 +202,7 @@ function harness(recovery?: { id: string; branch?: any[]; manager?: SessionManag
       if (recovery) { branch.push({ type: "custom", customType, data: structuredClone(data) }); return; }
       throw new Error("/omp must not modify session state");
     },
+    getThinkingLevel: () => ctx.thinkingLevel ?? "off",
   };
   omp(pi);
   const h = {
@@ -210,6 +215,7 @@ function harness(recovery?: { id: string; branch?: any[]; manager?: SessionManag
     sentMessages,
     selected,
     modelCalls,
+    footers,
     branch,
   };
   liveHarnesses.push(h);
@@ -223,6 +229,74 @@ async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
   }
   expect(await check()).toBe(true);
 }
+
+test("OMP replaces the native footer and retains every delegate, Council and continuation run across reload", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const manager = SessionManager.inMemory(tmp);
+  manager.appendUsage("main", "test", "model", addUsage(emptyUsage(), { input: 7, output: 3 }));
+  const makeFooter = (h: ReturnType<typeof harness>) => h.footers.at(-1)(
+    { requestRender() {} }, { fg: (_: string, text: string) => text },
+    { onBranchChange: () => () => {}, getGitBranch: () => null, getAvailableProviderCount: () => 1,
+      getExtensionStatuses: () => new Map([["quota", "Quota: 80%"]]) },
+  );
+  try {
+    const h = harness({ id: manager.getSessionId(), manager });
+    h.ctx.getContextUsage = () => undefined;
+    await h.handlers.session_start({}, h.ctx);
+    expect(h.footers).toHaveLength(1);
+    const footer = makeFooter(h);
+    await h.tools.omp_delegate.execute("tokens", { tasks: [
+      { agent: "explorer", task: "first" }, { agent: "fixer", task: "second" },
+    ] }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(footer.render(160)[1]).toContain("Σ30");
+    await h.tools.omp_council.execute("review-tokens", { question: "review" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 2);
+    expect(footer.render(160)[1]).toContain("Σ60");
+    const saved = manager.getEntries().find((entry: any) => entry.customType === "omp-recovery-v1" &&
+      entry.data.jobs?.[0]?.results?.[0]) as any;
+    await h.tools.omp_delegate.execute("continue-tokens", {
+      agent: "explorer", taskId: saved.data.jobs[0].items[0].taskId, task: "continue",
+    }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 3);
+    expect(footer.render(160)[1]).toContain("Σ70");
+    await h.handlers.session_shutdown({}, h.ctx);
+    const resumed = harness({ id: manager.getSessionId(), manager });
+    resumed.ctx.getContextUsage = () => undefined;
+    await resumed.handlers.session_start({}, resumed.ctx);
+    const lines = makeFooter(resumed).render(160);
+    expect(lines.filter((line: string) => line.includes("↑"))).toHaveLength(1);
+    expect(lines[1]).toContain("Σ70");
+    expect(lines[2]).toBe("Quota: 80%");
+    expect(resumed.sentMessages).toHaveLength(0);
+  } finally { process.argv[1] = argv; }
+});
+
+test.each(["retry", "failure", "cancel"])("saved footer totals retain paid child usage after %s", async (kind) => {
+  const argv = process.argv[1];
+  const retry = process.env.OMP_TEST_RETRY;
+  const fail = process.env.OMP_TEST_FAIL;
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  if (kind === "failure") process.env.OMP_TEST_FAIL = "1";
+  else process.env.OMP_TEST_RETRY = "1";
+  try {
+    const h = harness({ id: `usage-${kind}` });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("usage", { agent: "fixer", task: "work" }, undefined, undefined, h.ctx);
+    if (kind === "cancel") {
+      await waitFor(() => h.branch.some((entry) => entry.customType === USAGE_ENTRY && entry.data.usage.totalTokens === 10));
+      await h.handlers.session_shutdown({}, h.ctx);
+    } else await waitFor(() => h.sentMessages.length === 1);
+    const ledger = new ChildUsageLedger();
+    ledger.restore(h.branch);
+    expect(ledger.total.totalTokens).toBe(kind === "retry" ? 20 : 10);
+  } finally {
+    process.argv[1] = argv;
+    if (retry === undefined) delete process.env.OMP_TEST_RETRY; else process.env.OMP_TEST_RETRY = retry;
+    if (fail === undefined) delete process.env.OMP_TEST_FAIL; else process.env.OMP_TEST_FAIL = fail;
+  }
+});
 
 test("restarting OMP restores interrupted children from saved sessions without repeating completed tasks", async () => {
   const argv = process.argv[1];
