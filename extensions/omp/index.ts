@@ -988,7 +988,7 @@ export default function omp(pi: ExtensionAPI) {
         for (const row of job.progress)
           if (row.state === "running" && row.model && row.streamingUsage) addModelUsage(live, row.model, row.streamingUsage);
       return live;
-    }, () => footerModels);
+    }, () => pi.getThinkingLevel(), () => footerModels);
     refreshPinned();
     try {
       const config = readConfig();

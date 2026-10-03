@@ -25,7 +25,9 @@ function footer() {
     getContextUsage: () => { contextCalls++; return { percent: 13.9, tokens: 37_808, contextWindow: 272_000 }; },
     ui: { setFooter: (value: any) => { factory = value; } },
   };
-  const request = installUsageFooter(ctx, children, () => new Map([["test/child-model", live]]), () => configured);
+  let thinking: ReturnType<Parameters<typeof installUsageFooter>[3]> = "high";
+  const request = installUsageFooter(ctx, children, () => new Map([["test/child-model", live]]),
+    () => thinking, () => configured);
   const component = factory({ requestRender: () => { renders++; } }, { fg: (_: string, text: string) => text }, {
     getGitBranch: () => "main", getAvailableProviderCount: () => 2,
     getExtensionStatuses: () => new Map([["quota", "Quota: 80%"], ["omp", "OMP:orchestrator"]]),
@@ -34,6 +36,7 @@ function footer() {
   return { component, manager, ctx, request, branchChanged, children,
     setLive: (value: ReturnType<typeof emptyUsage>) => { live = value; },
     setConfigured: (models: string[]) => { configured = models; },
+    setThinking: (level: typeof thinking) => { thinking = level; },
     contextCalls: () => contextCalls, renders: () => renders, disposed: () => disposed };
 }
 
@@ -43,9 +46,30 @@ test("one statistics row shows configured model totals including unused models, 
   expect(lines).toHaveLength(3);
   expect(lines.filter((line: string) => line.includes("Σ"))).toHaveLength(1);
   expect(lines[0]).toContain("(main)");
+  expect(lines[0]).toEndWith("main-model • high");
   expect(lines[1]).toBe("Σ3.2k · main-model 3.0k · child-model 160 · unused-model 0 · 13.9%/272.0k");
   expect(lines[1]).not.toMatch(/↑|↓|ctx|CTX|\$/);
   expect(lines[2]).toBe("OMP:orchestrator Quota: 80%");
+});
+
+test("current main model and thinking level update without a new session entry", () => {
+  const h = footer();
+  h.component.render(180);
+  h.setThinking("xhigh");
+  expect(h.component.render(180)[0]).toEndWith("main-model • xhigh");
+  expect(h.contextCalls()).toBe(1);
+  h.setThinking("off");
+  expect(h.component.render(180)[0]).toEndWith("main-model • off");
+  h.ctx.model = { ...h.ctx.model, id: "next-model" };
+  expect(h.component.render(180)[0]).toEndWith("next-model • off");
+  expect(h.component.render(180)[1]).toContain("next-model 0");
+  expect(h.component.render(180)[1]).toContain("main-model 3.0k");
+  expect(h.contextCalls()).toBe(2);
+  h.ctx.model = { ...h.ctx.model, reasoning: false };
+  expect(h.component.render(180)[0]).toEndWith("next-model");
+  expect(h.component.render(180)[0]).not.toContain(" • off");
+  h.ctx.model = undefined;
+  expect(h.component.render(180)[0]).toEndWith("no-model");
 });
 
 test("streaming usage replaces its final snapshot, caches scans and redraws without overflowing narrow terminals", () => {
@@ -75,6 +99,7 @@ test("same-model agents merge, provider collisions stay distinct and historical 
   h.children.record("same-main", addUsage(emptyUsage(), { output: 50 }), undefined, "test/main-model");
   h.children.record("another-provider", addUsage(emptyUsage(), { output: 20 }), undefined, "other-provider/main-model");
   h.setConfigured(["test/unused-model"]);
+  expect(h.component.render(180)[0]).toEndWith("test/main-model • high");
   const row = h.component.render(180)[1];
   expect(row).toContain("test/main-model 3.1k");
   expect(row).toContain("other-provider/main-model 20");
@@ -84,5 +109,5 @@ test("same-model agents merge, provider collisions stay distinct and historical 
 });
 
 test("RPC mode keeps its native UI instead of installing a terminal footer", () => {
-  installUsageFooter({ hasUI: true, mode: "rpc", ui: {} } as any, new ChildUsageLedger(), () => new Map());
+  installUsageFooter({ hasUI: true, mode: "rpc", ui: {} } as any, new ChildUsageLedger(), () => new Map(), () => "off");
 });

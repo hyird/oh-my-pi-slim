@@ -244,9 +244,14 @@ test("OMP replaces the native footer and retains every delegate, Council and con
   try {
     const h = harness({ id: manager.getSessionId(), manager });
     h.ctx.getContextUsage = () => undefined;
+    h.ctx.model = { ...h.ctx.model, reasoning: true };
+    h.ctx.thinkingLevel = "high";
     await h.handlers.session_start({}, h.ctx);
     expect(h.footers).toHaveLength(1);
     const footer = makeFooter(h);
+    expect(footer.render(160)[0]).toEndWith("gpt-5.5 • high");
+    h.ctx.thinkingLevel = "xhigh";
+    expect(footer.render(160)[0]).toEndWith("gpt-5.5 • xhigh");
     expect(footer.render(160)[1]).toContain("gpt-5.5 10");
     expect(footer.render(160)[1]).toContain("gpt-5.3-codex-spark 0");
     await h.tools.omp_delegate.execute("tokens", { tasks: [
@@ -269,8 +274,11 @@ test("OMP replaces the native footer and retains every delegate, Council and con
     await h.handlers.session_shutdown({}, h.ctx);
     const resumed = harness({ id: manager.getSessionId(), manager });
     resumed.ctx.getContextUsage = () => undefined;
+    resumed.ctx.model = { ...resumed.ctx.model, reasoning: true };
+    resumed.ctx.thinkingLevel = "xhigh";
     await resumed.handlers.session_start({}, resumed.ctx);
     const lines = makeFooter(resumed).render(160);
+    expect(lines[0]).toEndWith("gpt-5.5 • xhigh");
     expect(lines.filter((line: string) => line.includes("Σ"))).toHaveLength(1);
     expect(lines[1]).toContain("Σ70");
     expect(lines[1]).toContain("gpt-5.5 60");

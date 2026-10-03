@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { mergeModelUsage, sessionModelUsage, type ChildUsageLedger, type ModelUsage } from "./usage.ts";
 
@@ -14,6 +14,7 @@ export function installUsageFooter(
   ctx: ExtensionContext,
   children: ChildUsageLedger,
   liveUsage: () => ModelUsage,
+  getThinkingLevel: ExtensionAPI["getThinkingLevel"],
   configuredModels: () => readonly string[] = () => [],
 ): () => void {
   let requestRender: (() => void) | undefined;
@@ -67,7 +68,15 @@ export function installUsageFooter(
         const branch = footerData.getGitBranch();
         const name = ctx.sessionManager.getSessionName();
         const location = `${clean(displayCwd)}${branch ? ` (${clean(branch)})` : ""}${name ? ` • ${clean(name)}` : ""}`;
-        const lines = [truncateToWidth(theme.fg("dim", location), width), theme.fg("dim", statsLine)];
+        const model = ctx.model;
+        const modelName = model ? clean(ids.filter((id) => id === model.id).length > 1
+          ? `${model.provider}/${model.id}` : model.id) : "no-model";
+        const current = truncateToWidth(`${modelName}${model?.reasoning ? ` • ${getThinkingLevel()}` : ""}`, width);
+        const locationWidth = width - visibleWidth(current) - 2;
+        const locationLeft = locationWidth > 0 ? truncateToWidth(location, locationWidth) : "";
+        const locationLine = `${locationLeft}${" ".repeat(Math.max(0,
+          width - visibleWidth(locationLeft) - visibleWidth(current)))}${current}`;
+        const lines = [theme.fg("dim", locationLine), theme.fg("dim", statsLine)];
         const statuses = [...footerData.getExtensionStatuses()].sort(([a], [b]) => a.localeCompare(b))
           .map(([, text]) => text.replace(/[\r\n\t]/g, " "));
         if (statuses.length) lines.push(truncateToWidth(statuses.join(" "), width));
