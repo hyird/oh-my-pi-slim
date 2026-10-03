@@ -44,6 +44,12 @@ export function getSettingsRows(ctx?: ExtensionCommandContext): SettingItem[] {
       currentValue: config.defaultAgent,
       description: "Default role for the main session; does not change Pi's current model.",
     },
+    {
+      id: "fast",
+      label: "Fast mode",
+      currentValue: config.fast ? "on" : "off",
+      description: "Priority processing for the main session and all OMP agents on supported OpenAI models. May cost more.",
+    },
     ...SETTING_ROLE_ORDER.map((name) => ({
       id: `role:${name}`,
       label: name,
@@ -58,6 +64,7 @@ export function getSettingsRows(ctx?: ExtensionCommandContext): SettingItem[] {
 
 export function getChoices(id: string, ctx: ExtensionCommandContext): string[] {
   if (id === "default") return [...MAIN_AGENT_NAMES];
+  if (id === "fast") return ["off", "on"];
   if (id.startsWith("thinking:")) return [INHERIT_THINKING, ...THINKING_LEVELS];
   const available = availableChildModels(ctx)
     .map((model) => `${model.provider}/${model.id}`)
@@ -122,9 +129,9 @@ async function showTui(ctx: ExtensionCommandContext, actions: SettingsActions): 
           picker.onCancel = onCancel;
           return picker;
         };
-        if (row.id === "default")
+        if (row.id === "default" || row.id === "fast")
           return makePicker(
-            itemsFor("default"),
+            itemsFor(row.id),
             current,
             (value) => close(value),
             () => close(),
@@ -326,8 +333,8 @@ async function showDialogs(ctx: ExtensionCommandContext, actions: SettingsAction
     if (!selected) return;
     const row = rows[choices.indexOf(selected)];
     if (!row) return;
-    if (row.id === "default") {
-      const value = await ctx.ui.select(row.label, getChoices("default", ctx));
+    if (row.id === "default" || row.id === "fast") {
+      const value = await ctx.ui.select(row.label, getChoices(row.id, ctx));
       if (value) await actions.apply(row.id, value, ctx);
       continue;
     }

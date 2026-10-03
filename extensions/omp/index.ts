@@ -45,6 +45,7 @@ import { discoverDcpTools } from "./dcp-tools.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 import { ChildUsageLedger, USAGE_ENTRY, addUsage, addModelUsage, emptyUsage } from "./usage.ts";
 import { installUsageFooter } from "./footer.ts";
+import registerFastMode from "./fast-mode.ts";
 
 const COUNCIL_PERSPECTIVES = [
   "Find failure modes, safety issues, and counterexamples.",
@@ -108,6 +109,7 @@ export default function omp(pi: ExtensionAPI) {
   registerWebSearch(pi);
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
+  registerFastMode(pi);
   let role: MainAgent = "orchestrator";
   let mainMessageStartedAt: number | undefined;
   let mainOutputTokens = 0;
@@ -819,6 +821,10 @@ export default function omp(pi: ExtensionAPI) {
     value: string,
     ctx: ExtensionCommandContext,
   ): Promise<void> {
+    if (id === "fast" && (value === "on" || value === "off")) {
+      await updateConfig((current) => ({ ...current, fast: value === "on" }));
+      return;
+    }
     if (id === "default" && isMainAgent(value)) {
       await updateConfig((current) => ({ ...current, defaultAgent: value }));
       role = value;
@@ -872,7 +878,7 @@ export default function omp(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("omp", {
-    description: "Open default main agent, specialist model, and thinking settings",
+    description: "Open main agent, shared Fast mode, and specialist model/thinking settings",
     handler: async (args, ctx) => {
       if (args.trim()) {
         ctx.ui.notify("Enter /omp without arguments to open settings", "warning");

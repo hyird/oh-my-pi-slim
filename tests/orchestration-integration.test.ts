@@ -463,7 +463,10 @@ describe("config safety", () => {
     expect(readConfig().models.oracle).toBe("openai/gpt-6-astra");
   });
   test("parses defaults and model IDs; rejects invalid roles and models", () => {
-    expect(parseConfig({})).toEqual({ defaultAgent: "orchestrator", models: {}, thinking: {} });
+    expect(parseConfig({})).toEqual({ defaultAgent: "orchestrator", fast: false, models: {}, thinking: {} });
+    expect(parseConfig({ fast: true }).fast).toBe(true);
+    for (const fast of [null, "on", 1, {}, []])
+      expect(() => parseConfig({ fast })).toThrow("fast must be a boolean");
     expect(parseModel("openai-codex/gpt-5.5")).toEqual({ provider: "openai-codex", id: "gpt-5.5" });
     expect(parseModel("--model/evil")).toBeUndefined();
     expect(() => parseConfig({ models: { unknown: "openai-codex/gpt-5.5" } })).toThrow();
@@ -508,6 +511,7 @@ describe("config safety", () => {
     fs.writeFileSync(configPath(), JSON.stringify(legacy));
     expect(readConfig()).toEqual({
       defaultAgent: "orchestrator",
+      fast: false,
       models: legacy.models,
       thinking: legacy.thinking,
     });
@@ -593,6 +597,7 @@ describe("/omp settings entry point", () => {
     const rows = getSettingsRows();
     expect(rows.map((r) => r.id)).toEqual([
       "default",
+      "fast",
       "role:oracle",
       "role:librarian",
       "role:explorer",
@@ -601,15 +606,18 @@ describe("/omp settings entry point", () => {
     ]);
     expect(rows[0].label).toBe("Default main agent");
     expect(rows[0].description).toContain("does not change Pi's current model");
-    expect(rows.slice(1).map((row) => row.label)).toEqual([
+    expect(rows[1].label).toBe("Fast mode");
+    expect(rows[1].currentValue).toBe("off");
+    expect(getChoices("fast", harness().ctx)).toEqual(["off", "on"]);
+    expect(rows.slice(2).map((row) => row.label)).toEqual([
       "oracle",
       "librarian",
       "explorer",
       "designer",
       "fixer",
     ]);
-    expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
-    expect(rows[1].description).toContain("Choose the model, then the thinking level");
+    expect(rows[2].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
+    expect(rows[2].description).toContain("Choose the model, then the thinking level");
     expect(getChoices("default", harness().ctx)).toEqual(["pi", "orchestrator", "council"]);
     expect(getChoices("model:explorer", harness().ctx)[0]).toBe(INHERIT);
     expect(getChoices("thinking:explorer", harness().ctx)).toEqual([
@@ -645,7 +653,7 @@ describe("/omp settings entry point", () => {
     h.ctx.mode = "rpc";
     let calls = 0;
     h.ctx.ui.select = async (_title: string, options: string[]) => {
-      if (++calls === 1) return options[3];
+      if (++calls === 1) return options.find((value) => value.startsWith("explorer  →"));
       if (calls === 2) return "openai-codex/gpt-5.5"; // forged, now disabled
       if (calls === 3) return "high";
       return undefined;
@@ -704,7 +712,7 @@ describe("/omp settings entry point", () => {
     component.handleInput("\x1b[A"); // pi native (only pi/orchestrator are primary)
     component.handleInput("\r");
     await waitFor(() => readConfig().defaultAgent === "pi");
-    for (let i = 0; i < 3; i++) component.handleInput("\x1b[B"); // explorer row
+    for (let i = 0; i < 4; i++) component.handleInput("\x1b[B"); // explorer row
     component.handleInput("\r");
     for (const char of "spark") component.handleInput(char);
     expect(component.render(90).join("\n")).toContain("Search models:");
@@ -776,7 +784,7 @@ describe("/omp settings entry point", () => {
     expect(narrow.join("\n")).toContain("Current: orchestrator");
     expect(narrow.join("\n")).toContain("\x1b[32m");
     expect(narrow.join("\n")).not.toContain("\x1b[31m");
-    for (let i = 0; i < 3; i++) component.handleInput("\x1b[B");
+    for (let i = 0; i < 4; i++) component.handleInput("\x1b[B");
     expect(
       component
         .render(32)
@@ -824,7 +832,7 @@ describe("/omp settings entry point", () => {
     let calls = 0;
     h.ctx.ui.select = async (title: string, options: string[]) => {
       titles.push(title);
-      if (++calls === 1) return options[3]; // explorer role
+      if (++calls === 1) return options.find((value) => value.startsWith("explorer  →"));
       if (calls === 2) return "openai-codex/gpt-5.5";
       if (calls === 3) {
         expect(readConfig().models.explorer).toBeUndefined();
@@ -842,6 +850,56 @@ describe("/omp settings entry point", () => {
     expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.5");
     expect(readConfig().thinking.explorer).toBe("high");
     expect(readConfig()).not.toHaveProperty("serviceTier");
+  });
+  test("RPC saves one Fast mode switch for the main session and children", async () => {
+    const h = harness();
+    h.ctx.mode = "rpc";
+    h.ctx.model = { ...models[0], api: "openai-codex-responses" };
+    const originalModel = h.ctx.model;
+    let calls = 0;
+    h.ctx.ui.select = async (_title: string, options: string[]) => {
+      if (++calls === 1) return options.find((value) => value.startsWith("Fast mode  →"));
+      if (calls === 2) return "on";
+      return undefined;
+    };
+    await h.commands.omp.handler("", h.ctx);
+    expect(readConfig().fast).toBe(true);
+    expect(h.handlers.before_provider_request({ payload: { model: "gpt-5.5" } }, h.ctx))
+      .toEqual({ model: "gpt-5.5", service_tier: "priority" });
+    expect(h.ctx.model).toBe(originalModel);
+    expect(h.selected).toEqual([]);
+    expect(readConfig()).not.toHaveProperty("serviceTier");
+    calls = 0;
+    h.ctx.ui.select = async (_title: string, options: string[]) => {
+      if (++calls === 1) return options.find((value) => value.startsWith("Fast mode  →"));
+      if (calls === 2) return "off";
+      return undefined;
+    };
+    await h.commands.omp.handler("", h.ctx);
+    expect(readConfig().fast).toBe(false);
+    expect(h.handlers.before_provider_request({ payload: {} }, h.ctx)).toBeUndefined();
+  });
+  test("TUI saves the shared Fast mode switch without opening role model pickers", async () => {
+    const h = harness();
+    let component: any;
+    h.ctx.ui.custom = (factory: any) => new Promise<void>((done) => {
+      component = factory(
+        { requestRender: () => {} },
+        { fg: (_: string, text: string) => text, bold: (text: string) => text },
+        {}, done,
+      );
+    });
+    const finished = h.commands.omp.handler("", h.ctx);
+    await waitFor(() => Boolean(component));
+    component.handleInput("\x1b[B");
+    component.handleInput("\r");
+    expect(component.render(90).join("\n")).not.toContain("Search models:");
+    component.handleInput("\x1b[B");
+    component.handleInput("\r");
+    await waitFor(() => readConfig().fast);
+    expect(getSettingsRows()[1].currentValue).toBe("on");
+    component.handleInput("\x1b");
+    await finished;
   });
   test("pi main agent cannot launch OMP children even through a stale tool call", async () => {
     await updateConfig((config) => ({ ...config, defaultAgent: "pi" }));
@@ -939,6 +997,7 @@ test("isolated child uses the configured specialist model and tool allowlist (of
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
     expect(recorded.args).not.toContain("--no-extensions");
     expect(recorded.args).not.toContain("--mcp-config"); // adapter is optional for non-Librarians
+    expect(recorded.args).toContain(path.resolve(import.meta.dir, "../extensions/omp/fast-mode.ts"));
     expect(recorded.childGuard).toBe("1");
     expect(recorded.args).toContain("--no-approve");
     expect(recorded.args[recorded.args.indexOf("--tools") + 1]).toBe("read,grep,find,ls,websearch");

@@ -108,6 +108,7 @@ const SIMPLIFY_SKILL_PATH = fileURLToPath(
   new URL("../../skills/simplify/SKILL.md", import.meta.url),
 );
 const CHILD_MCP_EXTENSION_PATH = fileURLToPath(new URL("./child-mcp.ts", import.meta.url));
+const FAST_MODE_EXTENSION_PATH = fileURLToPath(new URL("./fast-mode.ts", import.meta.url));
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
   return items.map(({ agent, task, taskId }) =>
@@ -408,6 +409,8 @@ export async function runAgent(
           tools.join(","),
           "--extension",
           CHILD_MCP_EXTENSION_PATH,
+          "--extension",
+          FAST_MODE_EXTENSION_PATH,
           ...dcpSnapshot.providers.flatMap((provider) => ["--extension", provider.path]),
           "--append-system-prompt",
           promptPath,

@@ -26,11 +26,14 @@ On a new install without `omp.json`, OMP uses these specialist defaults through 
 
 The default main role is Orchestrator. For an Orchestrator default of `openai/gpt-6.1-sol` with `high` thinking, set Pi's native `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` settings. Orchestrator keeps Pi's available skills and OMP permits verified MCP servers except `context7`. Existing `omp.json` files retain their saved role choices; an explicit empty `models` or `thinking` object means those roles inherit the Pi session. If a factory model is not enabled or available, OMP's normal model reconciliation selects an enabled fallback and warns.
 
+The **Fast mode** row in `/omp` is one shared on/off switch for the main session, specialists, and Council reviewers. It defaults to off. On supported OpenAI Responses, Chat Completions, and Codex requests, enabling it sets `service_tier: "priority"` ([OpenAI Fast mode](https://developers.openai.com/api/docs/guides/fast-mode)). Model and thinking choices stay the same. Other providers keep their normal request behavior. Every request reads the shared switch, including retries and requests from reused children; changes apply to the next request without restarting workers. Availability depends on the selected model and account, and Fast mode may cost more.
+
 Settings live in `getAgentDir()/omp.json` (normally `~/.pi/agent/omp.json`, or under `PI_CODING_AGENT_DIR`). They do not change Pi authentication or the main model. For example:
 
 ```json
 {
   "defaultAgent": "orchestrator",
+  "fast": false,
   "models": {
     "explorer": "openai-codex/gpt-5.3-codex-spark",
     "oracle": "openai-codex/gpt-5.5"
