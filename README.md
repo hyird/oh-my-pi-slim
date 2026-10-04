@@ -45,7 +45,7 @@ Settings live in `getAgentDir()/omp.json` (normally `~/.pi/agent/omp.json`, or u
 
 If a previously saved specialist model is later disabled, OMP switches it to the current Pi model when that model is enabled, otherwise to the first available enabled model, and shows a notification. This happens when a session starts, `/omp` opens, or delegation runs. If no enabled model is available, `/omp` marks the role and delegation stops before child work.
 
-The **Fast mode** row in `/omp` is one shared switch for the main session, specialists, and Council reviewers, defaulting to off. For supported OpenAI Responses, Chat Completions and Codex requests it sets `service_tier: "priority"`; other providers are unchanged. Every request reads the switch, including retries and reused children. Availability depends on the model/account and may cost more. Model and thinking choices remain unchanged. Legacy `serviceTier` fields are ignored and omitted the next time settings change.
+The **Fast mode** row in `/omp` is one shared switch across providers for the main session, specialists, and Council reviewers, defaulting to off. Every request reads it, including retries and reused children. Supported providers use their own Fast/priority parameters, not a universal OpenAI field. Availability depends on the model, endpoint and account; premium modes may cost more. Model, thinking and token-limit choices remain unchanged. Legacy `serviceTier` fields are ignored and omitted the next time settings change. See [Fast provider capabilities](docs/fast-mode.md) for automatic support and explicit capability declarations for custom or restricted endpoints.
 
 ## Web search (Exa)
 

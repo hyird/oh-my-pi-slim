@@ -48,7 +48,7 @@ export function getSettingsRows(ctx?: ExtensionCommandContext): SettingItem[] {
       id: "fast",
       label: "Fast mode",
       currentValue: config.fast ? "on" : "off",
-      description: "Priority processing for the main session and all OMP agents on supported OpenAI models. May cost more.",
+      description: "Fast or priority processing across supported providers for the main session and all OMP agents. May cost more.",
     },
     ...SETTING_ROLE_ORDER.map((name) => ({
       id: `role:${name}`,
