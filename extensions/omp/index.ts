@@ -42,8 +42,7 @@ import { availableChildModels } from "./models.ts";
 import { failureDetail } from "./failure-detail.ts";
 import { discoverDcpTools } from "./dcp-tools.ts";
 import { ChildUsageLedger, USAGE_ENTRY, addUsage, addModelUsage, emptyUsage } from "./usage.ts";
-import { installUsageFooter } from "./footer.ts";
-import registerFastMode from "./fast-mode.ts";
+import { installUsageFooter, OMP_STATUS_KEY } from "./footer.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 
 const COUNCIL_PERSPECTIVES = [
@@ -107,7 +106,6 @@ export default function omp(pi: ExtensionAPI) {
   registerWebSearch(pi);
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
-  registerFastMode(pi);
   let role: MainAgent = "orchestrator";
   let mainMessageStartedAt: number | undefined;
   let mainOutputTokens = 0;
@@ -145,6 +143,7 @@ export default function omp(pi: ExtensionAPI) {
     requestFooterRender();
   };
   const restoreUsageFooter = (ctx: ExtensionContext) => {
+    try { ctx.ui.setStatus("omp", undefined); } catch { /* Stale UI. */ }
     childUsage.restore(ctx.sessionManager.getEntries());
     requestFooterRender = installUsageFooter(ctx, childUsage, () => {
       const live = new Map();
@@ -786,7 +785,7 @@ export default function omp(pi: ExtensionAPI) {
   function status(ctx?: ExtensionContext) {
     try {
       ctx?.ui.setStatus(
-        "omp",
+        OMP_STATUS_KEY,
         `OMP:${role}${mainTokenRate !== undefined ? ` · ${formatTokenRate(mainTokenRate)}` : ""}`,
       );
     } catch {
@@ -824,10 +823,6 @@ export default function omp(pi: ExtensionAPI) {
     value: string,
     ctx: ExtensionCommandContext,
   ): Promise<void> {
-    if (id === "fast" && (value === "on" || value === "off")) {
-      await updateConfig((current) => ({ ...current, fast: value === "on" }));
-      return;
-    }
     if (id === "default" && isMainAgent(value)) {
       await updateConfig((current) => ({ ...current, defaultAgent: value }));
       role = value;
@@ -881,7 +876,7 @@ export default function omp(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("omp", {
-    description: "Open main agent, shared Fast mode, and specialist model/thinking settings",
+    description: "Open main agent and specialist model/thinking settings",
     handler: async (args, ctx) => {
       if (args.trim()) {
         ctx.ui.notify("Enter /omp without arguments to open settings", "warning");
@@ -1015,7 +1010,7 @@ export default function omp(pi: ExtensionAPI) {
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
     try { oldCtx?.ui.setWidget?.("omp-active", undefined); } catch { /* Stale UI. */ }
-    try { oldCtx?.ui.setStatus("omp", undefined); } catch { /* Stale UI. */ }
+    try { oldCtx?.ui.setStatus(OMP_STATUS_KEY, undefined); } catch { /* Stale UI. */ }
     return sessions.clear({ discard: true });
   };
 

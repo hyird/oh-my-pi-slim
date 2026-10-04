@@ -5,6 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { mergeModelUsage, sessionModelUsage, type ChildUsageLedger, type ModelUsage } from "./usage.ts";
 
+export const OMP_STATUS_KEY = "1:omp";
+
 const fmt = (n: number) => n < 1000 ? `${Math.round(n)}` : n < 1_000_000
   ? `${(n / 1000).toFixed(1)}k` : `${(n / 1_000_000).toFixed(1)}M`;
 const clean = (text: string) => stripTerminalSequences(text).replace(/[\r\n\t]/g, " ");

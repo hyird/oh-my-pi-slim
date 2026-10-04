@@ -388,10 +388,7 @@ test.each([
   }
 }, 10_000);
 
-test.each([
-  ["dist/cli.js", false], ["dist/cli.js", true],
-  ["dist/bundle/cli.js", false], ["dist/bundle/cli.js", true],
-] as const)("real Pi RPC (%s, Fast mode %s) shares the switch across main, reused children, retries, and cold restores", async (cliPath, fast) => {
+test.each(["dist/cli.js", "dist/bundle/cli.js"] as const)("real Pi RPC (%s) preserves provider defaults across main, reused children, retries, and cold restores", async (cliPath) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-native-rpc-"));
   const savedDir = process.env.PI_CODING_AGENT_DIR;
   const argv = process.argv[1];
@@ -481,7 +478,8 @@ test.each([
       }),
     );
     fs.writeFileSync(path.join(root, "omp.json"), JSON.stringify({
-      fast,
+      fast: true,
+      fastProviders: { openai: "openai-priority" },
       serviceTier: { explorer: "priority" },
     }));
     const ctx: any = { cwd: root, isProjectTrusted: () => false };
@@ -526,12 +524,9 @@ test.each([
       false,
     );
     expect(requests[0].tools.some((tool: any) => tool.function.name === "websearch")).toBe(true);
-    for (const request of requests) {
-      if (fast) expect(request.service_tier).toBe("priority");
-      else expect(request).not.toHaveProperty("service_tier");
-    }
-    await updateConfig((config) => ({ ...config, fast: !fast }));
-    const reused = await run("continue with the new shared Fast mode setting", first.taskId);
+    for (const request of requests) expect(request).not.toHaveProperty("service_tier");
+    await updateConfig((config) => ({ ...config, thinking: { explorer: "off" } }));
+    const reused = await run("continue after changing specialist settings", first.taskId);
     expect(reused.ok).toBe(true);
     expect(JSON.stringify(requests[3].messages)).toContain("continue the first objective");
     await run("independent objective"); // evict the first idle process
@@ -560,10 +555,7 @@ test.each([
     expect(recovered.ok).toBe(true);
     expect(requests).toHaveLength(9);
     expect(JSON.stringify(requests[8].messages)).toContain("retry during outage");
-    for (const request of requests.slice(3)) {
-      if (!fast) expect(request.service_tier).toBe("priority");
-      else expect(request).not.toHaveProperty("service_tier");
-    }
+    for (const request of requests.slice(3)) expect(request).not.toHaveProperty("service_tier");
 
     const settingsManager = SettingsManager.inMemory({
       defaultProvider: "openai", defaultModel: "mock", compaction: { enabled: false },
@@ -580,13 +572,11 @@ test.each([
     }));
     const extensionErrors: unknown[] = [];
     await mainSession.bindExtensions({ onError: (error) => { extensionErrors.push(error); } });
-    await mainSession.prompt("Main session with the shared Fast mode setting");
-    if (!fast) expect(requests[9].service_tier).toBe("priority");
-    else expect(requests[9]).not.toHaveProperty("service_tier");
-    await updateConfig((config) => ({ ...config, fast }));
-    await mainSession.prompt("Main session after changing the shared Fast mode setting");
-    if (fast) expect(requests[10].service_tier).toBe("priority");
-    else expect(requests[10]).not.toHaveProperty("service_tier");
+    await mainSession.prompt("Main session with provider defaults");
+    expect(requests[9]).not.toHaveProperty("service_tier");
+    await updateConfig((config) => ({ ...config, defaultAgent: "council" }));
+    await mainSession.prompt("Main session after changing the default role");
+    expect(requests[10]).not.toHaveProperty("service_tier");
     expect(extensionErrors).toEqual([]);
   } finally {
     await mainSession?.abort();

@@ -8,17 +8,8 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const isThinkingLevel = (value: string): value is ThinkingLevel =>
   (THINKING_LEVELS as readonly string[]).includes(value);
 
-export const FAST_PROVIDER_MODES = [
-  "openai-priority", "anthropic-fast", "groq-auto", "groq-performance",
-  "cerebras-auto", "bedrock-priority", "off",
-] as const;
-export type FastProviderMode = (typeof FAST_PROVIDER_MODES)[number];
-
 export interface OmpConfig {
   defaultAgent: MainAgent;
-  fast: boolean;
-  /** Capability declarations for provider IDs or exact provider/model IDs, not extra switches. */
-  fastProviders?: Record<string, FastProviderMode>;
   models: Partial<Record<Role, string>>;
   thinking: Partial<Record<Role, ThinkingLevel>>;
 }
@@ -26,7 +17,6 @@ export interface OmpConfig {
 /** Factory settings for a new OMP install. Saved per-role choices override these. */
 export const DEFAULT_CONFIG: OmpConfig = {
   defaultAgent: "orchestrator",
-  fast: false,
   models: {
     oracle: "openai/gpt-6-astra",
     librarian: "openai/gpt-6-luna",
@@ -60,21 +50,6 @@ export function parseConfig(raw: unknown): OmpConfig {
   if (typeof requestedDefault !== "string") throw new Error("Invalid defaultAgent");
   if (!isMainAgent(requestedDefault)) throw new Error("defaultAgent must be a main agent");
   const defaultAgent: MainAgent = requestedDefault;
-  const fast = value.fast === undefined ? false : value.fast;
-  if (typeof fast !== "boolean") throw new Error("fast must be a boolean");
-  let fastProviders: OmpConfig["fastProviders"];
-  if (value.fastProviders !== undefined) {
-    if (!value.fastProviders || typeof value.fastProviders !== "object" || Array.isArray(value.fastProviders))
-      throw new Error("fastProviders must be an object");
-    const entries = Object.entries(value.fastProviders);
-    for (const [key, mode] of entries) {
-      if ((!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(key) && !parseModel(key)) ||
-        typeof mode !== "string" || !(FAST_PROVIDER_MODES as readonly string[]).includes(mode)) {
-        throw new Error(`Invalid fastProviders.${key}: expected ${FAST_PROVIDER_MODES.join("/")}`);
-      }
-    }
-    fastProviders = Object.fromEntries(entries) as Record<string, FastProviderMode>;
-  }
   const models = value.models ?? {};
   if (!models || typeof models !== "object" || Array.isArray(models))
     throw new Error("models must be an object");
@@ -109,8 +84,6 @@ export function parseConfig(raw: unknown): OmpConfig {
   }
   return {
     defaultAgent,
-    fast,
-    ...(fastProviders === undefined ? {} : { fastProviders }),
     models: validated,
     thinking: validatedThinking,
   };
@@ -120,7 +93,6 @@ export function readConfig(file = configPath()): OmpConfig {
   if (!fs.existsSync(file))
     return {
       defaultAgent: DEFAULT_CONFIG.defaultAgent,
-      fast: DEFAULT_CONFIG.fast,
       models: { ...DEFAULT_CONFIG.models },
       thinking: { ...DEFAULT_CONFIG.thinking },
     };

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { installUsageFooter } from "../extensions/omp/footer.ts";
+import { installUsageFooter, OMP_STATUS_KEY } from "../extensions/omp/footer.ts";
 import { ChildUsageLedger, addUsage, emptyUsage } from "../extensions/omp/usage.ts";
 
 function footer() {
@@ -30,7 +30,7 @@ function footer() {
     () => thinking, () => configured);
   const component = factory({ requestRender: () => { renders++; } }, { fg: (_: string, text: string) => text }, {
     getGitBranch: () => "main", getAvailableProviderCount: () => 2,
-    getExtensionStatuses: () => new Map([["quota", "Quota: 80%"], ["omp", "OMP:orchestrator"]]),
+    getExtensionStatuses: () => new Map([["quota", "Quota: 80%"], [OMP_STATUS_KEY, "OMP:orchestrator"]]),
     onBranchChange: (callback: () => void) => { branchChanged = callback; return () => { disposed++; }; },
   });
   return { component, manager, ctx, request, branchChanged, children,
