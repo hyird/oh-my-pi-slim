@@ -106,6 +106,22 @@ test("child JSON events and completion remain in one private recording", async (
   }
 });
 
+test("discard requires a closed recording, clears its cache and is idempotent", () => {
+  const recording = startConversation("fixer", "temporary task", "test/model");
+  try {
+    expect(() => recording.discard()).toThrow("active specialist recording");
+    recording.record(message("temporary reply"));
+    recording.finish("done");
+    expect(getConversation(recording.id)?.meta.state).toBe("done");
+    recording.discard();
+    expect(fs.existsSync(fileFor(recording.id))).toBe(false);
+    expect(getConversation(recording.id)).toBeUndefined();
+    expect(() => recording.discard()).not.toThrow();
+  } finally {
+    recording.finish("cancelled");
+  }
+});
+
 test("cache invalidates after append and completion without exposing caller mutations", () => {
   const run = startConversation("explorer", "live", "test/model");
   const originalRead = fs.readFileSync;

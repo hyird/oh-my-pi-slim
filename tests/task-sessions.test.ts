@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runAgent, taskScope, type AgentProgress } from "../extensions/omp/subagents.ts";
+import { formatResults, runAgent, taskScope, type AgentProgress } from "../extensions/omp/subagents.ts";
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
 import { RpcWorker } from "../extensions/omp/rpc-worker.ts";
 
@@ -18,6 +18,7 @@ const keys = [
   "OMP_TEST_DUPLICATE",
   "OMP_TEST_FAIL",
   "OMP_TEST_LENGTH",
+  "OMP_TEST_OUTPUT",
 ] as const;
 let saved: Array<string | undefined>;
 let argv: string;
@@ -156,14 +157,86 @@ test("message_end and retries do not complete a task before settlement", async (
 
 test("a final output-limit stop is not reported as completed work", async () => {
   process.env.OMP_TEST_LENGTH = "1";
+  process.env.OMP_TEST_OUTPUT = "partial draft ".repeat(2000);
   const limited = await run("large task");
   expect(limited.ok).toBe(false);
   expect(limited.output).toContain("output limit");
+  expect(limited.outputTruncated).toBeUndefined();
+  expect(formatResults([limited])).toStartWith("FAILED fixer");
   expect(limited.taskId).toBeTruthy();
   delete process.env.OMP_TEST_LENGTH;
+  delete process.env.OMP_TEST_OUTPUT;
   const continued = await run("inspect partial work and finish", limited.taskId);
   expect(continued.ok).toBe(true);
   expect(capture().count).toBe(2);
+});
+
+test.each([
+  { name: "empty", reply: "" },
+  { name: "ASCII whitespace", reply: " \t\r\n" },
+  { name: "ideographic space", reply: "\u3000" },
+  { name: "oversized whitespace", reply: " ".repeat(20_001) },
+])("empty or whitespace-only replies are not successful work: $name", async ({ reply }) => {
+  process.env.OMP_TEST_OUTPUT = reply;
+  const snapshots: AgentProgress[] = [];
+  const result = await run("report findings", undefined, undefined, (row) => snapshots.push(row));
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain("Assistant returned no output");
+  expect(snapshots.some((row) => row.state === "done")).toBe(false);
+  expect(capture().count).toBe(1);
+  expect(() => process.kill(capture().pid, 0)).toThrow();
+  delete process.env.OMP_TEST_OUTPUT;
+  const continued = await run("inspect partial work and provide evidence", result.taskId);
+  expect(continued.ok).toBe(true);
+  expect(continued.taskId).toBe(result.taskId);
+  expect(capture().count).toBe(2);
+});
+
+test("locally shortened reports preserve final caveats and warn that evidence is incomplete", async () => {
+  const ending = "Final verification: tests failed. Acceptance criteria are NOT satisfied.";
+  const fullReport = `Changed paths: src/example.ts\n${"detail ".repeat(4000)}\n${ending}`;
+  process.env.OMP_TEST_OUTPUT = fullReport;
+  const result = await run("report implementation and verification");
+  expect(result.ok).toBe(true); // the model finished normally; acceptance remains the parent's decision
+  expect(result.output).toContain("Changed paths: src/example.ts");
+  expect(result.output).toContain(ending);
+  expect(result.output.length).toBeLessThanOrEqual(20_000);
+  expect(result.outputTruncated).toBe(true);
+  expect(result.output).toContain("output truncated");
+  expect(formatResults([result])).toContain("not complete acceptance evidence");
+  const logDir = path.join(root, "omp/conversations");
+  const events = fs.readFileSync(path.join(logDir, fs.readdirSync(logDir)[0]!), "utf8")
+    .trim().split("\n").map((line) => JSON.parse(line));
+  expect(JSON.stringify(events)).toContain(JSON.stringify(fullReport).slice(1, -1));
+  expect(capture().count).toBe(1); // shortening must not start a summarizer or replay the task
+});
+
+test("report shortening preserves Unicode at both retained boundaries", async () => {
+  process.env.OMP_TEST_OUTPUT = "😀".repeat(15_000);
+  const result = await run("report Unicode content");
+  expect(result.ok).toBe(true);
+  expect(result.output.length).toBeLessThanOrEqual(20_000);
+  expect(result.output.startsWith("😀")).toBe(true);
+  expect(result.output.endsWith("😀")).toBe(true);
+  expect(result.output).not.toMatch(/\p{Surrogate}/u);
+});
+
+test.each([19_999, 20_000])("reports of %i code units remain intact at the cap", async (length) => {
+  process.env.OMP_TEST_OUTPUT = "行".repeat(length);
+  const result = await run("report at the boundary");
+  expect(result.ok).toBe(true);
+  expect(result.output).toBe(process.env.OMP_TEST_OUTPUT);
+  expect(result.outputTruncated).toBeUndefined();
+  expect(formatResults([result])).not.toContain("output truncated");
+});
+
+test("complete short reports and explicit blockers are preserved without keyword success guessing", async () => {
+  process.env.OMP_TEST_OUTPUT = "I cannot complete this lane: the required API specification is missing.";
+  const result = await run("inspect the available specification");
+  expect(result.ok).toBe(true);
+  expect(result.output).toBe(process.env.OMP_TEST_OUTPUT);
+  expect(formatResults([result])).not.toContain("output truncated");
+  expect(capture().count).toBe(1);
 });
 
 test("idle eviction restores native session context without replaying the original task", async () => {
@@ -356,6 +429,42 @@ test("shutdown covers in-flight launches and repeated cleanup calls", async () =
   expect((await pending).ok).toBe(false);
   const next = await run("[delay=0] fresh after reload");
   expect(next.ok).toBe(true);
+});
+
+test("discarding a registry removes only its own files after all workers have closed", async () => {
+  const other = new TaskSessions();
+  try {
+    const unrelated = await runAgent(ctx, { agent: "fixer", task: "other parent" },
+      undefined, { model: "test/model" }, undefined, other);
+    const unrelatedPid = capture().pid;
+    const own = await run("this parent");
+    const ownPid = capture().pid;
+    await run("this parent continuation", own.taskId);
+    const sessionRoot = path.join(root, "omp/sessions");
+    const logRoot = path.join(root, "omp/conversations");
+    expect(fs.readdirSync(logRoot)).toHaveLength(3);
+    await Promise.all([sessions.clear({ discard: true }), sessions.clear({ discard: true })]);
+    expect(() => process.kill(ownPid, 0)).toThrow();
+    expect(() => process.kill(unrelatedPid, 0)).not.toThrow();
+    expect(fs.readdirSync(sessionRoot)).toEqual([unrelated.taskId!]);
+    expect(fs.readdirSync(logRoot)).toHaveLength(1);
+    expect(() => sessions.validate([{ agent: "fixer", task: "resume", taskId: own.taskId }],
+      taskScope(ctx))).toThrow("Unknown taskId");
+  } finally {
+    await other.clear({ discard: true });
+  }
+});
+
+test("discard waits for a launching task and does not remove files of the next generation", async () => {
+  const pending = run("[delay=5000] old launch");
+  const clearing = sessions.clear({ discard: true });
+  const next = run("[delay=300] new generation");
+  await clearing;
+  expect((await pending).ok).toBe(false);
+  const result = await next;
+  expect(result.ok).toBe(true);
+  expect(fs.readdirSync(path.join(root, "omp/sessions"))).toEqual([result.taskId!]);
+  expect(fs.readdirSync(path.join(root, "omp/conversations"))).toHaveLength(1);
 });
 
 test("graceful shutdown consumes the abort acknowledgement and lets the child flush before exit", async () => {

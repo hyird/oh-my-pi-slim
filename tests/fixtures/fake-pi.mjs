@@ -32,7 +32,7 @@ const capture = () => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const finish = (fail) => ({
   role: "assistant",
-  content: [{ type: "text", text: fail ? "failed provider draft" : "Specialist read the task" }],
+  content: [{ type: "text", text: fail ? "failed provider draft" : process.env.OMP_TEST_OUTPUT ?? "Specialist read the task" }],
   stopReason: fail ? "error" : process.env.OMP_TEST_LENGTH ? "length" : "stop",
   errorMessage: fail ? "simulated secret failure" : undefined,
   usage: {

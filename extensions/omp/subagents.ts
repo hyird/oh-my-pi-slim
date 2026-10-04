@@ -33,6 +33,8 @@ export interface Result {
   model: string;
   ok: boolean;
   output: string;
+  /** The model settled normally, but the report sent to the parent omits content. */
+  outputTruncated?: boolean;
   usage: Usage;
   cancelled?: boolean;
   taskId?: string;
@@ -96,6 +98,21 @@ export interface OmpDetails {
   animationFrame?: number;
 }
 const MAX_OUTPUT = 20_000;
+
+function boundedReport(text: string): string {
+  if (text.length <= MAX_OUTPUT) return text;
+  // Keep final caveats/check outcomes as well as the initial findings. Neither
+  // slice is a substitute for the full recording or acceptance verification.
+  const marker = "\n[output truncated] OMP omitted the middle of this report.\n";
+  const available = MAX_OUTPUT - marker.length;
+  let head = Math.floor(available / 2);
+  let tail = text.length - (available - head);
+  // Avoid introducing unpaired UTF-16 surrogates at either cut.
+  if (text.charCodeAt(head - 1) >= 0xd800 && text.charCodeAt(head - 1) <= 0xdbff) head--;
+  if (text.charCodeAt(tail) >= 0xdc00 && text.charCodeAt(tail) <= 0xdfff) tail++;
+  return text.slice(0, head) + marker + text.slice(tail);
+}
+
 const SIMPLIFY_SKILL_PATH = fileURLToPath(
   new URL("../../skills/simplify/SKILL.md", import.meta.url),
 );
@@ -329,6 +346,7 @@ export async function runAgent(
   let recordingFailed = false;
   let recordingError: string | undefined;
   let output = "";
+  let outputTruncated = false;
   let finalStop = "";
   let retryFailed = false;
   let failureReason: string | undefined;
@@ -348,6 +366,7 @@ export async function runAgent(
       recordingError ??= failureDetail(err);
       void worker?.stop();
     });
+    lease.discardRecordings.add(conversation.discard);
     progress.conversationId = conversation.id;
     publish();
     worker = await ownedSessions.worker(lease, async (sessionDir, sessionFile) => {
@@ -466,6 +485,7 @@ export async function runAgent(
         messageStartedAt = performance.now();
         failureReason = undefined;
         output = "";
+        outputTruncated = false;
         finalStop = "";
         progress.phase = "model";
         progress.retry = undefined;
@@ -555,7 +575,9 @@ export async function runAgent(
           ?.filter((part: { type: string }) => part.type === "text")
           .map((part: { text: string }) => part.text)
           .join("\n") ?? "";
-      output = text.length > MAX_OUTPUT ? `${text.slice(0, MAX_OUTPUT)}\n[output truncated]` : text;
+      const hasText = !!text.trim();
+      outputTruncated = hasText && text.length > MAX_OUTPUT;
+      output = hasText ? boundedReport(text) : "";
       progress.text =
         msg.stopReason === "error" || msg.stopReason === "aborted" ? "" : text.slice(-2000);
       streamingText = "";
@@ -590,7 +612,7 @@ export async function runAgent(
     progress.state = "done";
     progress.elapsedMs = timings.totalMs;
     report("Work completed");
-    return { agent, model, ok: true, output, usage, taskId, runId, timings };
+    return { agent, model, ok: true, output, ...(outputTruncated ? { outputTruncated: true } : {}), usage, taskId, runId, timings };
   } catch (err) {
     await worker?.stop();
     const cancelled = signal?.aborted;
@@ -778,7 +800,7 @@ export function formatResults(results: Result[]): string {
   return results
     .map(
       (result) =>
-        `${result.ok ? "OK" : result.cancelled ? "CANCELLED" : "FAILED"} ${result.agent} [${result.model}]${result.taskId ? ` taskId=${result.taskId} runId=${result.runId}` : ""}\n${result.output}`,
+        `${result.ok ? "OK" : result.cancelled ? "CANCELLED" : "FAILED"} ${result.agent} [${result.model}]${result.taskId ? ` taskId=${result.taskId} runId=${result.runId}` : ""}\n${result.outputTruncated ? "[OMP: shortened report, not complete acceptance evidence. Inspect the full recording or request a concise taskId follow-up.]\n" : ""}${result.output}`,
     )
     .join("\n\n---\n\n");
 }

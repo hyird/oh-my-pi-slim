@@ -178,6 +178,11 @@ export function startConversation(
   return {
     id: meta.id,
     flush,
+    discard() {
+      if (!finished) throw new Error("Cannot discard an active specialist recording");
+      fs.rmSync(file, { force: true });
+      evict(path.resolve(file));
+    },
     record(event: any) {
       if (finished) return;
       if (failure) throw failure;

@@ -14,6 +14,7 @@ import {
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createChildMcpExtension } from "../extensions/omp/child-mcp.ts";
+import { waitFor } from "../extensions/omp/wait-for.ts";
 
 let tmp = "";
 let originalAgentDir: string | undefined;
@@ -72,6 +73,7 @@ function fakeAssistant(toolCall: boolean, options: { error?: boolean; direct?: b
 }
 
 async function setup(options: {
+  listDelayMs?: number;
   permissionBlocks?: boolean;
   directAttempt?: boolean;
   serverError?: boolean;
@@ -159,6 +161,7 @@ async function setup(options: {
       command: process.execPath,
       args: [fixtureServer],
       env: {
+        OMP_NATIVE_MCP_LIST_DELAY_MS: String(options.listDelayMs ?? 0),
         OMP_NATIVE_MCP_CALL_LOG: callLog,
         OMP_NATIVE_MCP_STARTED_LOG: starts,
         OMP_NATIVE_MCP_PROTOCOL_LOG: protocol,
@@ -268,6 +271,18 @@ async function setup(options: {
   return { session, calls, results, modelDeclarations, extensionErrors, callLog, starts, stops, fakeSource, foreignTargetExecutions: () => foreignTargetExecutions, targetOwners, tmp };
 }
 
+test("the first scoped gateway call waits for delayed native MCP tool discovery", async () => {
+  const h = await setup({ listDelayMs: 250 });
+  await h.session.prompt("Search immediately while the MCP server is still starting");
+  expect(h.extensionErrors).toEqual([]);
+  expect(fs.existsSync(h.callLog)).toBe(true);
+  const calls = fs.readFileSync(h.callLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({ name: "searchGitHub", arguments: { query: "gateway-call" } });
+  expect(h.results).toContainEqual({ name: "mcp", parentToolCallId: undefined, isError: false });
+  expect(h.modelDeclarations.flat()).not.toContain("mcp__gh_grep__searchGitHub");
+});
+
 test("native MCP connector ignores traps and only gateway declares/calls the exact nested target", async () => {
   const h = await setup();
   expect(h.session.getAllTools().map((tool) => tool.name)).toContain("mcp");
@@ -316,6 +331,10 @@ test("non-Librarian native child config stays empty and ignores dynamic server r
 
 test("direct target attempts cannot call the server", async () => {
   const h = await setup({ directAttempt: true });
+  // Test policy rejection of a registered target, not a missing-tool error.
+  expect(await waitFor(() => h.session.getCallableToolNames().includes("mcp__gh_grep__searchGitHub"), {
+    timeoutMs: 2000,
+  })).toBe(true);
   await h.session.prompt("Try to call the MCP target directly");
   expect(h.session.getActiveToolNames()).not.toContain("mcp__gh_grep__searchGitHub");
   expect(h.session.getCallableToolNames()).toContain("mcp__gh_grep__searchGitHub");
@@ -325,6 +344,9 @@ test("direct target attempts cannot call the server", async () => {
 
 test("unauthorized nested callers cannot reach the exact native MCP target", async () => {
   const h = await setup({ unauthorizedNested: true });
+  expect(await waitFor(() => h.session.getCallableToolNames().includes("mcp__gh_grep__searchGitHub"), {
+    timeoutMs: 2000,
+  })).toBe(true);
   await h.session.prompt("Attempt a nested call without the gateway");
   expect(fs.existsSync(h.callLog)).toBe(false);
 });

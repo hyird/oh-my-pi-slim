@@ -41,6 +41,7 @@ import {
 } from "../extensions/omp/render.ts";
 import { startConversation } from "../extensions/omp/transcript.ts";
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
+import { RpcWorker } from "../extensions/omp/rpc-worker.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
 let tmp: string;
@@ -161,6 +162,7 @@ function harness() {
     },
     sessionManager: { getBranch: () => branch },
     isProjectTrusted: () => false,
+    isIdle: () => true,
     ui: {
       notify: (text: string) => notifications.push(text),
       setStatus: () => {},
@@ -2372,6 +2374,213 @@ test("reload cancels running children without restoring cards or delivering stal
   }
 });
 
+test.each(["quit", "reload", "resume", "new", "fork", "tree"])(
+  "%s discards owned OMP files and never restores historical cards",
+  async (reason) => {
+    const h = harness();
+    const argv = process.argv[1];
+    process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+    const theme: any = { fg: (_: string, text: string) => text, bold: (text: string) => text };
+    const widgets: unknown[] = [];
+    h.ctx.ui.setWidget = (_key: string, content: unknown) => widgets.push(content);
+    const historical = startConversation("fixer", "unowned previous recording", "test/model");
+    historical.finish("done");
+    const historyPath = path.join(tmp, "omp/conversations", `${historical.id}.jsonl`);
+    const untouched = path.join(tmp, "parent-session.jsonl");
+    fs.writeFileSync(untouched, "Pi history must not change");
+    try {
+      const tool = h.tools.omp_delegate;
+      const args = { tasks: [
+        { agent: "explorer", task: "[delay=0] completed" },
+        { agent: "fixer", task: "[delay=5000] unfinished" },
+      ] };
+      const result = await tool.execute("old-call", args, undefined, undefined, h.ctx);
+      await waitFor(() => h.sentMessages.length === 1);
+      const taskId = result.details.progress[0].taskId;
+      expect(fs.readdirSync(path.join(tmp, "omp/sessions"))).toHaveLength(2);
+      expect(fs.readdirSync(path.join(tmp, "omp/conversations"))).toHaveLength(3);
+      if (reason === "tree") await h.handlers.session_tree({}, h.ctx);
+      else {
+        await h.handlers.session_shutdown({ reason }, h.ctx);
+        await h.handlers.session_start({ reason: reason === "quit" ? "startup" : reason }, h.ctx);
+      }
+      expect(fs.readdirSync(path.join(tmp, "omp/sessions"))).toEqual([]);
+      expect(fs.readdirSync(path.join(tmp, "omp/conversations"))).toEqual([`${historical.id}.jsonl`]);
+      expect(fs.existsSync(historyPath)).toBe(true);
+      expect(fs.readFileSync(untouched, "utf8")).toBe("Pi history must not change");
+      expect(widgets.at(-1)).toBeUndefined();
+      expect(h.sentMessages).toHaveLength(1); // no cancelled results in the new session
+      for (const toolName of ["omp_delegate", "omp_council"]) {
+        const oldTool = h.tools[toolName];
+        const context = { state: {}, toolCallId: "old-call", isPartial: false, invalidate() {} };
+        const oldArgs = toolName === "omp_delegate" ? args : { question: "old review" };
+        const call = oldTool.renderCall(oldArgs, theme, context);
+        const output = oldTool.renderResult(result, { expanded: true, isPartial: false }, theme, context);
+        expect(call.render(100)).toEqual([]);
+        expect(output.render(100)).toEqual([]);
+        // Older versions may have stored progress without a job ID, too.
+        expect(oldTool.renderResult({ ...result, details: { progress: result.details.progress } },
+          { expanded: true, isPartial: false }, theme, context).render(100)).toEqual([]);
+      }
+      await expect(tool.execute("expired", { agent: "explorer", taskId, task: "continue" },
+        undefined, undefined, h.ctx)).rejects.toThrow("Unknown taskId");
+      const fresh = await tool.execute("fresh", { agent: "explorer", task: "fresh" },
+        undefined, undefined, h.ctx);
+      expect(fresh.details.progress[0].taskId).not.toBe(taskId);
+      await waitFor(() => h.sentMessages.length === 2);
+      expect(widgetText(widgets.at(-1))).toContain("done · Explorer task");
+    } finally {
+      process.argv[1] = argv;
+    }
+  },
+);
+
+test.each(["shutdown", "abort"])("%s during model reconciliation cannot launch a stale dispatch", async (action) => {
+  const h = harness();
+  const controller = new AbortController();
+  h.ctx.signal = controller.signal;
+  await updateConfig((config) => ({ ...config, models: { explorer: "missing/model" } }));
+  let unlock!: () => void;
+  let entered!: () => void;
+  const locked = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { unlock = resolve; });
+  const blocker = withFileMutationQueue(configPath(), async () => { entered(); await gate; });
+  await locked;
+  const dispatch = h.tools.omp_delegate.execute("racing", { agent: "explorer", task: "inspect" },
+    undefined, undefined, h.ctx);
+  const outcome = dispatch.then(() => undefined, (error: unknown) => error);
+  try {
+    if (action === "shutdown") await h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
+    else controller.abort();
+    unlock();
+    await blocker;
+    expect(await outcome).toBeInstanceOf(Error);
+    expect(String(await outcome)).toContain("Specialist dispatch cancelled");
+    expect(readConfig().models.explorer).toBe("missing/model");
+    expect(fs.existsSync(path.join(tmp, "omp/sessions"))).toBe(false);
+    expect(h.sentMessages).toHaveLength(0);
+  } finally {
+    unlock();
+    await blocker;
+  }
+});
+
+test("parent cancellation stops every batch and Council worker without waking the model", async () => {
+  const h = harness();
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const controller = new AbortController();
+  h.ctx.signal = controller.signal;
+  const workers: RpcWorker[] = [];
+  const originalPrompt = RpcWorker.prototype.prompt;
+  const prompt = spyOn(RpcWorker.prototype, "prompt").mockImplementation(function (this: RpcWorker, ...args) {
+    workers.push(this);
+    return originalPrompt.apply(this, args);
+  });
+  let pinned: unknown;
+  h.ctx.ui.setWidget = (_key: string, value: unknown) => { pinned = value; };
+  try {
+    const delegate = h.tools.omp_delegate;
+    await delegate.execute("batch-a", { tasks: [
+      { agent: "explorer", task: "[delay=0] done" },
+      { agent: "fixer", task: "[delay=5000] slow" },
+    ] }, undefined, undefined, h.ctx);
+    await delegate.execute("batch-b", { agent: "oracle", task: "[delay=5000] review" },
+      undefined, undefined, h.ctx);
+    await h.tools.omp_council.execute("reviewers", { question: "[delay=5000] decision" },
+      undefined, undefined, h.ctx);
+    await waitFor(() => workers.length === 6 && h.sentMessages.length === 1);
+    expect(h.sentMessages[0].message.content).toContain("OK explorer");
+    const interrupt = new AbortController();
+    h.ctx.signal = interrupt.signal;
+    h.handlers.agent_start({}, h.ctx); // user starts another turn while children are running
+    controller.abort(); // the previous turn's listener must have been removed
+    expect(workers.every((worker) => worker.alive)).toBe(true);
+    interrupt.abort(); // this turn cancels earlier-turn children too
+    await waitFor(() => workers.filter((worker) => worker.alive).length === 1);
+    await waitFor(() => h.sentMessages.length === 4);
+    expect(widgetText(pinned).split("\n").filter((line) =>
+      line.includes("cancelled ·") && !line.includes("OMP"))).toHaveLength(5);
+    expect(widgetText(pinned)).toContain("done · Explorer task");
+    for (const message of h.sentMessages.slice(1)) expect(message.options.triggerTurn).toBe(false);
+    const alive = workers.filter((worker) => worker.alive);
+    expect(alive).toHaveLength(1); // completed worker retained for explicit same-session continuation
+    for (const worker of workers.filter((worker) => !worker.alive)) {
+      await worker.closed;
+      expect(() => process.kill((worker as any).proc.pid, 0)).toThrow();
+    }
+    // A new turn must detach the old parent signal and remain usable.
+    const next = new AbortController();
+    h.ctx.signal = next.signal;
+    h.handlers.agent_start({}, h.ctx);
+    await delegate.execute("after-esc", { agent: "fixer", task: "new work" },
+      undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 5);
+    expect(h.sentMessages.at(-1)!.options.triggerTurn).toBe(true);
+  } finally {
+    prompt.mockRestore();
+    process.argv[1] = argv;
+  }
+});
+
+test.each(["manual", "threshold", "overflow"])(
+  "aborting %s compaction cancels children through its own signal without waking the model",
+  async (reason) => {
+    const h = harness();
+    const argv = process.argv[1];
+    process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+    const parent = new AbortController();
+    const compaction = new AbortController();
+    h.ctx.signal = parent.signal;
+    try {
+      await h.tools.omp_delegate.execute("compact-abort", { agent: "fixer", task: "[delay=5000] work" },
+        undefined, undefined, h.ctx);
+      h.handlers.session_before_compact({ reason, signal: compaction.signal }, h.ctx);
+      compaction.abort();
+      expect(parent.signal.aborted).toBe(false);
+      h.handlers.session_compact_failed({ reason, aborted: true }, h.ctx);
+      await waitFor(() => h.sentMessages.length === 1);
+      expect(h.sentMessages[0].message.content).toContain("CANCELLED fixer");
+      expect(h.sentMessages[0].options.triggerTurn).toBe(false);
+    } finally {
+      process.argv[1] = argv;
+    }
+  },
+);
+
+test.each(["success", "failure", "extension-veto", "session-reset"])(
+  "%s removes the old compaction listener without cancelling later work",
+  async (outcome) => {
+    const h = harness();
+    const argv = process.argv[1];
+    process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+    const parent = new AbortController();
+    const compaction = new AbortController();
+    h.ctx.signal = parent.signal;
+    try {
+      h.handlers.session_before_compact({ reason: "threshold", signal: compaction.signal }, h.ctx);
+      if (outcome === "success") h.handlers.session_compact({}, h.ctx);
+      else if (outcome === "session-reset") await h.handlers.session_start({ reason: "resume" }, h.ctx);
+      else h.handlers.session_compact_failed({ aborted: outcome === "extension-veto" }, h.ctx);
+      await h.tools.omp_delegate.execute("post-compact", { agent: "fixer", task: "[delay=50] work" },
+        undefined, undefined, h.ctx);
+      compaction.abort();
+      await waitFor(() => h.sentMessages.length === 1);
+      expect(h.sentMessages[0].message.content).toContain("OK fixer");
+      expect(h.sentMessages[0].options.triggerTurn).toBe(true);
+      // The parent watcher remains independent from the finished compaction.
+      await h.tools.omp_delegate.execute("parent-abort", { agent: "explorer", task: "[delay=5000] work" },
+        undefined, undefined, h.ctx);
+      parent.abort();
+      await waitFor(() => h.sentMessages.length === 2);
+      expect(h.sentMessages[1].message.content).toContain("CANCELLED explorer");
+      expect(h.sentMessages[1].options.triggerTurn).toBe(false);
+    } finally {
+      process.argv[1] = argv;
+    }
+  },
+);
+
 test("background batches start more than three children concurrently", async () => {
   const h = harness();
   const originalArgv = process.argv[1];
@@ -2511,6 +2720,7 @@ test("council moves all reviewer statuses to the fixed card and clears it on com
     ).toBe(true);
     expect(result.usage).toBeUndefined();
     expect(h.sentMessages[0].message.content).toContain("3/3 reviewers responded");
+    expect(h.sentMessages[0].message.content).toContain("Disclose missing, failed, blocked or shortened reviews");
     for (const isExpanded of [false, true]) {
       const displayed = tool
         .renderResult(result, { expanded: isExpanded, isPartial: false }, theme)
@@ -2532,6 +2742,33 @@ test("council moves all reviewer statuses to the fixed card and clears it on com
   } finally {
     process.argv[1] = originalArgv;
     delete process.env.OMP_TEST_CAPTURE;
+  }
+});
+
+test.each(["omp_delegate", "omp_council"])("%s delivers shortened reports with their final blockers and evidence warning", async (toolName) => {
+  const h = harness();
+  const argv = process.argv[1];
+  const savedOutput = process.env.OMP_TEST_OUTPUT;
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const ending = "Final caveat: required validation is blocked; this is not approval.";
+  process.env.OMP_TEST_OUTPUT = `Findings:\n${"context ".repeat(4000)}\n${ending}`;
+  try {
+    const count = toolName === "omp_council" ? 3 : 1;
+    await h.tools[toolName].execute("bounded-reports", toolName === "omp_council"
+      ? { question: "审查结论和验证证据" }
+      : { agent: "fixer", task: "汇报结论和验证证据" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    const content = h.sentMessages[0].message.content as string;
+    expect(content.match(/not complete acceptance evidence/g)).toHaveLength(count);
+    expect(content.match(/Final caveat: required validation is blocked/g)).toHaveLength(count);
+    expect(content.match(/\[output truncated\] OMP omitted the middle/g)).toHaveLength(count);
+    expect(h.sentMessages[0].options).toEqual({ triggerTurn: true, deliverAs: "steer" });
+    expect(fs.readdirSync(path.join(tmp, "omp/conversations"))).toHaveLength(count);
+    if (toolName === "omp_council") expect(content).toContain("never infer consensus from them");
+  } finally {
+    process.argv[1] = argv;
+    if (savedOutput === undefined) delete process.env.OMP_TEST_OUTPUT;
+    else process.env.OMP_TEST_OUTPUT = savedOutput;
   }
 });
 
@@ -3136,6 +3373,52 @@ test("fast results unblock the parent while a sibling remains running, without d
   }
 });
 
+test("an additive user request preserves running work and sends its amendment only after completion", async () => {
+  const h = harness();
+  const argv = process.argv[1];
+  const savedCapture = process.env.OMP_TEST_CAPTURE;
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  process.env.OMP_TEST_CAPTURE = path.join(tmp, "amendment.json");
+  const capture = () => JSON.parse(fs.readFileSync(process.env.OMP_TEST_CAPTURE!, "utf8"));
+  try {
+    const tool = h.tools.omp_delegate;
+    const dispatched = await tool.execute("initial", { agent: "fixer", task: "[delay=200] initial work" },
+      undefined, undefined, h.ctx);
+    const taskId = dispatched.details.progress[0].taskId;
+    await waitFor(() => fs.existsSync(process.env.OMP_TEST_CAPTURE!) && capture().count === 1);
+    const pid = capture().pid;
+    h.branch.push({ type: "message", message: { role: "user", content: "还要覆盖空输入" } });
+    h.handlers.input({ source: "interactive", text: "还要覆盖空输入" }, h.ctx);
+    const rejected = tool.execute("too-early", { agent: "fixer", taskId, task: "追加空输入验证" },
+      undefined, undefined, h.ctx).then(() => undefined, (error: unknown) => error);
+    expect(String(await rejected)).toContain("No new prompt was sent");
+    expect(capture().count).toBe(1);
+    expect(capture().pid).toBe(pid);
+    expect(fs.readdirSync(path.join(tmp, "omp/sessions"))).toHaveLength(1);
+    expect(fs.readdirSync(path.join(tmp, "omp/conversations"))).toHaveLength(1);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(h.sentMessages[0].message.content).toContain("OK fixer");
+    const continued = await tool.execute("amendment", { agent: "fixer", taskId, task: "追加空输入验证" },
+      undefined, undefined, h.ctx);
+    expect(continued.details.progress[0].taskId).toBe(taskId);
+    await waitFor(() => h.sentMessages.length === 2);
+    expect(capture().pid).toBe(pid);
+    expect(capture().count).toBe(2);
+    expect(capture().message).toContain("追加空输入验证");
+    expect(capture().message).not.toContain("initial work");
+    const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    h.handlers.before_agent_start(event, h.ctx);
+    expect(event.systemPromptOptions.sections.omp_roster).toContain("retain the amendment in the parent conversation");
+    expect(event.systemPromptOptions.sections.omp_roster).toContain("do not claim the child received the amendment");
+    expect(event.systemPromptOptions.sections.omp_roster).toContain("normal runtime completion, not acceptance");
+    expect(event.systemPromptOptions.sections.omp_roster).toContain("Failed or cancelled runs are not proof of completion");
+  } finally {
+    process.argv[1] = argv;
+    if (savedCapture === undefined) delete process.env.OMP_TEST_CAPTURE;
+    else process.env.OMP_TEST_CAPTURE = savedCapture;
+  }
+});
+
 test("delegate taskId continues the same worker and rejects reuse after session replacement", async () => {
   const h = harness();
   const oldArgv = process.argv[1];
@@ -3187,8 +3470,58 @@ test("delegate taskId continues the same worker and rejects reuse after session 
   }
 });
 
-test("notification retries reuse a completed result without starting new child work", async () => {
+test.each(["complete", "cancel", "reset"])("pending delivery retries pause during compaction and respect %s", async (outcome) => {
   const h = harness();
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const compaction = new AbortController();
+  let attempts = 0;
+  const push = h.sentMessages.push.bind(h.sentMessages);
+  h.sentMessages.push = (...items) => {
+    if (++attempts === 1) throw new Error("retry after temporary delivery failure");
+    return push(...items);
+  };
+  try {
+    await h.tools.omp_delegate.execute("pending", { agent: "fixer", task: "one run" },
+      undefined, undefined, h.ctx);
+    await waitFor(() => attempts === 1);
+    h.handlers.session_before_compact({ reason: "manual", signal: compaction.signal }, h.ctx);
+    await Bun.sleep(150);
+    expect(attempts).toBe(1);
+    expect(h.sentMessages).toHaveLength(0);
+    expect(h.notifications).toEqual([]);
+    if (outcome === "reset") {
+      await h.handlers.session_shutdown({ reason: "reload" }, h.ctx);
+      await h.handlers.session_start({ reason: "reload" }, h.ctx);
+      compaction.abort();
+      await Bun.sleep(150);
+      expect(attempts).toBe(1);
+      expect(h.sentMessages).toHaveLength(0);
+    } else {
+      if (outcome === "cancel") {
+        compaction.abort();
+        h.handlers.session_compact_failed({ aborted: true }, h.ctx);
+      } else {
+        // Automatic compaction can end inside a still-active main turn.
+        h.ctx.signal = new AbortController().signal;
+        h.ctx.isIdle = () => false;
+        h.handlers.session_compact({}, h.ctx);
+      }
+      await waitFor(() => h.sentMessages.length === 1);
+      expect(attempts).toBe(2);
+      expect(h.sentMessages[0].options).toEqual({ triggerTurn: outcome === "complete", deliverAs: "steer" });
+      expect(h.sentMessages[0].message.content.match(/OK fixer/g)).toHaveLength(1);
+      expect(fs.readdirSync(path.join(tmp, "omp/conversations"))).toHaveLength(1);
+    }
+  } finally {
+    process.argv[1] = argv;
+  }
+});
+
+test.each([false, true])("notification retries reuse results and respect parent cancellation: %s", async (cancel) => {
+  const h = harness();
+  const controller = new AbortController();
+  h.ctx.signal = controller.signal;
   const oldArgv = process.argv[1];
   process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
   let attempts = 0;
@@ -3211,8 +3544,10 @@ test("notification retries reuse a completed result without starting new child w
     });
     await waitFor(() => attempts === 1);
     expect(ended).toBe(false);
+    if (cancel) controller.abort();
     await end;
-    expect(h.sentMessages).toHaveLength(1);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(h.sentMessages[0].options.triggerTurn).toBe(!cancel);
     expect(attempts).toBe(2);
     expect(h.sentMessages[0].message.content.match(/OK fixer/g)).toHaveLength(1);
     expect(fs.readdirSync(path.join(tmp, "omp", "conversations"))).toHaveLength(1);

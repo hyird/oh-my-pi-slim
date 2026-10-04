@@ -75,6 +75,7 @@ type PendingDelivery = {
   session: number;
   content: string;
   attempts: number;
+  wake: boolean;
   retryAt?: number;
   completed?: Array<{ result: Result; at: number }>;
 };
@@ -126,6 +127,11 @@ export default function omp(pi: ExtensionAPI) {
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const sessions = new TaskSessions();
+  const liveCalls = new Set<string>();
+  let acceptingWork = true;
+  let dispatchRevision = 0;
+  let parentSignal: AbortSignal | undefined;
+  let compactionSignal: AbortSignal | undefined;
   const backgroundWaiters = new Set<() => void>();
   let deliveryRevision = 0;
   let observedDeliveryRevision = 0;
@@ -374,6 +380,12 @@ export default function omp(pi: ExtensionAPI) {
     },
   ) => {
     if (context?.toolCallId) {
+      // Persisted tool results are history, not live OMP state. Never resurrect
+      // their queued/running cards when Pi rebuilds a resumed transcript.
+      if (context.isPartial === false && !liveCalls.has(context.toolCallId)) {
+        context.state.card?.clear();
+        return new Container();
+      }
       const pending = calls.get(context.toolCallId);
       // Pi renders a call before tool_execution_start. Keep that first frame
       // empty; the start event creates the fixed card from the complete task list.
@@ -435,6 +447,10 @@ export default function omp(pi: ExtensionAPI) {
     if (!runtime.running.size) stopAnimation();
   };
   const cancelRunning = () => {
+    dispatchRevision++;
+    // Cancellation results remain available as context, but must not wake the
+    // model after ESC (including a completed result waiting for delivery retry).
+    for (const item of runtime.pending) item.wake = false;
     releaseBackgroundWaiters();
     stopAnimation();
     runtime.dirtyJobs.clear();
@@ -443,6 +459,38 @@ export default function omp(pi: ExtensionAPI) {
       job.controller.abort();
     }
     runtime.running.clear();
+  };
+  const watchAbort = (previous: AbortSignal | undefined, signal: AbortSignal | undefined) => {
+    if (signal === previous) return signal;
+    previous?.removeEventListener("abort", cancelRunning);
+    signal?.addEventListener("abort", cancelRunning, { once: true });
+    if (signal?.aborted) cancelRunning();
+    return signal;
+  };
+  const watchParent = (signal: AbortSignal | undefined) => {
+    parentSignal = watchAbort(parentSignal, signal);
+  };
+  const clearCompactionWatch = () => {
+    compactionSignal = watchAbort(compactionSignal, undefined);
+  };
+  const finishCompaction = () => {
+    clearCompactionWatch();
+    flushPending();
+  };
+  const prepareDispatch = (ctx: ExtensionContext, signal?: AbortSignal) => {
+    if (!acceptingWork) throw new Error("OMP session is closed");
+    const operationSignal = ctx.signal ?? signal;
+    watchParent(operationSignal);
+    const session = runtime.session;
+    const revision = dispatchRevision;
+    const current = () =>
+      acceptingWork && session === runtime.session && revision === dispatchRevision &&
+      !operationSignal?.aborted && !signal?.aborted;
+    const assertCurrent = () => {
+      if (!current()) throw new Error("Specialist dispatch cancelled; start a new task when ready");
+    };
+    assertCurrent();
+    return { current, assertCurrent };
   };
   const bindContext = (ctx: ExtensionContext) => {
     runtime.pi = pi;
@@ -453,6 +501,17 @@ export default function omp(pi: ExtensionAPI) {
     if (!runtime.pi || delivering) return;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
+    if (!runtime.pending.length || compactionSignal) return;
+    // Native recovery/summarization can be busy without an active agent signal.
+    // Earlier before_compact handlers may still own the summary, and session_compact
+    // itself precedes native teardown. Do not start a concurrent model in either
+    // gap. An active agent can receive steering; otherwise wait locally for idle.
+    // This wait is not a delivery error and makes no provider requests.
+    if (!runtime.ctx?.signal && !runtime.ctx?.isIdle()) {
+      runtime.retryTimer = setTimeout(flushPending, 50);
+      runtime.retryTimer.unref?.();
+      return;
+    }
     delivering = true;
     try {
       const pending = runtime.pending.splice(0);
@@ -465,7 +524,7 @@ export default function omp(pi: ExtensionAPI) {
         try {
           runtime.pi.sendMessage(
             { customType: "omp-background-result", display: false, content: item.content },
-            { triggerTurn: true, deliverAs: "steer" },
+            { triggerTurn: item.wake, deliverAs: "steer" },
           );
           deliveryRevision++;
           releaseBackgroundWaiters();
@@ -514,7 +573,10 @@ export default function omp(pi: ExtensionAPI) {
     completed?: Array<{ result: Result; at: number }>,
   ) => {
     if (job.session !== runtime.session) return;
-    runtime.pending.push({ session: job.session, content, attempts: 0, completed });
+    runtime.pending.push({
+      session: job.session, content, attempts: 0,
+      wake: !job.controller.signal.aborted, completed,
+    });
     flushPending();
   };
   const visibleResult = (
@@ -524,6 +586,13 @@ export default function omp(pi: ExtensionAPI) {
     context?: { state: OmpRenderState; invalidate: () => void; toolCallId: string },
   ) => {
     const job = result.details?.jobId ? jobs.get(result.details.jobId) : undefined;
+    if (
+      (result.details?.jobId && !job) ||
+      (context?.toolCallId && !options.isPartial && !liveCalls.has(context.toolCallId))
+    ) {
+      context?.state.card?.clear();
+      return new Container();
+    }
     if (job && context?.toolCallId) {
       if (job.callId !== context.toolCallId && runtime.jobsByCall.get(job.callId) === job)
         runtime.jobsByCall.delete(job.callId);
@@ -648,7 +717,7 @@ export default function omp(pi: ExtensionAPI) {
           job.state === "cancelled"
             ? "Some specialist tasks were cancelled. Review any completed results.\n\n"
             : kind === "council"
-              ? `${results.filter((result) => result.ok).length}/${results.length} reviewers responded. These perspectives use the same inherited model, so do not claim cross-model agreement. Synthesize disagreements.\n\n`
+              ? `${results.filter((result) => result.ok).length}/${results.length} reviewers responded. These perspectives use the same inherited model, so do not claim cross-model agreement. Synthesize disagreements. Disclose missing, failed, blocked or shortened reviews; never infer consensus from them.\n\n`
               : "Verify and integrate these specialist results before finalizing.\n\n";
         deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
       })
@@ -787,6 +856,8 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.on("tool_execution_start", (event, ctx) => {
     if (event.toolName !== "omp_delegate" && event.toolName !== "omp_council") return;
+    if (!acceptingWork) return;
+    liveCalls.add(event.toolCallId);
     bindContext(ctx);
     if (event.toolName === "omp_delegate") {
       const args = event.args ?? {};
@@ -825,6 +896,23 @@ export default function omp(pi: ExtensionAPI) {
     observedInputRevision = inputRevision;
   });
 
+  pi.on("agent_start", (_event, ctx) => {
+    if (!acceptingWork) return;
+    watchParent(ctx.signal);
+    flushPending();
+  });
+
+  // Pi's ESC during compaction aborts a separate controller, not ctx.signal.
+  // Observe that operation, never raw keys: ESC in a picker remains a UI action.
+  pi.on("session_before_compact", (event) => {
+    if (!acceptingWork) return;
+    compactionSignal = watchAbort(compactionSignal, event.signal);
+    flushPending(); // pause any pending retry timer until the terminal hook
+  });
+  pi.on("session_compact", finishCompaction);
+  // aborted can also mean an extension veto; only the signal proves an abort.
+  pi.on("session_compact_failed", finishCompaction);
+
   pi.on("agent_end", async (event, ctx) => {
     const lastAssistant = [...event.messages]
       .reverse()
@@ -855,20 +943,42 @@ export default function omp(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  const clearRuntime = () => {
+    acceptingWork = false;
+    runtime.session++;
+    watchParent(undefined);
+    clearCompactionWatch();
     resetMainThroughput();
     cancelRunning();
-    const clearing = sessions.clear();
+    const oldCtx = runtime.ctx;
+    runtime.pi = undefined;
+    runtime.ctx = undefined;
+    runtime.requestPinnedRender = undefined;
+    runtime.pinnedUiAvailable = false;
+    for (const job of jobs.values()) job.invalidators.clear();
     jobs.clear();
     runtime.jobsByCall.clear();
     runtime.pinned.clear();
     calls.clear();
+    liveCalls.clear();
     runtime.pending.length = 0;
+    runtime.scroll = { listTop: 0, detailTop: 0 };
+    runtime.nextDisplayOrder = 0;
+    observedDeliveryRevision = deliveryRevision;
+    observedInputRevision = inputRevision;
     if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
-    const session = ++runtime.session;
+    try { oldCtx?.ui.setWidget?.("omp-active", undefined); } catch { /* Stale UI. */ }
+    try { oldCtx?.ui.setStatus("omp", undefined); } catch { /* Stale UI. */ }
+    return sessions.clear({ discard: true });
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    const clearing = clearRuntime();
+    const session = runtime.session;
     await clearing;
     if (session !== runtime.session) return;
+    acceptingWork = true;
     bindContext(ctx);
     refreshPinned();
     try {
@@ -893,27 +1003,17 @@ export default function omp(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", () => {
-    resetMainThroughput();
-    try {
-      runtime.ctx?.ui.setWidget?.("omp-active", undefined);
-    } catch {
-      /* Continue closing children even if the previous UI was replaced. */
-    }
-    runtime.pi = undefined;
-    runtime.ctx = undefined;
-    runtime.requestPinnedRender = undefined;
-    for (const job of jobs.values()) job.invalidators.clear();
-    runtime.session++;
-    cancelRunning();
-    jobs.clear();
-    runtime.jobsByCall.clear();
-    runtime.pinned.clear();
-    calls.clear();
-    runtime.pending.length = 0;
-    if (runtime.retryTimer) clearTimeout(runtime.retryTimer);
-    runtime.retryTimer = undefined;
-    return sessions.clear();
+  pi.on("session_shutdown", clearRuntime);
+
+  pi.on("session_tree", async (_event, ctx) => {
+    const clearing = clearRuntime();
+    const session = runtime.session;
+    await clearing;
+    if (session !== runtime.session) return;
+    acceptingWork = true;
+    bindContext(ctx);
+    refreshPinned();
+    status(ctx);
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -932,7 +1032,7 @@ export default function omp(pi: ExtensionAPI) {
       .map((name) => `${name} (${ROLES[name].description})`)
       .join(
         "; ",
-      )}. All delegation and Council work runs in the background. Continue only independent work; if none remains, end your turn with a brief status, without claiming the task is finished. OMP waits locally at the turn boundary for the next result, preventing automatic goal continuations from issuing empty model requests. Completion steers an active turn at the next safe tool boundary. Never use shell sleep or polling to wait for specialists. Use their findings only after the completion message arrives. Progress and assistant replies remain in the fixed OMP task card until the next user input. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility.`;
+      )}. OMP tasks and task IDs exist only in the current runtime. Exit, reload, session replacement and tree navigation clear them; never wait for or resume old tasks from restored history. Inspect partial work before assigning a new task. Before dispatching, check current-runtime tasks and their results for the same objective. If the user adds requirements to a running task, retain the amendment in the parent conversation and wait for that task's terminal result, then continue it by the same taskId. Do not cancel it or create a duplicate merely for an additive request, and do not claim the child received the amendment before it is actually dispatched. A refused taskId sends no new prompt; do not omit that ID to replay the same live objective as a new task. Cancellation does not undo edits or satisfy required verification. All delegation and Council work runs in the background. Continue only independent work; if none remains, end your turn with a brief status, without claiming the task is finished. OMP waits locally at the turn boundary for the next result, preventing automatic goal continuations from issuing empty model requests. Completion steers an active turn at the next safe tool boundary. Never use shell sleep or polling to wait for specialists. Use their findings only after the completion message arrives. Progress and assistant replies remain in the fixed OMP task card until the next user input. Give one writer ownership of each file. For high-stakes choices use omp_council. Specialist results are evidence to verify, not a substitute for your own responsibility. An OK result confirms normal runtime completion, not acceptance: review refusals, blockers, missing checks and report omissions before advancing dependencies. Failed or cancelled runs are not proof of completion.`;
   });
 
   pi.on("message_start", (event) => {
@@ -985,7 +1085,7 @@ export default function omp(pi: ExtensionAPI) {
       taskId: Type.Optional(
         Type.String({
           description:
-            "Continue a completed task from this session; omit for a new objective. Never use for a running task or as a status check.",
+            "Continue a finished task in this live runtime; inspect partial work after failure/cancellation. Omit for a new objective. Never use for a running task, status check, or task from restored history.",
         }),
       ),
       tasks: Type.Optional(
@@ -1008,6 +1108,8 @@ export default function omp(pi: ExtensionAPI) {
       return visibleResult(result as AgentToolResult<OmpDetails>, options, theme, context);
     },
     async execute(_id, params, signal, onUpdate, ctx) {
+      const dispatch = prepareDispatch(ctx, signal);
+      liveCalls.add(_id);
       bindContext(ctx);
       if (role === "pi")
         throw new Error("OMP delegation is disabled while the default agent is pi");
@@ -1035,13 +1137,15 @@ export default function omp(pi: ExtensionAPI) {
       const assignments = items as Assignment[];
       sessions.validate(assignments, taskScope(ctx));
       beginCall(_id, assignments);
-      const snapshot = await reconcileModels(ctx);
+      const snapshot = await reconcileModels(ctx, dispatch.current);
+      dispatch.assertCurrent();
       // Validate the entire batch once before starting any children.
       const launches = resolveLaunches(ctx, assignments, snapshot);
       onUpdate?.({
         content: [{ type: "text", text: "OMP: starting specialists" }],
         details: { progress: queuedProgress(assignments) },
       });
+      dispatch.assertCurrent();
       const prepared = prepareAssignments(ctx, assignments, signal);
       sessions.validate(prepared.items, taskScope(ctx));
       return startJob(ctx, prepared, "delegate", _id, launches);
@@ -1067,6 +1171,8 @@ export default function omp(pi: ExtensionAPI) {
       return visibleResult(result as AgentToolResult<OmpDetails>, options, theme, context);
     },
     async execute(_id, { question }, signal, onUpdate, ctx) {
+      const dispatch = prepareDispatch(ctx, signal);
+      liveCalls.add(_id);
       bindContext(ctx);
       if (role === "pi")
         throw new Error("OMP delegation is disabled while the default agent is pi");
@@ -1082,6 +1188,7 @@ export default function omp(pi: ExtensionAPI) {
         content: [{ type: "text", text: "Council: starting specialists" }],
         details: { progress: queuedProgress(assignments) },
       });
+      dispatch.assertCurrent();
       const prepared = prepareAssignments(ctx, assignments, signal);
       return startJob(ctx, prepared, "council", _id, launches);
     },

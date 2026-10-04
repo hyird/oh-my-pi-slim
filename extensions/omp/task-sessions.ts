@@ -18,6 +18,7 @@ export interface TaskSession {
   closing?: Promise<void>;
   idleTimer?: ReturnType<typeof setTimeout>;
   finish?: () => void;
+  discardRecordings: Set<() => void>;
 }
 
 function statRevision(file: string): string {
@@ -165,6 +166,7 @@ export class TaskSessions {
   private tasks = new Map<string, TaskSession>();
   private idle = new Set<TaskSession>();
   private operations = new Set<Promise<unknown>>();
+  private cleanups = new Set<Promise<void>>();
   private epoch = 0;
   constructor(
     private readonly idleMs = 120_000,
@@ -190,7 +192,9 @@ export class TaskSessions {
       if (task.agent !== item.agent || task.scope !== scope)
         throw new Error("Task role, directory or trust scope changed; start a new task");
       if (task.busy)
-        throw new Error("Task is still running; wait for its completion before continuing it");
+        throw new Error(
+          "Task is still running; wait for its completion before continuing it. No new prompt was sent. Keep added requirements in the parent conversation; do not cancel or duplicate this task merely to add them.",
+        );
       if (!task.worker?.alive && (!task.sessionFile || !fs.existsSync(task.sessionFile))) {
         throw new Error(
           "Task has no saved session to resume; inspect partial work before starting a new task",
@@ -206,7 +210,10 @@ export class TaskSessions {
     if (!task) {
       const sessionDir = path.join(getAgentDir(), "omp", "sessions", taskId);
       fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-      task = { taskId, runId: "", agent: item.agent, scope, signature, sessionDir, busy: false };
+      task = {
+        taskId, runId: "", agent: item.agent, scope, signature, sessionDir,
+        busy: false, discardRecordings: new Set(),
+      };
       this.tasks.set(taskId, task);
     }
     if (task.idleTimer) clearTimeout(task.idleTimer);
@@ -272,12 +279,29 @@ export class TaskSessions {
     }
   }
 
-  async clear(): Promise<void> {
+  clear({ discard = false }: { discard?: boolean } = {}): Promise<void> {
     this.epoch++;
     const tasks = [...this.tasks.values()];
     this.tasks.clear();
     for (const task of tasks) this.retire(task);
-    // Repeated shutdown calls must also wait for earlier retirement/launch work.
-    while (this.operations.size) await Promise.allSettled([...this.operations]);
+    // Snapshot this generation: shutdown must wait for its launches, recordings
+    // and prior cleanups, not for unrelated work started in a new session.
+    const pending = [...this.operations, ...this.cleanups];
+    const cleanup = Promise.allSettled(pending).then(async () => {
+      if (!discard) return;
+      // Workers/recorders have closed before removal, so they cannot recreate
+      // these files. Remove only paths owned by this registry, never the shared
+      // OMP root (other Pi instances and older recordings may live there).
+      const results = await Promise.allSettled(tasks.flatMap((task) => [
+        fs.promises.rm(task.sessionDir, { recursive: true, force: true }),
+        ...[...task.discardRecordings].map(async (remove) => remove()),
+      ]));
+      const errors = results.filter((result) => result.status === "rejected");
+      if (errors.length)
+        throw new AggregateError(errors.map((result) => result.reason), "OMP session cleanup failed");
+    });
+    this.cleanups.add(cleanup);
+    void cleanup.finally(() => this.cleanups.delete(cleanup)).catch(() => {});
+    return cleanup;
   }
 }

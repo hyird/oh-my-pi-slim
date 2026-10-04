@@ -24,7 +24,7 @@ function handle(message) {
       },
     });
   } else if (message.method === "tools/list") {
-    respond({
+    setTimeout(() => respond({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -34,7 +34,7 @@ function handle(message) {
           inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
         }],
       },
-    });
+    }), Number(process.env.OMP_NATIVE_MCP_LIST_DELAY_MS ?? 0));
   } else if (message.method === "tools/call") {
     const log = process.env.OMP_NATIVE_MCP_CALL_LOG;
     if (log) fs.appendFileSync(log, JSON.stringify(message.params) + "\n");

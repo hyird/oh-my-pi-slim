@@ -10,6 +10,7 @@ import {
   type ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { isRole } from "./roles.ts";
+import { waitFor } from "./wait-for.ts";
 import { MCP_ISOLATION_ERROR_MARKER, mcpIsolationError } from "./mcp-isolation.ts";
 
 const MCP_TARGET = "mcp__gh_grep__searchGitHub";
@@ -73,6 +74,18 @@ export function createChildMcpExtension(
     const permits = new Map<string, Permit>();
     let isolationReady = false;
     let isolationFailure: string | undefined;
+    let sessionLifetime = new AbortController();
+
+    // Register before the connector so pending calls stop before native shutdown waits.
+    pi.on("session_start", () => {
+      sessionLifetime.abort(new Error("MCP session replaced"));
+      sessionLifetime = new AbortController();
+    });
+    pi.on("session_shutdown", () => {
+      sessionLifetime.abort(new Error("MCP session shut down"));
+      isolationReady = false;
+      permits.clear();
+    });
 
     // The native connector must not inherit servers registered by another extension.
     // Keep the host registry untouched and replace only the connector's view.
@@ -213,16 +226,25 @@ export function createChildMcpExtension(
         if (signal?.aborted) throw signal.reason ?? new Error("MCP call cancelled");
         rethrowLatchedFailure(ctx);
         if (!isolationReady) closeOnIsolationFailure(ctx, "connector has not been validated");
-        const targetReady = validateConnector(ctx, true);
-        if (!targetReady || !ctx.tools.some((tool) => tool.name === MCP_TARGET)) {
-          throw new Error("Native gh_grep target is unavailable; the server may not be connected. Refusing fallback.");
+        const callSignal = signal
+          ? AbortSignal.any([signal, sessionLifetime.signal])
+          : sessionLifetime.signal;
+        const targetReady = await waitFor(
+          () => validateConnector(ctx, true) && ctx.tools.some((tool) => tool.name === MCP_TARGET),
+          { signal: callSignal, timeoutMs: 10_000 },
+        );
+        callSignal.throwIfAborted();
+        if (!targetReady) {
+          throw new Error("Native gh_grep target was not ready within 10 seconds. Refusing fallback.");
         }
+        // Recheck after the await: another handler may have replaced the target.
+        validateConnector(ctx, true);
 
         const permit: Permit = { args: stableJson(params.args), used: false };
         permits.set(toolCallId, permit);
         try {
           const outcome = await ctx.executeTool(MCP_TARGET, params.args, {
-            signal,
+            signal: callSignal,
             onUpdate: (partial) => onUpdate?.(partial),
           });
           return { ...outcome.result, isError: outcome.isError || outcome.result.isError === true };
