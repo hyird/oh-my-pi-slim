@@ -40,6 +40,10 @@ import { registerWebSearch } from "./websearch.ts";
 import { installMcpPolicy } from "./mcp-policy.ts";
 import { availableChildModels } from "./models.ts";
 import { failureDetail } from "./failure-detail.ts";
+import { discoverDcpTools } from "./dcp-tools.ts";
+import { ChildUsageLedger, USAGE_ENTRY, addUsage, addModelUsage, emptyUsage } from "./usage.ts";
+import { installUsageFooter } from "./footer.ts";
+import registerFastMode from "./fast-mode.ts";
 import { scrollablePinnedCard, type PinnedScrollState } from "./pinned-scroll.ts";
 
 const COUNCIL_PERSPECTIVES = [
@@ -103,6 +107,7 @@ export default function omp(pi: ExtensionAPI) {
   registerWebSearch(pi);
   // Child sessions need personal provider extensions but must not register OMP again.
   if (process.env.PI_OMP_CHILD === "1") return;
+  registerFastMode(pi);
   let role: MainAgent = "orchestrator";
   let mainMessageStartedAt: number | undefined;
   let mainOutputTokens = 0;
@@ -127,6 +132,29 @@ export default function omp(pi: ExtensionAPI) {
   const jobs = runtime.jobs;
   const calls = runtime.calls;
   const sessions = new TaskSessions();
+  const childUsage = new ChildUsageLedger();
+  let mainStreamingUsage = emptyUsage();
+  let requestFooterRender = () => {};
+  let footerModels: string[] = [];
+  const recordUsage = (runId: string | undefined, usage: Result["usage"] | undefined, taskId?: string, model?: string) => {
+    if (!runId || !usage || !childUsage.record(runId, usage, taskId, model)) return;
+    if (runtime.ctx?.sessionManager?.getSessionId?.()) {
+      try { pi.appendEntry(USAGE_ENTRY, { runId, taskId, model, usage: structuredClone(usage) }); }
+      catch (err) { warn(runtime.ctx, `OMP: could not save token usage: ${failureDetail(err) ?? "unknown error"}`); }
+    }
+    requestFooterRender();
+  };
+  const restoreUsageFooter = (ctx: ExtensionContext) => {
+    childUsage.restore(ctx.sessionManager.getEntries());
+    requestFooterRender = installUsageFooter(ctx, childUsage, () => {
+      const live = new Map();
+      if (ctx.model) addModelUsage(live, `${ctx.model.provider}/${ctx.model.id}`, mainStreamingUsage);
+      for (const job of runtime.running)
+        for (const row of job.progress)
+          if (row.state === "running" && row.model && row.streamingUsage) addModelUsage(live, row.model, row.streamingUsage);
+      return live;
+    }, () => pi.getThinkingLevel(), () => footerModels);
+  };
   const liveCalls = new Set<string>();
   let acceptingWork = true;
   let dispatchRevision = 0;
@@ -157,6 +185,7 @@ export default function omp(pi: ExtensionAPI) {
       config: readConfig(),
       available: ctx.modelRegistry.getAvailable(),
     };
+    if (canCommit()) footerModels = Object.values(snapshot.config.models);
     const available = availableChildModels(ctx, snapshot.available);
     const byName = new Map(available.map((model) => [`${model.provider}/${model.id}`, model]));
     const configured = snapshot.config.models;
@@ -200,6 +229,7 @@ export default function omp(pi: ExtensionAPI) {
       configPath(),
       canCommit,
     );
+    if (canCommit()) { footerModels = Object.values(snapshot.config.models); requestFooterRender(); }
     if (canCommit() && changed.length)
       warn(
         ctx,
@@ -227,6 +257,7 @@ export default function omp(pi: ExtensionAPI) {
     }
     runtime.dirtyJobs.clear();
     refreshPinned();
+    requestFooterRender();
   };
   const setPinnedAvailability = (available: boolean) => {
     if (runtime.pinnedUiAvailable === available) return;
@@ -652,6 +683,7 @@ export default function omp(pi: ExtensionAPI) {
       animationFrame: 0,
     };
     bindContext(ctx);
+    const dcpSnapshot = discoverDcpTools(pi);
     calls.delete(callId);
     jobs.set(id, job);
     runtime.jobsByCall.set(callId, job);
@@ -684,6 +716,8 @@ export default function omp(pi: ExtensionAPI) {
       prepared.items,
       controller.signal,
       (progress) => {
+        if (job.session !== runtime.session) return;
+        for (const row of progress) recordUsage(row.runId, row.usage, row.taskId, row.model);
         job.progress = progress;
         repaint(job, runtime.ctx?.mode !== "tui");
       },
@@ -692,13 +726,16 @@ export default function omp(pi: ExtensionAPI) {
       (result, index) => {
         if (completed.has(index) || job.session !== runtime.session) return;
         completed.add(index);
+        recordUsage(result.runId, result.usage, result.taskId, result.model);
         if (kind === "council") return;
         pendingResults.push({ result, at: performance.now() });
         if (completed.size === prepared.items.length) flushResults();
         else job.deliveryTimer ??= setTimeout(flushResults, 50);
       },
+      dcpSnapshot,
     )
       .then((results) => {
+        if (job.session !== runtime.session) return;
         job.results = results;
         job.state = controller.signal.aborted
           ? "cancelled"
@@ -722,6 +759,7 @@ export default function omp(pi: ExtensionAPI) {
         deliver(job, `OMP background ${kind} ${job.state}. ${councilHeader}${summary}`);
       })
       .catch((err) => {
+        if (job.session !== runtime.session) return;
         flushResults();
         job.state = controller.signal.aborted ? "cancelled" : "failed";
         runtime.running.delete(job);
@@ -762,6 +800,7 @@ export default function omp(pi: ExtensionAPI) {
     mainGenerationMs = 0;
     mainTokenRate = undefined;
     lastRateStatusAt = 0;
+    mainStreamingUsage = emptyUsage();
   };
   const updateMainThroughput = (
     ctx: ExtensionContext,
@@ -785,6 +824,10 @@ export default function omp(pi: ExtensionAPI) {
     value: string,
     ctx: ExtensionCommandContext,
   ): Promise<void> {
+    if (id === "fast" && (value === "on" || value === "off")) {
+      await updateConfig((current) => ({ ...current, fast: value === "on" }));
+      return;
+    }
     if (id === "default" && isMainAgent(value)) {
       await updateConfig((current) => ({ ...current, defaultAgent: value }));
       role = value;
@@ -821,7 +864,7 @@ export default function omp(pi: ExtensionAPI) {
           );
         }
       }
-      await updateConfig((current) => {
+      const config = await updateConfig((current) => {
         const models = { ...current.models };
         if (model) models[name] = model;
         else delete models[name];
@@ -830,13 +873,15 @@ export default function omp(pi: ExtensionAPI) {
         else thinking[name] = thinkingLevel;
         return { ...current, models, thinking };
       });
+      footerModels = Object.values(config.models);
+      requestFooterRender();
       return;
     }
     throw new Error(`Invalid setting ${id}: ${value}`);
   }
 
   pi.registerCommand("omp", {
-    description: "Open default main agent, specialist model, and thinking settings",
+    description: "Open main agent, shared Fast mode, and specialist model/thinking settings",
     handler: async (args, ctx) => {
       if (args.trim()) {
         ctx.ui.notify("Enter /omp without arguments to open settings", "warning");
@@ -954,6 +999,7 @@ export default function omp(pi: ExtensionAPI) {
     runtime.pi = undefined;
     runtime.ctx = undefined;
     runtime.requestPinnedRender = undefined;
+    requestFooterRender = () => {};
     runtime.pinnedUiAvailable = false;
     for (const job of jobs.values()) job.invalidators.clear();
     jobs.clear();
@@ -980,11 +1026,15 @@ export default function omp(pi: ExtensionAPI) {
     if (session !== runtime.session) return;
     acceptingWork = true;
     bindContext(ctx);
+    restoreUsageFooter(ctx);
     refreshPinned();
     try {
-      role = readConfig().defaultAgent;
+      const config = readConfig();
+      role = config.defaultAgent;
+      footerModels = Object.values(config.models);
     } catch (err) {
       role = "orchestrator";
+      footerModels = [];
       warn(
         ctx,
         `OMP: failed to read ${configPath()}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1012,6 +1062,7 @@ export default function omp(pi: ExtensionAPI) {
     if (session !== runtime.session) return;
     acceptingWork = true;
     bindContext(ctx);
+    restoreUsageFooter(ctx);
     refreshPinned();
     status(ctx);
   });
@@ -1025,7 +1076,7 @@ export default function omp(pi: ExtensionAPI) {
       delete event.systemPromptOptions.sections.omp_roster;
       return;
     }
-    event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " For MCP access use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Direct MCP tools are unavailable; adapter tool descriptions may suggest calls that OMP blocks." : ""}`;
+    event.systemPromptOptions.sections.omp_role = `Active OMP main agent: ${role}. ${ROLES[role].prompt}${role === "orchestrator" ? " Prefer Pi's native MCP tools, including calls through codemode or tools loaded with tool_search. Use only permitted non-context7 server namespaces. Resource requests must name one permitted server explicitly. With a legacy adapter, use only server-scoped gateway calls such as mcp({server:'gh_grep',tool:'search',args:{query:'example'}}). Never use unscoped gateway calls, gateway search/describe/instructions modes, mcpScript, or the context7 server (including its namespace). Unattributed adapter direct tools are unavailable." : ""}`;
     event.systemPromptOptions.sections.omp_roster = `Specialists available with omp_delegate: ${ROLE_NAMES.filter(
       (name) => name !== "orchestrator" && name !== "council",
     )
@@ -1036,13 +1087,17 @@ export default function omp(pi: ExtensionAPI) {
   });
 
   pi.on("message_start", (event) => {
-    if (event.message.role === "assistant") mainMessageStartedAt = performance.now();
+    if (event.message.role === "assistant") {
+      mainMessageStartedAt = performance.now();
+      mainStreamingUsage = emptyUsage();
+    }
   });
 
   pi.on("message_update", (event, ctx) => {
     const partial =
       "partial" in event.assistantMessageEvent ? event.assistantMessageEvent.partial : undefined;
     const output = partial?.usage?.output;
+    if (partial?.usage) mainStreamingUsage = addUsage(emptyUsage(), partial.usage);
     if (
       mainMessageStartedAt !== undefined &&
       typeof output === "number" &&
@@ -1055,6 +1110,7 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.on("message_end", (event, ctx) => {
     if (event.message.role !== "assistant") return;
+    mainStreamingUsage = emptyUsage();
     const output = event.message.usage?.output;
     if (
       mainMessageStartedAt !== undefined &&
@@ -1071,6 +1127,7 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_delegate",
+    exposure: "model-only",
     label: "OMP delegate",
     renderShell: "self",
     description:
@@ -1154,6 +1211,7 @@ export default function omp(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "omp_council",
+    exposure: "model-only",
     label: "OMP council",
     renderShell: "self",
     description:

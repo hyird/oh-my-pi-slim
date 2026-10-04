@@ -10,15 +10,15 @@ import {
   SessionManager,
   SettingsManager,
   type ExtensionAPI,
+  type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createChildMcpExtension } from "../extensions/omp/child-mcp.ts";
-import { waitFor } from "../extensions/omp/wait-for.ts";
 
 let tmp = "";
 let originalAgentDir: string | undefined;
-const sessions: Array<{ dispose(): void }> = [];
+const sessions: AgentSession[] = [];
 const originalTestEnv: Record<string, string | undefined> = {};
 for (const key of [
   "OMP_NATIVE_MCP_CALL_LOG",
@@ -27,8 +27,11 @@ for (const key of [
   "OMP_NATIVE_MCP_STOPPED_LOG",
 ]) originalTestEnv[key] = process.env[key];
 
-afterEach(() => {
-  for (const session of sessions.splice(0)) session.dispose();
+afterEach(async () => {
+  for (const session of sessions.splice(0)) {
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    session.dispose();
+  }
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   for (const [key, value] of Object.entries(originalTestEnv)) {
@@ -73,7 +76,6 @@ function fakeAssistant(toolCall: boolean, options: { error?: boolean; direct?: b
 }
 
 async function setup(options: {
-  listDelayMs?: number;
   permissionBlocks?: boolean;
   directAttempt?: boolean;
   serverError?: boolean;
@@ -84,8 +86,10 @@ async function setup(options: {
   role?: string;
   cancelNested?: boolean;
   parallelCalls?: boolean;
+  connectionDelayMs?: number;
+  disabledServer?: boolean;
 } = {}) {
-  const { permissionBlocks = false, directAttempt = false, serverError = false, commandCollision = false, lateTargetReplacement, lateMcpCommand = false, unauthorizedNested = false, role = "librarian", cancelNested = false, parallelCalls = false } = options;
+  const { permissionBlocks = false, directAttempt = false, serverError = false, commandCollision = false, lateTargetReplacement, lateMcpCommand = false, unauthorizedNested = false, role = "librarian", cancelNested = false, parallelCalls = false, connectionDelayMs = 0, disabledServer = false } = options;
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-native-mcp-"));
   originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = tmp;
@@ -119,12 +123,16 @@ async function setup(options: {
   });
   let modelCalls = 0;
   const modelDeclarations: string[][] = [];
+  const discoverySections: string[] = [];
   runtime.registerProvider("omp-test", {
     name: "Offline fixture",
     api: "openai-completions",
     apiKey: "fixture-not-used",
     baseUrl: "http://127.0.0.1:9/model-not-used",
     streamSimple: (_model, context) => {
+      discoverySections.push(...context.messages.flatMap((message) =>
+        message.role === "system" ? [message.sections?.mcp_servers ?? ""] : [],
+      ));
       modelDeclarations.push(context.messages.flatMap((message) =>
         message.role === "system" ? (message.toolsAdded ?? []).map((tool) => tool.name) : [],
       ));
@@ -158,14 +166,15 @@ async function setup(options: {
     name: "gh_grep",
     source: fakeSource,
     config: {
+      enabled: !disabledServer,
       command: process.execPath,
       args: [fixtureServer],
       env: {
-        OMP_NATIVE_MCP_LIST_DELAY_MS: String(options.listDelayMs ?? 0),
         OMP_NATIVE_MCP_CALL_LOG: callLog,
         OMP_NATIVE_MCP_STARTED_LOG: starts,
         OMP_NATIVE_MCP_PROTOCOL_LOG: protocol,
         OMP_NATIVE_MCP_STOPPED_LOG: stops,
+        OMP_NATIVE_MCP_LIST_DELAY_MS: String(connectionDelayMs),
       },
       exposure: "hidden" as const,
       toolExposure: { "*": "hidden" as const, searchGitHub: "deferred" as const }
@@ -268,11 +277,17 @@ async function setup(options: {
   });
   sessions.push(session);
   await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
-  return { session, calls, results, modelDeclarations, extensionErrors, callLog, starts, stops, fakeSource, foreignTargetExecutions: () => foreignTargetExecutions, targetOwners, tmp };
+  return { session, calls, results, modelDeclarations, discoverySections, extensionErrors, callLog, starts, stops, protocol, fakeSource, foreignTargetExecutions: () => foreignTargetExecutions, targetOwners, tmp };
+}
+
+async function waitForNativeTarget(session: AgentSession) {
+  for (let i = 0; i < 200 && !session.getCallableToolNames().includes("mcp__gh_grep__searchGitHub"); i++)
+    await Bun.sleep(5);
+  expect(session.getCallableToolNames()).toContain("mcp__gh_grep__searchGitHub");
 }
 
 test("the first scoped gateway call waits for delayed native MCP tool discovery", async () => {
-  const h = await setup({ listDelayMs: 250 });
+  const h = await setup({ connectionDelayMs: 250 });
   await h.session.prompt("Search immediately while the MCP server is still starting");
   expect(h.extensionErrors).toEqual([]);
   expect(fs.existsSync(h.callLog)).toBe(true);
@@ -332,9 +347,7 @@ test("non-Librarian native child config stays empty and ignores dynamic server r
 test("direct target attempts cannot call the server", async () => {
   const h = await setup({ directAttempt: true });
   // Test policy rejection of a registered target, not a missing-tool error.
-  expect(await waitFor(() => h.session.getCallableToolNames().includes("mcp__gh_grep__searchGitHub"), {
-    timeoutMs: 2000,
-  })).toBe(true);
+  await waitForNativeTarget(h.session);
   await h.session.prompt("Try to call the MCP target directly");
   expect(h.session.getActiveToolNames()).not.toContain("mcp__gh_grep__searchGitHub");
   expect(h.session.getCallableToolNames()).toContain("mcp__gh_grep__searchGitHub");
@@ -344,9 +357,7 @@ test("direct target attempts cannot call the server", async () => {
 
 test("unauthorized nested callers cannot reach the exact native MCP target", async () => {
   const h = await setup({ unauthorizedNested: true });
-  expect(await waitFor(() => h.session.getCallableToolNames().includes("mcp__gh_grep__searchGitHub"), {
-    timeoutMs: 2000,
-  })).toBe(true);
+  await waitForNativeTarget(h.session);
   await h.session.prompt("Attempt a nested call without the gateway");
   expect(fs.existsSync(h.callLog)).toBe(false);
 });
@@ -382,6 +393,48 @@ test("gateway execution rejects a late foreign same-name MCP target", async () =
   expect(fs.existsSync(h.callLog)).toBe(false);
   expect(h.foreignTargetExecutions()).toBe(0);
 });
+
+test("the first scoped gateway call waits for deferred MCP tools without declaring discovery helpers", async () => {
+  const h = await setup({ connectionDelayMs: 250 });
+  expect(h.session.getCallableToolNames()).not.toContain("mcp__gh_grep__searchGitHub");
+  const prompt = h.session.prompt("Research before the MCP tools arrive");
+  for (let i = 0; i < 200 && !h.calls.some((call) => call.name === "mcp"); i++) await Bun.sleep(1);
+  expect(h.calls).toContainEqual({ name: "mcp", parentToolCallId: undefined });
+  expect(h.session.getCallableToolNames()).not.toContain("mcp__gh_grep__searchGitHub");
+  await prompt;
+  expect(h.extensionErrors).toEqual([]);
+  expect(fs.readFileSync(h.callLog, "utf8")).toContain('"name":"searchGitHub"');
+  expect(h.discoverySections.length).toBeGreaterThan(0);
+  expect(h.discoverySections.every((section) => section === "")).toBe(true);
+  expect(h.modelDeclarations.every((tools) => tools.includes("mcp")
+    && !tools.some((tool) => ["tool_search", "codemode", "mcp__gh_grep__searchGitHub"].includes(tool)))).toBe(true);
+});
+
+test("cancelling while MCP tools connect releases the gateway without a server call", async () => {
+  const h = await setup({ connectionDelayMs: 2_000 });
+  const prompt = h.session.prompt("Cancel before the MCP target registers").catch(() => undefined);
+  for (let i = 0; i < 200 && !h.calls.some((call) => call.name === "mcp"); i++) await Bun.sleep(1);
+  expect(h.calls).toContainEqual({ name: "mcp", parentToolCallId: undefined });
+  for (let i = 0; i < 200 && !(fs.existsSync(h.protocol) && fs.readFileSync(h.protocol, "utf8").includes("tools/list")); i++) await Bun.sleep(5);
+  expect(fs.readFileSync(h.protocol, "utf8")).toContain("tools/list");
+  expect(h.session.getCallableToolNames()).not.toContain("mcp__gh_grep__searchGitHub");
+  await h.session.abort();
+  await Promise.race([prompt, Bun.sleep(500).then(() => { throw new Error("connecting MCP gateway did not cancel promptly"); })]);
+  expect(fs.existsSync(h.callLog)).toBe(false);
+  await h.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+  // Pi closes an in-progress connection after its pending tools/list settles.
+  for (let i = 0; i < 600 && !fs.existsSync(h.stops); i++) await Bun.sleep(5);
+  expect(fs.readFileSync(h.stops, "utf8")).toContain("stopped");
+});
+
+test("an unavailable deferred MCP target fails within the gateway's connection deadline", async () => {
+  const h = await setup({ disabledServer: true });
+  await h.session.prompt("Try an unavailable MCP target");
+  expect(h.results).toContainEqual({ name: "mcp", parentToolCallId: undefined, isError: true });
+  expect(JSON.stringify(h.session.messages)).toContain("Native gh_grep target was not ready within 10 seconds");
+  expect(fs.existsSync(h.callLog)).toBe(false);
+  expect(fs.existsSync(h.starts)).toBe(false);
+}, 15_000);
 
 test("nested tool-call validation rejects a foreign target installed immediately before its hook", async () => {
   const h = await setup({ lateTargetReplacement: "nested" });

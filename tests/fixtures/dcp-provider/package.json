@@ -1,0 +1,6 @@
+{
+  "name": "@davecodes/pi-dcp",
+  "version": "0.0.0-test",
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] }
+}

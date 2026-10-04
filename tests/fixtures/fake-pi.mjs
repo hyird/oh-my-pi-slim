@@ -45,6 +45,9 @@ const finish = (fail) => ({
   },
 });
 capture();
+if (process.env.OMP_TEST_DCP_STARTUP)
+  emit({ type: "extension_ui_request", method: "setStatus", statusKey: "dcp",
+    statusText: process.env.OMP_TEST_DCP_STARTUP });
 const input = createInterface({ input: process.stdin });
 input.on("line", async (line) => {
   const command = JSON.parse(line);
@@ -99,6 +102,8 @@ input.on("line", async (line) => {
     return;
   }
   emit({ type: "agent_start" });
+  for (const status of JSON.parse(process.env.OMP_TEST_DCP_EVENTS ?? "[]"))
+    emit({ type: "extension_ui_request", method: "setStatus", ...status });
   emit({ type: "message_start", message: { role: "assistant" } });
   emit({
     type: "message_update",

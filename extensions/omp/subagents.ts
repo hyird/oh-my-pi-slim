@@ -12,6 +12,8 @@ import { availableChildModels } from "./models.ts";
 import { RpcWorker } from "./rpc-worker.ts";
 import { TaskSessions, resourceRevision, type TaskSession } from "./task-sessions.ts";
 import { failureDetail } from "./failure-detail.ts";
+import { mergeRoleTools, type DcpToolSnapshot } from "./dcp-tools.ts";
+import { addUsage, emptyUsage, nativeSessionUsage, usageDelta } from "./usage.ts";
 
 export interface Assignment {
   agent: Role;
@@ -40,6 +42,7 @@ export interface Result {
   taskId?: string;
   runId?: string;
   timings?: Timings;
+  dcpStatus?: string;
 }
 export interface AgentProgress {
   agent: Role;
@@ -65,6 +68,11 @@ export interface AgentProgress {
   lastEventAt?: number;
   /** Current run's reported token usage, including cache tokens. */
   totalTokens?: number;
+  /** Completed usage for this run; persisted separately from the streaming estimate. */
+  usage?: Usage;
+  streamingUsage?: Usage;
+  /** Latest estimate reported by this child's configured DCP extension. */
+  dcpStatus?: string;
   /** Wall-clock start for live display; elapsedMs freezes the duration once settled. */
   startedAt?: number;
   elapsedMs?: number;
@@ -117,6 +125,7 @@ const SIMPLIFY_SKILL_PATH = fileURLToPath(
   new URL("../../skills/simplify/SKILL.md", import.meta.url),
 );
 const CHILD_MCP_EXTENSION_PATH = fileURLToPath(new URL("./child-mcp.ts", import.meta.url));
+const FAST_MODE_EXTENSION_PATH = fileURLToPath(new URL("./fast-mode.ts", import.meta.url));
 
 export function queuedProgress(items: readonly Assignment[]): AgentProgress[] {
   return items.map(({ agent, task, taskId }) =>
@@ -158,15 +167,6 @@ export function editLineCounts(result: unknown): { added: number; removed: numbe
   }
   return { added, removed };
 }
-
-const emptyUsage = (): Usage => ({
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-});
 
 export interface ModelSnapshot {
   config: OmpConfig;
@@ -247,6 +247,7 @@ export async function runAgent(
   onActivity?: (snapshot: AgentProgress) => void,
   sessions?: TaskSessions,
   resourceSnapshot?: string,
+  dcpSnapshot: DcpToolSnapshot = { providers: [], tools: [], signature: "[]" },
 ): Promise<Result> {
   const { agent, task } = assignment;
   if (!isRole(agent) || !task.trim())
@@ -277,6 +278,7 @@ export async function runAgent(
     thinking,
     prompt,
     ROLES[agent].tools,
+    dcpSnapshot.signature,
     resourceSnapshot ?? resourceRevision(ctx.cwd),
   ]);
   const lease: TaskSession = ownedSessions.claim(assignment, taskScope(ctx), signature);
@@ -342,6 +344,25 @@ export async function runAgent(
   const usage = emptyUsage();
   const timings: Timings = { startupMs: 0, generationMs: 0, toolMs: 0, totalMs: 0 };
   let worker: RpcWorker | undefined;
+  let baseline: Usage | undefined;
+  const publishUsage = () => {
+    progress.usage = structuredClone(usage);
+    progress.streamingUsage = undefined;
+    progress.totalTokens = usage.totalTokens;
+    publish();
+  };
+  const reconcileUsage = () => {
+    const native = nativeSessionUsage(worker?.sessionFile);
+    if (!native || !baseline) return;
+    const delta = usageDelta(native, baseline);
+    // Keep reported events when a cancelled/failed process did not flush its last message.
+    for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const)
+      usage[key] = Math.max(usage[key], delta[key]);
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const)
+      usage.cost[key] = Math.max(usage.cost[key], delta.cost[key]);
+    addUsage(usage, undefined);
+    publishUsage();
+  };
   let conversation: ReturnType<typeof startConversation> | undefined;
   let recordingFailed = false;
   let recordingError: string | undefined;
@@ -381,8 +402,12 @@ export async function runAgent(
             : prompt,
           { mode: 0o600 },
         );
-        const tools: string[] = [...ROLES[agent].tools];
-        if (agent === "librarian") tools.push("mcp", "mcp__gh_grep__searchGitHub");
+        const tools = mergeRoleTools(
+          agent === "librarian"
+            ? [...ROLES[agent].tools, "mcp", "mcp__gh_grep__searchGitHub"]
+            : ROLES[agent].tools,
+          dcpSnapshot.tools,
+        );
         const args = [
           "--mode",
           "rpc",
@@ -403,6 +428,9 @@ export async function runAgent(
           tools.join(","),
           "--extension",
           CHILD_MCP_EXTENSION_PATH,
+          "--extension",
+          FAST_MODE_EXTENSION_PATH,
+          ...dcpSnapshot.providers.flatMap((provider) => ["--extension", provider.path]),
           "--append-system-prompt",
           promptPath,
         ];
@@ -416,11 +444,13 @@ export async function runAgent(
             ...process.env,
             PI_OMP_CHILD: "1",
             PI_OMP_CHILD_ROLE: agent,
+            PI_OMP_DCP_TOOLS: JSON.stringify(dcpSnapshot.providers),
           },
           cleanup,
           undefined,
           undefined,
           CHILD_MCP_EXTENSION_PATH,
+          dcpSnapshot.providers.map((provider) => provider.path),
         );
       } catch (err) {
         await cleanup();
@@ -437,10 +467,15 @@ export async function runAgent(
         throw new Error("Specialist cancelled");
       }
       await worker.ready;
+      baseline = nativeSessionUsage(worker.sessionFile) ?? emptyUsage();
     } finally {
       signal?.removeEventListener("abort", abortStartup);
     }
     timings.startupMs = performance.now() - started;
+    if (worker.dcpStatus !== progress.dcpStatus) {
+      progress.dcpStatus = worker.dcpStatus;
+      publish();
+    }
     // Dynamic task/language guidance stays outside the stable role system prompt.
     // A leading slash in task text must not execute a Pi slash/skill command.
     const message = `${assignment.instructions ? assignment.instructions + "\n\n" : ""}Assigned task:\n${task}`;
@@ -454,6 +489,12 @@ export async function runAgent(
       }
       replies.record(event);
       progress.replyText = replies.text();
+      if (event.type === "extension_ui_request" && event.method === "setStatus" &&
+        event.statusKey === "dcp") {
+        progress.dcpStatus = worker!.dcpStatus;
+        publish();
+        return;
+      }
       if (event.type === "auto_retry_start") {
         retryFailed = false;
         const attempt = Number.isSafeInteger(event.attempt) ? Math.max(0, event.attempt) : 0;
@@ -490,6 +531,7 @@ export async function runAgent(
         progress.phase = "model";
         progress.retry = undefined;
         progress.totalTokens = usage.totalTokens;
+        progress.streamingUsage = undefined;
         publish();
         return;
       }
@@ -501,6 +543,7 @@ export async function runAgent(
         const partialUsage = event.message?.usage ?? update?.partial?.usage ?? event.usage;
         if (Number.isFinite(partialUsage?.totalTokens) && partialUsage.totalTokens >= 0) {
           progress.totalTokens = usage.totalTokens + partialUsage.totalTokens;
+          progress.streamingUsage = addUsage(emptyUsage(), partialUsage);
           changed = true;
         }
         const partialOutput = event.usage?.output ?? update?.partial?.usage?.output;
@@ -565,6 +608,11 @@ export async function runAgent(
         publish();
         return;
       }
+      if (event.type === "message_end" && event.message?.role === "toolResult" && event.message.usage) {
+        addUsage(usage, event.message.usage);
+        publishUsage();
+        return;
+      }
       if (event.type !== "message_end" || event.message?.role !== "assistant") return;
       const msg = event.message;
       finalStop = msg.stopReason;
@@ -583,10 +631,7 @@ export async function runAgent(
       streamingText = "";
       const u = msg.usage;
       if (u) {
-        for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const)
-          usage[key] += u[key] ?? 0;
-        for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const)
-          usage.cost[key] += u.cost?.[key] ?? 0;
+        addUsage(usage, u);
         if (Number.isFinite(u.output) && u.output > 0 && messageStartedAt !== undefined) {
           completedOutputTokens += u.output;
           timings.generationMs += Math.max(1, performance.now() - messageStartedAt);
@@ -594,9 +639,9 @@ export async function runAgent(
         }
       }
       messageStartedAt = undefined;
-      progress.totalTokens = usage.totalTokens;
-      publish();
+      publishUsage();
     });
+    reconcileUsage();
     if (!output || finalStop !== "stop") {
       throw new Error(failureReason ?? (output ? `Assistant stopped: ${finalStop || "unknown"}` : "Assistant returned no output"));
     }
@@ -612,9 +657,11 @@ export async function runAgent(
     progress.state = "done";
     progress.elapsedMs = timings.totalMs;
     report("Work completed");
-    return { agent, model, ok: true, output, ...(outputTruncated ? { outputTruncated: true } : {}), usage, taskId, runId, timings };
+    return { agent, model, ok: true, output, ...(outputTruncated ? { outputTruncated: true } : {}), usage, taskId, runId, timings, dcpStatus: progress.dcpStatus };
   } catch (err) {
     await worker?.stop();
+    reconcileUsage();
+    publishUsage();
     const cancelled = signal?.aborted;
     const thrownDetail = failureDetail(err);
     const modelDetail = failureDetail(failureReason);
@@ -655,6 +702,7 @@ export async function runAgent(
       taskId,
       runId,
       timings,
+      dcpStatus: progress.dcpStatus,
     };
   } finally {
     if (!sessions) await ownedSessions.clear();
@@ -668,6 +716,7 @@ export async function runAssignments(
   modelOverride?: string | ReadonlyMap<Role, AgentLaunch>,
   sessions?: TaskSessions,
   onComplete?: (result: Result, index: number) => void,
+  dcpSnapshot: DcpToolSnapshot = { providers: [], tools: [], signature: "[]" },
 ): Promise<Result[]> {
   const launches = typeof modelOverride === "object" ? modelOverride : undefined;
   const config = launches || signal?.aborted ? undefined : readConfig();
@@ -738,12 +787,14 @@ export async function runAssignments(
             (snapshot) => {
               const important =
                 snapshot.activities !== progress[index].activities ||
-                snapshot.state !== progress[index].state;
+                snapshot.state !== progress[index].state ||
+                snapshot.usage !== progress[index].usage;
               progress[index] = snapshot;
               publish(important);
             },
             sessions,
             batchResources(),
+            dcpSnapshot,
           );
         } catch (err) {
           results[index] = {

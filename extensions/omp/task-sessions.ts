@@ -21,6 +21,8 @@ export interface TaskSession {
   discardRecordings: Set<() => void>;
 }
 
+export type SavedTaskSession = Pick<TaskSession, "taskId" | "agent" | "scope" | "sessionFile">;
+
 function statRevision(file: string): string {
   try {
     const stat = fs.statSync(file, { bigint: true });

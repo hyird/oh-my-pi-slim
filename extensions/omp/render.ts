@@ -66,14 +66,34 @@ function formatDuration(ms: number): string {
 }
 
 function taskUsageLabels(item?: AgentProgress, final?: Result): string[] {
-  const labels: string[] = [];
   const elapsed = item?.elapsedMs ?? final?.timings?.totalMs ??
     (item?.state === "running" && item.startedAt !== undefined ? Date.now() - item.startedAt : undefined);
-  if (elapsed !== undefined && Number.isFinite(elapsed)) labels.push(formatDuration(elapsed));
   const tokens = final?.usage?.totalTokens ?? item?.totalTokens;
-  if (tokens !== undefined && Number.isFinite(tokens) && tokens >= 0)
-    labels.push(`${formatTokens(tokens)} tokens`);
-  return labels;
+  const dcp = item ? item.dcpStatus : final?.dcpStatus;
+  return [
+    elapsed !== undefined && Number.isFinite(elapsed) ? formatDuration(elapsed) : "",
+    tokens !== undefined && Number.isFinite(tokens) && tokens >= 0 ? `${formatTokens(tokens)} tokens` : "",
+    dcp ?? "",
+  ];
+}
+
+function padColumn(text: string, width: number, right = false): string {
+  const spaces = " ".repeat(Math.max(0, width - visibleWidth(text)));
+  return right ? spaces + text : text + spaces;
+}
+
+type RowMetrics = { item?: AgentProgress; final?: Result; throughput?: number };
+function metricWidths(rows: readonly RowMetrics[]): number[] {
+  const widths = [0, 0, 0, 0];
+  for (const row of rows) {
+    const [elapsed, tokens, dcp] = taskUsageLabels(row.item, row.final);
+    const rate = row.throughput !== undefined && Number.isFinite(row.throughput) && row.throughput > 0
+      ? formatTokenRate(row.throughput) : "";
+    [elapsed!, tokens!, rate, dcp!].forEach((label, i) => {
+      widths[i] = Math.max(widths[i]!, visibleWidth(label));
+    });
+  }
+  return widths;
 }
 
 function boundedOutput(value: string): string {
@@ -123,22 +143,22 @@ function taskStatusLabels(item: AgentProgress | undefined, state: AgentProgress[
   const lastEventAt = item.lastEventAt;
   if (typeof lastEventAt === "number" && Number.isFinite(lastEventAt)) {
     const quietMinutes = Math.floor(Math.max(0, Date.now() - lastEventAt) / 60_000);
-    if (quietMinutes > 0) labels.push(`no events ${quietMinutes}m`);
+    if (quietMinutes > 0) labels.push(`quiet:${quietMinutes}m`);
   }
   // Only fixed OMP phases are rendered. Activity text can contain tool paths or
   // provider data, so it must never be used as a task-row label.
   switch (item.phase) {
     case "starting": labels.push("starting"); break;
-    case "model": labels.push("model working"); break;
-    case "tool": labels.push("tool running"); break;
+    case "model": labels.push("working"); break;
+    case "tool": labels.push("tool"); break;
     case "retrying": {
       const attempt = item.retry?.attempt;
       const max = item.retry?.max;
       labels.push(Number.isSafeInteger(attempt) && Number.isSafeInteger(max)
-        ? `retrying ${attempt}/${max}` : "retrying");
+        ? `retrying:${attempt}/${max}` : "retrying");
       break;
     }
-    case "retry-failed": labels.push("request failed"); break;
+    case "retry-failed": labels.push("error"); break;
     case "settling": labels.push("finishing"); break;
   }
   return labels;
@@ -185,6 +205,7 @@ function taskRow(
   throughput?: number,
   statusLabels?: () => readonly string[],
   usageLabels?: () => readonly string[],
+  columnWidths?: () => readonly number[],
 ): Component {
   const currentLine = () => (typeof line === "function" ? line() : line);
   let previousLine = currentLine();
@@ -199,22 +220,29 @@ function taskRow(
     const range = interaction?.state.expanded?.has(index)
       ? interaction.state.inlineRange
       : undefined;
+    const [elapsed = "", tokens = "", dcp = ""] = usageLabels?.() ?? [];
+    const rate = throughput !== undefined && Number.isFinite(throughput) && throughput > 0
+      ? formatTokenRate(throughput) : "";
+    const columns = columnWidths?.();
+    const metrics = [elapsed, tokens, rate, dcp];
+    const statuses = statusLabels?.() ?? [];
+    for (let i = 0; i < metrics.length; i++) {
+      const label = metrics[i]!;
+      const size = columns?.[i] ?? visibleWidth(label);
+      if (!size) continue;
+      if (!metrics.slice(i).some(Boolean) && !statuses.length) break;
+      const suffix = ` · ${padColumn(label, size, i < 3)}`;
+      // Keep later columns from sliding into an earlier column's position.
+      if (visibleWidth(content) + visibleWidth(suffix) > width) break;
+      content += theme.fg("muted", suffix);
+    }
+    for (const label of statuses) {
+      const suffix = ` · ${label}`;
+      if (visibleWidth(content) + visibleWidth(suffix) <= width)
+        content += theme.fg("muted", suffix);
+    }
     if (range && visibleWidth(content) + visibleWidth(range) <= width)
       content += theme.fg("muted", range);
-    for (const label of usageLabels?.() ?? []) {
-      const suffix = ` · ${label}`;
-      if (visibleWidth(content) + visibleWidth(suffix) <= width)
-        content += theme.fg("muted", suffix);
-    }
-    if (throughput !== undefined && Number.isFinite(throughput) && throughput > 0) {
-      const rate = ` · ${formatTokenRate(throughput)}`;
-      if (visibleWidth(content) + visibleWidth(rate) <= width) content += theme.fg("muted", rate);
-    }
-    for (const label of statusLabels?.() ?? []) {
-      const suffix = ` · ${label}`;
-      if (visibleWidth(content) + visibleWidth(suffix) <= width)
-        content += theme.fg("muted", suffix);
-    }
     return content === base ? text.render(width) : new TruncatedText(content).render(width);
   };
   if (!interaction)
@@ -337,6 +365,8 @@ export function renderPinnedOmpOverview(
     });
   });
   const done = rows.filter((row) => row.status === "done").length;
+  const stateWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.status)));
+  const nameWidth = Math.max(0, ...rows.map((row) => visibleWidth(taskName(row.agent, row.index, row.count))));
   const failed = rows.filter((row) => row.status === "failed").length;
   const cancelled = rows.filter((row) => row.status === "cancelled").length;
   const queued = rows.filter((row) => row.status === "queued").length;
@@ -380,11 +410,12 @@ export function renderPinnedOmpOverview(
     view.addChild(taskRow(() => {
       const { icon, name, color } = stateInfo(row.status, row.frame());
       const expanded = row.state.expanded?.has(row.index) ?? false;
-      return theme.fg(color, `${icon} ${name}`) + theme.fg("muted", " · ") +
-        theme.fg("accent", taskName(row.agent, row.index, row.count)) +
+      return theme.fg(color, `${icon} ${padColumn(name, stateWidth)}`) + theme.fg("muted", " · ") +
+        theme.fg("accent", padColumn(taskName(row.agent, row.index, row.count), nameWidth)) +
         theme.fg("muted", expanded ? " ▾" : " ▸");
     }, row.index, theme, interaction, row.throughput,
-    () => taskStatusLabels(row.item, row.status), () => taskUsageLabels(row.item, row.final)));
+    () => taskStatusLabels(row.item, row.status), () => taskUsageLabels(row.item, row.final),
+    () => metricWidths(rows)));
   }
   return clearHoverOutsideTasks(view, states, invalidate);
 }
@@ -633,7 +664,7 @@ export function renderOmpResult(
   });
   if (!count) return view;
 
-  for (let index = 0; index < count; index++) {
+  const rows = Array.from({ length: count }, (_, index) => {
     const item = progress[index];
     const final = results[index];
     const state =
@@ -645,15 +676,20 @@ export function renderOmpResult(
             : "failed"
         : (item?.state ?? "queued");
     const agent = item?.agent ?? final?.agent ?? "agent";
+    return { item, final, state, agent, index, throughput: item?.tokensPerSecond };
+  });
+  const stateWidth = Math.max(...rows.map((row) => visibleWidth(row.state)));
+  const nameWidth = Math.max(...rows.map((row) => visibleWidth(taskName(row.agent, row.index, count))));
+  for (const { item, final, state, agent, index } of rows) {
     const expanded = interaction?.state.expanded?.has(index) ?? false;
     view.addChild(
       taskRow(
         () => {
           const { icon, name, color } = stateInfo(state, frame());
           return (
-            theme.fg(color, `${icon} ${name}`) +
+            theme.fg(color, `${icon} ${padColumn(name, stateWidth)}`) +
             theme.fg("muted", " · ") +
-            theme.fg("accent", taskName(agent, index, count)) +
+            theme.fg("accent", padColumn(taskName(agent, index, count), nameWidth)) +
             (interaction ? theme.fg("muted", expanded ? " ▾" : " ▸") : "")
           );
         },
@@ -663,6 +699,7 @@ export function renderOmpResult(
         item?.tokensPerSecond,
         () => taskStatusLabels(item, state),
         () => taskUsageLabels(item, final),
+        () => metricWidths(rows),
       ),
     );
     if (expanded && showDetails)

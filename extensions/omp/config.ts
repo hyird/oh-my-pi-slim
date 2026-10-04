@@ -10,6 +10,7 @@ export const isThinkingLevel = (value: string): value is ThinkingLevel =>
 
 export interface OmpConfig {
   defaultAgent: MainAgent;
+  fast: boolean;
   models: Partial<Record<Role, string>>;
   thinking: Partial<Record<Role, ThinkingLevel>>;
 }
@@ -17,12 +18,13 @@ export interface OmpConfig {
 /** Factory settings for a new OMP install. Saved per-role choices override these. */
 export const DEFAULT_CONFIG: OmpConfig = {
   defaultAgent: "orchestrator",
+  fast: false,
   models: {
-    oracle: "openai-codex/gpt-6-astra",
-    librarian: "openai-codex/gpt-6-luna",
-    explorer: "openai-codex/gpt-6-luna",
-    designer: "openai-codex/gpt-6-luna",
-    fixer: "openai-codex/gpt-6-luna",
+    oracle: "openai/gpt-6-astra",
+    librarian: "openai/gpt-6-luna",
+    explorer: "openai/gpt-6-luna",
+    designer: "openai/gpt-6-luna",
+    fixer: "openai/gpt-6-luna",
   },
   thinking: {
     oracle: "high",
@@ -50,6 +52,8 @@ export function parseConfig(raw: unknown): OmpConfig {
   if (typeof requestedDefault !== "string") throw new Error("Invalid defaultAgent");
   if (!isMainAgent(requestedDefault)) throw new Error("defaultAgent must be a main agent");
   const defaultAgent: MainAgent = requestedDefault;
+  const fast = value.fast === undefined ? false : value.fast;
+  if (typeof fast !== "boolean") throw new Error("fast must be a boolean");
   const models = value.models ?? {};
   if (!models || typeof models !== "object" || Array.isArray(models))
     throw new Error("models must be an object");
@@ -84,6 +88,7 @@ export function parseConfig(raw: unknown): OmpConfig {
   }
   return {
     defaultAgent,
+    fast,
     models: validated,
     thinking: validatedThinking,
   };
@@ -93,6 +98,7 @@ export function readConfig(file = configPath()): OmpConfig {
   if (!fs.existsSync(file))
     return {
       defaultAgent: DEFAULT_CONFIG.defaultAgent,
+      fast: DEFAULT_CONFIG.fast,
       models: { ...DEFAULT_CONFIG.models },
       thinking: { ...DEFAULT_CONFIG.thinking },
     };

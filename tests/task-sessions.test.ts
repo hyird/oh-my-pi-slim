@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { formatResults, runAgent, taskScope, type AgentProgress } from "../extensions/omp/subagents.ts";
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
 import { RpcWorker } from "../extensions/omp/rpc-worker.ts";
+import type { DcpToolSnapshot } from "../extensions/omp/dcp-tools.ts";
 
 const keys = [
   "PI_CODING_AGENT_DIR",
@@ -19,6 +20,8 @@ const keys = [
   "OMP_TEST_FAIL",
   "OMP_TEST_LENGTH",
   "OMP_TEST_OUTPUT",
+  "OMP_TEST_DCP_STARTUP",
+  "OMP_TEST_DCP_EVENTS",
 ] as const;
 let saved: Array<string | undefined>;
 let argv: string;
@@ -32,7 +35,8 @@ const run = (
   signal?: AbortSignal,
   activity?: (row: AgentProgress) => void,
   launch = { model: "test/model", thinking: "low" as const },
-) => runAgent(ctx, { agent: "fixer", task, taskId }, signal, launch, activity, sessions);
+  dcpSnapshot?: DcpToolSnapshot,
+) => runAgent(ctx, { agent: "fixer", task, taskId }, signal, launch, activity, sessions, undefined, dcpSnapshot);
 
 beforeEach(() => {
   saved = keys.map((key) => process.env[key]);
@@ -93,6 +97,40 @@ test("Oracle starts with the bundled simplify skill resolved independently of cw
   expect(fs.existsSync(args[skillArg + 1]!)).toBe(true);
 });
 
+test("DCP tools and their extension are passed to children, and loadout changes rebuild workers", async () => {
+  const providerPath = path.join(root, "dcp.ts");
+  fs.writeFileSync(providerPath, "export default () => {};\\n");
+  const firstSnapshot: DcpToolSnapshot = {
+    providers: [{ path: providerPath, tools: ["compress_v2", "prune_context"] }],
+    tools: ["compress_v2", "prune_context"],
+    signature: JSON.stringify([{ path: providerPath, tools: ["compress_v2", "prune_context"] }]),
+  };
+  const first = await run("first", undefined, undefined, undefined, undefined, firstSnapshot);
+  const initial = capture();
+  const firstTools = initial.args[initial.args.indexOf("--tools") + 1];
+  expect(firstTools.split(",")).toContain("compress_v2");
+  expect(firstTools.split(",")).toContain("prune_context");
+  expect(initial.args.slice(initial.args.indexOf("--extension") + 1)).toContain(providerPath);
+
+  const changed: DcpToolSnapshot = {
+    providers: [{ path: providerPath, tools: ["compress_v2", "new_tool"] }],
+    tools: ["compress_v2", "new_tool"],
+    signature: JSON.stringify([{ path: providerPath, tools: ["compress_v2", "new_tool"] }]),
+  };
+  await run("continue with changed DCP", first.taskId, undefined, undefined, undefined, changed);
+  expect(capture().pid).not.toBe(initial.pid);
+  expect(capture().count).toBe(2);
+  expect(capture().args[capture().args.indexOf("--tools") + 1].split(",")).toContain("new_tool");
+
+  const removed: DcpToolSnapshot = { providers: [], tools: [], signature: "[]" };
+  await run("continue after DCP removal", first.taskId, undefined, undefined, undefined, removed);
+  expect(capture().pid).not.toBe(initial.pid);
+  expect(capture().count).toBe(3);
+  const removedTools = capture().args[capture().args.indexOf("--tools") + 1].split(",");
+  expect(removedTools).not.toContain("compress_v2");
+  expect(removedTools).not.toContain("new_tool");
+});
+
 test("same task resumes in the same process, while independent tasks have separate context", async () => {
   const first = await run("first");
   const initial = capture();
@@ -106,6 +144,35 @@ test("same task resumes in the same process, while independent tasks have separa
   expect(independent.taskId).not.toBe(first.taskId);
   expect(capture().pid).not.toBe(initial.pid);
   expect(capture().count).toBe(1);
+});
+
+test("DCP startup estimates survive readiness, resume, and final settlement", async () => {
+  process.env.OMP_TEST_DCP_STARTUP = "✂️ DCP: ~683 tokens saved";
+  const rows: AgentProgress[] = [];
+  const first = await run("first", undefined, undefined, (row) => rows.push(row));
+  expect(first.dcpStatus).toBe("DCP: ~683");
+  expect(rows.some((row) => row.phase === "starting" && row.dcpStatus === "DCP: ~683")).toBe(true);
+  expect(rows.at(-1)?.dcpStatus).toBe("DCP: ~683");
+  const resumed = await run("follow-up", first.taskId);
+  expect(resumed.dcpStatus).toBe("DCP: ~683");
+  delete process.env.OMP_TEST_DCP_STARTUP;
+  const separate = await run("independent without DCP");
+  expect(separate.dcpStatus).toBeUndefined();
+});
+
+test.each([false, true])("child DCP updates are isolated and cleared when requested: %s", async (clear) => {
+  process.env.OMP_TEST_DCP_EVENTS = JSON.stringify([
+    { statusKey: "dcp", statusText: "\u001b[31m✂️ DCP: ~1.2k tokens saved · SECRET_EXTENSION_TEXT\u001b[0m" },
+    { statusKey: "other", statusText: "DCP: ~999" },
+    ...(clear ? [{ statusKey: "dcp" }] : []),
+  ]);
+  const rows: AgentProgress[] = [];
+  const result = await run("DCP update", undefined, undefined, (row) => rows.push(row));
+  expect(result.ok).toBe(true);
+  expect(rows.some((row) => row.dcpStatus === "DCP: ~1.2k")).toBe(true);
+  expect(result.dcpStatus).toBe(clear ? undefined : "DCP: ~1.2k");
+  expect(rows.at(-1)?.dcpStatus).toBe(result.dcpStatus);
+  expect(rows.every((row) => !row.dcpStatus?.includes("SECRET") && !row.dcpStatus?.includes("999"))).toBe(true);
 });
 
 test("a completed result does not wait for process shutdown", async () => {

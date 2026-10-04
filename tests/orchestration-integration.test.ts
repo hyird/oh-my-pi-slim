@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import omp from "../extensions/omp/index.ts";
 import ompEntry from "../extensions/omp/entry.ts";
-import { initTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { initTheme, withFileMutationQueue, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   configPath,
   DEFAULT_CONFIG,
@@ -18,6 +18,7 @@ import {
   formatResults,
   queuedProgress,
   resolveModel,
+  taskScope,
   runAgent,
   runAssignments,
   type AgentProgress,
@@ -42,6 +43,7 @@ import {
 import { startConversation } from "../extensions/omp/transcript.ts";
 import { TaskSessions } from "../extensions/omp/task-sessions.ts";
 import { RpcWorker } from "../extensions/omp/rpc-worker.ts";
+import { ChildUsageLedger, USAGE_ENTRY, addUsage, emptyUsage } from "../extensions/omp/usage.ts";
 
 const savedDir = process.env.PI_CODING_AGENT_DIR;
 let tmp: string;
@@ -133,7 +135,7 @@ test.each(["input", "abort", "shutdown"])(
   },
 );
 
-function harness() {
+function harness(recovery?: { id: string; branch?: any[]; manager?: SessionManager; queueOnly?: boolean }) {
   const commands: Record<string, any> = {};
   const shortcuts: Record<string, any> = {};
   const tools: Record<string, any> = {};
@@ -142,7 +144,8 @@ function harness() {
   const sentMessages: Array<{ message: any; options: any }> = [];
   const selected: string[] = [];
   const modelCalls: any[] = [];
-  const branch: any[] = [
+  const footers: any[] = [];
+  const branch: any[] = recovery?.branch ?? [
     {
       type: "message",
       message: { role: "user", content: [{ type: "text", text: "请用中文处理这个任务" }] },
@@ -160,13 +163,16 @@ function harness() {
         throw new Error("Dispatch must not call the main model");
       },
     },
-    sessionManager: { getBranch: () => branch },
+    sessionManager: recovery?.manager ?? { getBranch: () => branch,
+      getEntries: () => branch,
+      ...(recovery ? { getSessionId: () => recovery.id } : {}) },
     isProjectTrusted: () => false,
     isIdle: () => true,
     ui: {
       notify: (text: string) => notifications.push(text),
       setStatus: () => {},
       setWidget: () => {},
+      setFooter: (factory: any) => footers.push(factory),
       select: async () => undefined,
       input: async () => undefined,
     },
@@ -183,6 +189,8 @@ function harness() {
     },
     sendMessage: (message: any, options: any) => {
       sentMessages.push({ message, options });
+      if (recovery?.manager && !recovery.queueOnly) recovery.manager.appendMessage({ ...message, role: "custom", timestamp: Date.now() });
+      else if (recovery && !recovery.queueOnly) branch.push({ type: "message", message: { ...message, role: "custom" } });
     },
     on: (name: string, handler: any) => {
       handlers[name] = handler;
@@ -192,9 +200,12 @@ function harness() {
       ctx.model = model;
       return true;
     },
-    appendEntry: () => {
+    appendEntry: (customType: string, data: unknown) => {
+      if (recovery?.manager) { recovery.manager.appendCustomEntry(customType, structuredClone(data)); return; }
+      if (recovery) { branch.push({ type: "custom", customType, data: structuredClone(data) }); return; }
       throw new Error("/omp must not modify session state");
     },
+    getThinkingLevel: () => ctx.thinkingLevel ?? "off",
   };
   omp(pi);
   const h = {
@@ -207,6 +218,7 @@ function harness() {
     sentMessages,
     selected,
     modelCalls,
+    footers,
     branch,
   };
   liveHarnesses.push(h);
@@ -220,6 +232,124 @@ async function waitFor(check: () => boolean | Promise<boolean>, attempts = 50) {
   }
   expect(await check()).toBe(true);
 }
+
+test("OMP replaces the native footer and retains every delegate, Council and continuation run across reload", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  const manager = SessionManager.inMemory(tmp);
+  manager.appendUsage("main", "openai-codex", "gpt-5.5", addUsage(emptyUsage(), { input: 7, output: 3 }));
+  fs.writeFileSync(configPath(), JSON.stringify({ models: { fixer: "openai-codex/gpt-5.3-codex-spark" } }));
+  const makeFooter = (h: ReturnType<typeof harness>) => h.footers.at(-1)(
+    { requestRender() {} }, { fg: (_: string, text: string) => text },
+    { onBranchChange: () => () => {}, getGitBranch: () => null, getAvailableProviderCount: () => 1,
+      getExtensionStatuses: () => new Map([["quota", "Quota: 80%"]]) },
+  );
+  try {
+    const h = harness({ id: manager.getSessionId(), manager });
+    h.ctx.getContextUsage = () => undefined;
+    h.ctx.model = { ...h.ctx.model, reasoning: true };
+    h.ctx.thinkingLevel = "high";
+    await h.handlers.session_start({}, h.ctx);
+    expect(h.footers).toHaveLength(1);
+    const footer = makeFooter(h);
+    expect(footer.render(160)[0]).toEndWith("gpt-5.5 • high");
+    h.ctx.thinkingLevel = "xhigh";
+    expect(footer.render(160)[0]).toEndWith("gpt-5.5 • xhigh");
+    expect(footer.render(160)[1]).toContain("gpt-5.5 10");
+    expect(footer.render(160)[1]).toContain("gpt-5.3-codex-spark 0");
+    await h.tools.omp_delegate.execute("tokens", { tasks: [
+      { agent: "explorer", task: "first" }, { agent: "fixer", task: "second" },
+    ] }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    expect(footer.render(160)[1]).toContain("Σ30");
+    expect(footer.render(160)[1]).toContain("gpt-5.5 20");
+    expect(footer.render(160)[1]).toContain("gpt-5.3-codex-spark 10");
+    await h.tools.omp_council.execute("review-tokens", { question: "review" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 2);
+    expect(footer.render(160)[1]).toContain("Σ60");
+    // Parallel completion order is not task order: choose Explorer's model,
+    // rather than accidentally continuing the faster Fixer with the wrong role.
+    const saved = manager.getEntries().find((entry: any) => entry.customType === USAGE_ENTRY &&
+      entry.data.taskId && entry.data.model === "openai-codex/gpt-5.5") as any;
+    await h.tools.omp_delegate.execute("continue-tokens", {
+      agent: "explorer", taskId: saved.data.taskId, task: "continue",
+    }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 3);
+    expect(footer.render(160)[1]).toContain("Σ70");
+    await h.handlers.session_shutdown({}, h.ctx);
+    const resumed = harness({ id: manager.getSessionId(), manager });
+    resumed.ctx.getContextUsage = () => undefined;
+    resumed.ctx.model = { ...resumed.ctx.model, reasoning: true };
+    resumed.ctx.thinkingLevel = "xhigh";
+    await resumed.handlers.session_start({}, resumed.ctx);
+    const lines = makeFooter(resumed).render(160);
+    expect(lines[0]).toEndWith("gpt-5.5 • xhigh");
+    expect(lines.filter((line: string) => line.includes("Σ"))).toHaveLength(1);
+    expect(lines[1]).toContain("Σ70");
+    expect(lines[1]).toContain("gpt-5.5 60");
+    expect(lines[1]).not.toMatch(/↑|↓|ctx|CTX/);
+    expect(lines[2]).toBe("Quota: 80%");
+    expect(resumed.sentMessages).toHaveLength(0);
+  } finally { process.argv[1] = argv; }
+});
+
+test.each(["retry", "failure", "cancel"])("saved footer totals retain paid child usage after %s", async (kind) => {
+  const argv = process.argv[1];
+  const retry = process.env.OMP_TEST_RETRY;
+  const fail = process.env.OMP_TEST_FAIL;
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  if (kind === "failure") process.env.OMP_TEST_FAIL = "1";
+  else process.env.OMP_TEST_RETRY = "1";
+  try {
+    const h = harness({ id: `usage-${kind}` });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("usage", { agent: "fixer", task: "work" }, undefined, undefined, h.ctx);
+    if (kind === "cancel") {
+      await waitFor(() => h.branch.some((entry) => entry.customType === USAGE_ENTRY && entry.data.usage.totalTokens === 10));
+      await h.handlers.session_shutdown({}, h.ctx);
+    } else await waitFor(() => h.sentMessages.length === 1);
+    const ledger = new ChildUsageLedger();
+    ledger.restore(h.branch);
+    expect(ledger.total.totalTokens).toBe(kind === "retry" ? 20 : 10);
+  } finally {
+    process.argv[1] = argv;
+    if (retry === undefined) delete process.env.OMP_TEST_RETRY; else process.env.OMP_TEST_RETRY = retry;
+    if (fail === undefined) delete process.env.OMP_TEST_FAIL; else process.env.OMP_TEST_FAIL = fail;
+  }
+});
+
+test("legacy recovery checkpoints do not restart work when a real parent session is reopened", async () => {
+  const argv = process.argv[1];
+  process.argv[1] = path.resolve(import.meta.dir, "fixtures/fake-pi.mjs");
+  try {
+    const manager = SessionManager.create(tmp, path.join(tmp, "parent-sessions"));
+    manager.appendMessage({ role: "user", content: "saved work", timestamp: Date.now() });
+    const h = harness({ id: manager.getSessionId(), manager });
+    await h.handlers.session_start({}, h.ctx);
+    await h.tools.omp_delegate.execute("native-parent", { agent: "fixer", task: "finish" }, undefined, undefined, h.ctx);
+    await waitFor(() => h.sentMessages.length === 1);
+    const usage: any = manager.getEntries().find((entry: any) => entry.customType === USAGE_ENTRY && entry.data.taskId);
+    const taskId = usage.data.taskId;
+    manager.appendCustomEntry("omp-recovery-v1", {
+      version: 1, parentId: manager.getSessionId(), scope: taskScope(h.ctx),
+      tasks: [{ taskId, agent: "fixer", scope: taskScope(h.ctx), lastUsedAt: Date.now(),
+        sessionFile: path.join(tmp, "omp", "sessions", taskId, "session.jsonl") }],
+      jobs: [{ id: "legacy", callId: "native-parent", kind: "delegate", active: true,
+        items: [{ agent: "fixer", task: "finish", taskId }], results: [null], delivered: [] }],
+    });
+    await h.handlers.session_shutdown({}, h.ctx);
+    expect(fs.existsSync(path.join(tmp, "omp", "sessions", taskId))).toBe(false);
+    const reopened = SessionManager.open(manager.getSessionFile()!);
+    const resumed = harness({ id: reopened.getSessionId(), manager: reopened });
+    await resumed.handlers.session_start({}, resumed.ctx);
+    await Bun.sleep(80);
+    expect(resumed.sentMessages).toHaveLength(0);
+    expect(resumed.notifications.some((text) => text.includes("restored saved background"))).toBe(false);
+    await expect(resumed.tools.omp_delegate.execute("old-task", {
+      agent: "fixer", taskId, task: "continue",
+    }, undefined, undefined, resumed.ctx)).rejects.toThrow();
+  } finally { process.argv[1] = argv; }
+});
 
 function widgetText(content: any, width = 100): string {
   if (!content) return "";
@@ -240,10 +370,13 @@ describe("config safety", () => {
     expect(readConfig()).toEqual(DEFAULT_CONFIG);
     const first = readConfig();
     first.models.oracle = "other/model";
-    expect(readConfig().models.oracle).toBe("openai-codex/gpt-6-astra");
+    expect(readConfig().models.oracle).toBe("openai/gpt-6-astra");
   });
   test("parses defaults and model IDs; rejects invalid roles and models", () => {
-    expect(parseConfig({})).toEqual({ defaultAgent: "orchestrator", models: {}, thinking: {} });
+    expect(parseConfig({})).toEqual({ defaultAgent: "orchestrator", fast: false, models: {}, thinking: {} });
+    expect(parseConfig({ fast: true }).fast).toBe(true);
+    for (const fast of [null, "on", 1, {}, []])
+      expect(() => parseConfig({ fast })).toThrow("fast must be a boolean");
     expect(parseModel("openai-codex/gpt-5.5")).toEqual({ provider: "openai-codex", id: "gpt-5.5" });
     expect(parseModel("--model/evil")).toBeUndefined();
     expect(() => parseConfig({ models: { unknown: "openai-codex/gpt-5.5" } })).toThrow();
@@ -288,6 +421,7 @@ describe("config safety", () => {
     fs.writeFileSync(configPath(), JSON.stringify(legacy));
     expect(readConfig()).toEqual({
       defaultAgent: "orchestrator",
+      fast: false,
       models: legacy.models,
       thinking: legacy.thinking,
     });
@@ -373,6 +507,7 @@ describe("/omp settings entry point", () => {
     const rows = getSettingsRows();
     expect(rows.map((r) => r.id)).toEqual([
       "default",
+      "fast",
       "role:oracle",
       "role:librarian",
       "role:explorer",
@@ -381,15 +516,18 @@ describe("/omp settings entry point", () => {
     ]);
     expect(rows[0].label).toBe("Default main agent");
     expect(rows[0].description).toContain("does not change Pi's current model");
-    expect(rows.slice(1).map((row) => row.label)).toEqual([
+    expect(rows[1].label).toBe("Fast mode");
+    expect(rows[1].currentValue).toBe("off");
+    expect(getChoices("fast", harness().ctx)).toEqual(["off", "on"]);
+    expect(rows.slice(2).map((row) => row.label)).toEqual([
       "oracle",
       "librarian",
       "explorer",
       "designer",
       "fixer",
     ]);
-    expect(rows[1].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
-    expect(rows[1].description).toContain("Choose the model, then the thinking level");
+    expect(rows[2].currentValue).toBe(`${INHERIT} · ${INHERIT_THINKING}`);
+    expect(rows[2].description).toContain("Choose the model, then the thinking level");
     expect(getChoices("default", harness().ctx)).toEqual(["pi", "orchestrator", "council"]);
     expect(getChoices("model:explorer", harness().ctx)[0]).toBe(INHERIT);
     expect(getChoices("thinking:explorer", harness().ctx)).toEqual([
@@ -425,7 +563,7 @@ describe("/omp settings entry point", () => {
     h.ctx.mode = "rpc";
     let calls = 0;
     h.ctx.ui.select = async (_title: string, options: string[]) => {
-      if (++calls === 1) return options[3];
+      if (++calls === 1) return options.find((value) => value.startsWith("explorer  →"));
       if (calls === 2) return "openai-codex/gpt-5.5"; // forged, now disabled
       if (calls === 3) return "high";
       return undefined;
@@ -484,7 +622,7 @@ describe("/omp settings entry point", () => {
     component.handleInput("\x1b[A"); // pi native (only pi/orchestrator are primary)
     component.handleInput("\r");
     await waitFor(() => readConfig().defaultAgent === "pi");
-    for (let i = 0; i < 3; i++) component.handleInput("\x1b[B"); // explorer row
+    for (let i = 0; i < 4; i++) component.handleInput("\x1b[B"); // explorer row
     component.handleInput("\r");
     for (const char of "spark") component.handleInput(char);
     expect(component.render(90).join("\n")).toContain("Search models:");
@@ -556,7 +694,7 @@ describe("/omp settings entry point", () => {
     expect(narrow.join("\n")).toContain("Current: orchestrator");
     expect(narrow.join("\n")).toContain("\x1b[32m");
     expect(narrow.join("\n")).not.toContain("\x1b[31m");
-    for (let i = 0; i < 3; i++) component.handleInput("\x1b[B");
+    for (let i = 0; i < 4; i++) component.handleInput("\x1b[B");
     expect(
       component
         .render(32)
@@ -604,7 +742,7 @@ describe("/omp settings entry point", () => {
     let calls = 0;
     h.ctx.ui.select = async (title: string, options: string[]) => {
       titles.push(title);
-      if (++calls === 1) return options[3]; // explorer role
+      if (++calls === 1) return options.find((value) => value.startsWith("explorer  →"));
       if (calls === 2) return "openai-codex/gpt-5.5";
       if (calls === 3) {
         expect(readConfig().models.explorer).toBeUndefined();
@@ -622,6 +760,56 @@ describe("/omp settings entry point", () => {
     expect(readConfig().models.explorer).toBe("openai-codex/gpt-5.5");
     expect(readConfig().thinking.explorer).toBe("high");
     expect(readConfig()).not.toHaveProperty("serviceTier");
+  });
+  test("RPC saves one Fast mode switch for the main session and children", async () => {
+    const h = harness();
+    h.ctx.mode = "rpc";
+    h.ctx.model = { ...models[0], api: "openai-codex-responses" };
+    const originalModel = h.ctx.model;
+    let calls = 0;
+    h.ctx.ui.select = async (_title: string, options: string[]) => {
+      if (++calls === 1) return options.find((value) => value.startsWith("Fast mode  →"));
+      if (calls === 2) return "on";
+      return undefined;
+    };
+    await h.commands.omp.handler("", h.ctx);
+    expect(readConfig().fast).toBe(true);
+    expect(h.handlers.before_provider_request({ payload: { model: "gpt-5.5" } }, h.ctx))
+      .toEqual({ model: "gpt-5.5", service_tier: "priority" });
+    expect(h.ctx.model).toBe(originalModel);
+    expect(h.selected).toEqual([]);
+    expect(readConfig()).not.toHaveProperty("serviceTier");
+    calls = 0;
+    h.ctx.ui.select = async (_title: string, options: string[]) => {
+      if (++calls === 1) return options.find((value) => value.startsWith("Fast mode  →"));
+      if (calls === 2) return "off";
+      return undefined;
+    };
+    await h.commands.omp.handler("", h.ctx);
+    expect(readConfig().fast).toBe(false);
+    expect(h.handlers.before_provider_request({ payload: {} }, h.ctx)).toBeUndefined();
+  });
+  test("TUI saves the shared Fast mode switch without opening role model pickers", async () => {
+    const h = harness();
+    let component: any;
+    h.ctx.ui.custom = (factory: any) => new Promise<void>((done) => {
+      component = factory(
+        { requestRender: () => {} },
+        { fg: (_: string, text: string) => text, bold: (text: string) => text },
+        {}, done,
+      );
+    });
+    const finished = h.commands.omp.handler("", h.ctx);
+    await waitFor(() => Boolean(component));
+    component.handleInput("\x1b[B");
+    component.handleInput("\r");
+    expect(component.render(90).join("\n")).not.toContain("Search models:");
+    component.handleInput("\x1b[B");
+    component.handleInput("\r");
+    await waitFor(() => readConfig().fast);
+    expect(getSettingsRows()[1].currentValue).toBe("on");
+    component.handleInput("\x1b");
+    await finished;
   });
   test("pi main agent cannot launch OMP children even through a stale tool call", async () => {
     await updateConfig((config) => ({ ...config, defaultAgent: "pi" }));
@@ -719,6 +907,7 @@ test("isolated child uses the configured specialist model and tool allowlist (of
     const recorded = JSON.parse(fs.readFileSync(capture, "utf8"));
     expect(recorded.args).not.toContain("--no-extensions");
     expect(recorded.args).not.toContain("--mcp-config"); // adapter is optional for non-Librarians
+    expect(recorded.args).toContain(path.resolve(import.meta.dir, "../extensions/omp/fast-mode.ts"));
     expect(recorded.childGuard).toBe("1");
     expect(recorded.args).toContain("--no-approve");
     expect(recorded.args[recorded.args.indexOf("--tools") + 1]).toBe("read,grep,find,ls,websearch");
@@ -1079,7 +1268,7 @@ test("OMP cards show only safe progress until final outputs, regardless of expan
       .join("\n");
   const compact = render(false, true);
   expect(compact).toContain("running · 0/2");
-  expect(compact).toContain("○ queued · Explorer task 1");
+  expect(compact.replace(/ +/g, " ")).toContain("○ queued · Explorer task 1");
   expect(compact).toContain("⠋ running · Fixer task 2");
   expect(compact).not.toMatch(/SECRET_|private-command|assistant message|Ctrl\+Alt\+O/);
   const expanded = render(true, true);
@@ -1109,7 +1298,7 @@ test("OMP cards show only safe progress until final outputs, regardless of expan
       .render(120)
       .join("\n");
     expect(finished).toContain("failed · 2/2");
-    expect(finished).toContain("✓ done · Explorer task 1");
+    expect(finished.replace(/ +/g, " ")).toContain("✓ done · Explorer task 1");
     expect(finished).toContain("✗ failed · Fixer task 2");
     expect(finished).toContain("Final answer");
     expect(finished).toContain("Safe conclusion.");
@@ -1279,6 +1468,45 @@ test("OMP task rows show live run time and tokens, then retain final values", ()
   }
 });
 
+test("mixed OMP tasks align columns across statuses, names, metrics and missing values", () => {
+  const theme: any = {
+    fg: (_: string, value: string) => `\x1b[32m${value}\x1b[0m`,
+    bold: (value: string) => value,
+  };
+  const agents = ["explorer", "librarian", "oracle", "designer", "fixer"] as const;
+  const progress = agents.map((agent, i): AgentProgress => ({
+    agent, task: "inspect", state: i === 4 ? "running" : "done",
+    activity: "", text: "", activities: [], elapsedMs: [17000, 21000, 71000, 12000, 202000][i],
+    totalTokens: [8600, 27000, 51000, 9900, 618000][i],
+    tokensPerSecond: [42, 36, 18, 36, 41][i], phase: "model",
+    dcpStatus: i === 4 ? "DCP: ~683" : undefined,
+  }));
+  const pinned = renderPinnedOmpOverview(
+    [{ kind: "job", progress, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
+  const result = renderOmpResult({ content: [], details: { progress } },
+    { expanded: false, isPartial: true }, theme);
+  for (const card of [pinned, result]) {
+    const lines = card.render(140).map(stripTerminalSequences).filter((line) => line.includes(" task "));
+    expect(lines).toHaveLength(5);
+    const separators = (line: string) => Array.from(line.matchAll(/ · /g), (match) => match.index);
+    const columns = separators(lines[0]!);
+    for (const line of lines) expect(separators(line).slice(0, 4)).toEqual(columns);
+    expect(lines[4]).toContain("DCP: ~683");
+    for (const width of [24, 34, 50, 80])
+      expect(card.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
+  }
+  // A queued child reserves positions only when it has later reported metrics.
+  const missing = [{ ...progress[0]!, elapsedMs: undefined, tokensPerSecond: undefined }, progress[4]!];
+  const card = renderPinnedOmpOverview(
+    [{ kind: "job", progress: missing, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
+  const lines = card.render(140).map(stripTerminalSequences).filter((line) => line.includes(" task "));
+  expect(lines[0]!.indexOf("tokens") + "tokens".length).toBe(lines[1]!.indexOf("tokens") + "tokens".length);
+});
+
 test("result-only cards retain run time and tokens after cancellation", () => {
   const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
   const results: Result[] = [{
@@ -1293,6 +1521,29 @@ test("result-only cards retain run time and tokens after cancellation", () => {
   ).render(80).join("\n");
   expect(output).toContain("cancelled · Fixer task · 45s · 1.0k tokens");
   expect(output).not.toContain("private error");
+});
+
+test("DCP estimates appear per child in live, completed and result-only cards", () => {
+  const theme: any = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+  const progress = queuedProgress([
+    { agent: "explorer", task: "inspect" }, { agent: "fixer", task: "fix" },
+  ]).map((item, i) => ({ ...item, state: "running" as const,
+    dcpStatus: i === 0 ? "DCP: ~683" : undefined }));
+  const pinned = renderPinnedOmpOverview(
+    [{ kind: "job", progress, isPartial: true, frame: () => 0, state: {} }],
+    theme, () => {}, () => {},
+  );
+  const lines = pinned.render(120);
+  expect(lines.find((line) => line.includes("Explorer task"))).toContain("DCP: ~683");
+  expect(lines.find((line) => line.includes("Fixer task"))).not.toContain("DCP:");
+  expect(pinned.render(34).every((line) => visibleWidth(line) <= 34)).toBe(true);
+  const results: Result[] = [{ agent: "explorer", model: "test/model", ok: true,
+    output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, dcpStatus: "DCP: ~683" }];
+  for (const rows of [progress.map((item) => ({ ...item, state: "done" as const })), []]) {
+    expect(renderOmpResult({ content: [], details: { progress: rows, results } },
+      { expanded: false, isPartial: false }, theme).render(120).join("\n")).toContain("DCP: ~683");
+  }
 });
 
 test("OMP task rows show retries and quiet time without exposing activity text", () => {
@@ -1316,12 +1567,12 @@ test("OMP task rows show retries and quiet time without exposing activity text",
     [{ kind: "job", progress: [item], isPartial: true, frame: () => 0, state: {} }],
     theme, () => {}, () => {},
   ).render(120).join("\n");
-  expect(pinned).toContain("Explorer task ▸ · no events 2m · retrying 3/3");
+  expect(pinned).toContain("Explorer task ▸ · quiet:2m · retrying:3/3");
   const result = renderOmpResult(
     { content: [], details: { progress: [item] } },
     { expanded: false, isPartial: true }, theme,
   ).render(120).join("\n");
-  expect(result).toContain("Explorer task · no events 2m · retrying 3/3");
+  expect(result).toContain("Explorer task · quiet:2m · retrying:3/3");
   expect(pinned + result).not.toMatch(/SECRET_|private-command|private task/);
 });
 
@@ -1784,7 +2035,7 @@ test("a new dispatch returns finished batches to chat while keeping batches sepa
       h.ctx,
     );
     const fixed = widgetText(pinned);
-    expect(fixed).toContain("queued · Fixer task");
+    expect(fixed.replace(/ +/g, " ")).toContain("queued · Fixer task");
     expect(fixed).not.toContain("Explorer task");
     expect(fixed.match(/OMP/g)).toHaveLength(1);
     const releasedCard = tool.renderCall(firstArgs, theme, { ...firstContext, isPartial: false });
@@ -1843,7 +2094,7 @@ test("a new dispatch leaves an unfinished earlier batch fixed", async () => {
     );
     const fixed = widgetText(pinned);
     expect(fixed).toContain("running · Explorer task");
-    expect(fixed).toContain("queued · Fixer task");
+    expect(fixed.replace(/ +/g, " ")).toContain("queued · Fixer task");
     expect((fixed.match(/OMP/g) ?? []).length).toBe(1);
     expect(fixed.indexOf("Explorer task")).toBeLessThan(fixed.indexOf("Fixer task"));
     h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
@@ -1979,7 +2230,7 @@ test("long fixed task details scroll within half the terminal and keep task rows
   const second = card.render(100).join("\n");
   expect(second).toContain("second task detail");
   expect(second).toContain("Explorer task 1 ▸");
-  expect(second).toContain("Fixer task 2 ▾");
+  expect(second.replace(/ +/g, " ")).toContain("Fixer task 2 ▾");
   expect(second).not.toContain("detail line 60");
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
@@ -2181,7 +2432,7 @@ test("only one task can stay expanded across dispatches in the fixed OMP overvie
   expect(second).toContain("second private detail");
   expect(second).not.toContain("first private detail");
   expect(second).toContain("Explorer task ▸");
-  expect(second).toContain("Fixer task ▾");
+  expect(second.replace(/ +/g, " ")).toContain("Fixer task ▾");
   h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
 });
 
@@ -2501,7 +2752,7 @@ test("parent cancellation stops every batch and Council worker without waking th
     await waitFor(() => h.sentMessages.length === 4);
     expect(widgetText(pinned).split("\n").filter((line) =>
       line.includes("cancelled ·") && !line.includes("OMP"))).toHaveLength(5);
-    expect(widgetText(pinned)).toContain("done · Explorer task");
+    expect(widgetText(pinned)).toMatch(/done\s+· Explorer task/);
     for (const message of h.sentMessages.slice(1)) expect(message.options.triggerTurn).toBe(false);
     const alive = workers.filter((worker) => worker.alive);
     expect(alive).toHaveLength(1); // completed worker retained for explicit same-session continuation
